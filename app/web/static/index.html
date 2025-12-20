@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>LocalPro Chat Orchestrator</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div>
+      <h1>ChatGPT Pro (Local)</h1>
+      <p class="sub">Local multi-agent orchestrator with Tavily research.</p>
+    </div>
+    <div class="actions">
+      <button id="settingsBtn">Settings</button>
+      <span id="modelWarning" class="warning"></span>
+    </div>
+  </header>
+
+  <main class="layout">
+    <section class="panel">
+      <h2>Ask a question</h2>
+      <form id="chatForm">
+        <textarea id="question" rows="4" placeholder="Ask anything..."></textarea>
+        <div class="controls">
+          <div>
+            <label><input type="radio" name="mode" value="auto" checked> Auto reasoning</label>
+            <label><input type="radio" name="mode" value="manual"> Manual</label>
+            <select id="manualLevel">
+              <option value="LOW">LOW</option>
+              <option value="MED" selected>MED</option>
+              <option value="HIGH">HIGH</option>
+              <option value="ULTRA">ULTRA</option>
+            </select>
+          </div>
+          <div>
+            <label>Search depth</label>
+            <select id="searchDepth">
+              <option value="auto">Auto</option>
+              <option value="basic">Basic</option>
+              <option value="advanced">Advanced</option>
+            </select>
+          </div>
+          <div>
+            <label>Max results</label>
+            <input type="number" id="maxResults" value="6" min="1" max="15">
+          </div>
+          <div>
+            <label><input type="checkbox" id="strictMode"> Strict mode</label>
+          </div>
+          <div>
+            <label><input type="checkbox" id="evidenceDump"> Evidence dump</label>
+          </div>
+        </div>
+        <button type="submit">Run</button>
+      </form>
+
+      <div id="chatThread" class="chat-thread"></div>
+    </section>
+
+    <section class="panel activity">
+      <h2>Activity</h2>
+      <div id="activityFeed" class="feed"></div>
+    </section>
+  </main>
+
+  <section class="panel result">
+    <h2>Final answer</h2>
+    <div id="finalAnswer"></div>
+    <div id="confidence"></div>
+    <div id="sources"></div>
+    <div id="evidence" class="hidden"></div>
+  </section>
+
+  <div id="settingsModal" class="modal hidden">
+    <div class="modal-content">
+      <h3>Settings</h3>
+      <label>LM Studio Base URL <input id="cfgBaseUrl"></label>
+      <label>Orchestrator Model <input id="cfgOrch"></label>
+      <label>Worker (Qwen8) Model <input id="cfgQwen8"></label>
+      <label>Router/Summarizer (Qwen4) Model <input id="cfgQwen4"></label>
+      <label>Tavily API Key <input id="cfgTavily" type="password"></label>
+      <label>Search depth default <input id="cfgSearchMode"></label>
+      <label>Max results base <input id="cfgMaxBase" type="number"></label>
+      <label>Max results high <input id="cfgMaxHigh" type="number"></label>
+      <label>Extract depth <input id="cfgExtract"></label>
+      <div class="modal-actions">
+        <button id="saveSettings">Save</button>
+        <button id="closeSettings">Close</button>
+      </div>
+      <p id="settingsStatus" class="status"></p>
+    </div>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
