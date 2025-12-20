@@ -9,8 +9,8 @@ class LMStudioClient:
         self.base_url = base_url.rstrip("/")
         self.client = httpx.AsyncClient(timeout=60)
 
-    async def list_models(self) -> Dict[str, Any]:
-        url = f"{self.base_url}/models"
+    async def list_models(self, base_url: Optional[str] = None) -> Dict[str, Any]:
+        url = f"{(base_url or self.base_url).rstrip('/')}/models"
         resp = await self.client.get(url)
         resp.raise_for_status()
         return resp.json()
@@ -23,8 +23,9 @@ class LMStudioClient:
         max_tokens: int = 512,
         stream: bool = False,
         response_format: Optional[dict] = None,
+        base_url: Optional[str] = None,
     ) -> Any:
-        url = f"{self.base_url}/chat/completions"
+        url = f"{(base_url or self.base_url).rstrip('/')}/chat/completions"
         payload: Dict[str, Any] = {
             "model": model,
             "messages": messages,
@@ -41,10 +42,20 @@ class LMStudioClient:
         return resp.json()
 
     async def stream_text(
-        self, model: str, messages: List[Dict[str, str]], temperature: float = 0.2, max_tokens: int = 1024
+        self,
+        model: str,
+        messages: List[Dict[str, str]],
+        temperature: float = 0.2,
+        max_tokens: int = 1024,
+        base_url: Optional[str] = None,
     ) -> AsyncGenerator[str, None]:
         response = await self.chat_completion(
-            model=model, messages=messages, temperature=temperature, max_tokens=max_tokens, stream=True
+            model=model,
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            stream=True,
+            base_url=base_url,
         )
         async for line in response.aiter_lines():
             if not line.startswith("data:"):
@@ -62,4 +73,3 @@ class LMStudioClient:
 
     async def close(self) -> None:
         await self.client.aclose()
-

@@ -2,6 +2,8 @@ import json
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
+from .schemas import Artifact
+
 import aiosqlite
 
 
@@ -107,6 +109,58 @@ class Database:
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     created_at TEXT,
                     payload_json TEXT
+                );
+                CREATE TABLE IF NOT EXISTS step_plans(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_id TEXT,
+                    plan_json TEXT,
+                    created_at TEXT
+                );
+                CREATE TABLE IF NOT EXISTS step_runs(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_id TEXT,
+                    step_id INTEGER,
+                    status TEXT,
+                    started_at TEXT,
+                    ended_at TEXT,
+                    agent_profile TEXT,
+                    prompt_text TEXT,
+                    output_json TEXT,
+                    error_text TEXT
+                );
+                CREATE TABLE IF NOT EXISTS artifacts(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_id TEXT,
+                    step_id INTEGER,
+                    key TEXT,
+                    artifact_type TEXT,
+                    content_text TEXT,
+                    content_json TEXT,
+                    created_at TEXT
+                );
+                CREATE TABLE IF NOT EXISTS control_actions(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_id TEXT,
+                    action_type TEXT,
+                    payload_json TEXT,
+                    created_at TEXT
+                );
+                CREATE TABLE IF NOT EXISTS memory_items(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_at TEXT,
+                    updated_at TEXT,
+                    kind TEXT,
+                    title TEXT,
+                    content TEXT,
+                    tags_json TEXT,
+                    pinned_bool INTEGER,
+                    relevance_score REAL
+                );
+                CREATE TABLE IF NOT EXISTS run_memory_links(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_id TEXT,
+                    memory_item_id INTEGER,
+                    reason TEXT
                 );
                 """
             )
@@ -334,3 +388,168 @@ class Database:
             "created_at": row["created_at"],
         }
 
+    async def get_artifacts(self, run_id: str) -> List[dict]:
+        rows = await self.fetchall(
+            "SELECT step_id, key, artifact_type, content_text, content_json, created_at FROM artifacts WHERE run_id=? ORDER BY id ASC",
+            (run_id,),
+        )
+        out = []
+        for row in rows:
+            out.append(
+                {
+                    "step_id": row["step_id"],
+                    "key": row["key"],
+                    "artifact_type": row["artifact_type"],
+                    "content_text": row["content_text"],
+                    "content_json": json.loads(row["content_json"] or "{}"),
+                    "created_at": row["created_at"],
+                }
+            )
+        return out
+
+    async def add_step_plan(self, run_id: str, plan_json: dict) -> None:
+        await self.execute(
+            "INSERT INTO step_plans(run_id, plan_json, created_at) VALUES (?,?,?)",
+            (run_id, json.dumps(plan_json), utc_now()),
+        )
+
+    async def add_step_run(
+        self,
+        run_id: str,
+        step_id: int,
+        status: str,
+        agent_profile: str,
+        prompt_text: str,
+    ) -> int:
+        async with aiosqlite.connect(self.path) as db:
+            cursor = await db.execute(
+                "INSERT INTO step_runs(run_id, step_id, status, started_at, agent_profile, prompt_text) VALUES (?,?,?,?,?,?)",
+                (run_id, step_id, status, utc_now(), agent_profile, prompt_text),
+            )
+            await db.commit()
+            return cursor.lastrowid
+
+    async def update_step_run(
+        self,
+        row_id: int,
+        status: str,
+        output_json: Optional[dict] = None,
+        error_text: Optional[str] = None,
+    ) -> None:
+        await self.execute(
+            "UPDATE step_runs SET status=?, ended_at=?, output_json=?, error_text=? WHERE id=?",
+            (status, utc_now(), json.dumps(output_json or {}), error_text or "", row_id),
+        )
+
+    async def add_artifact(self, run_id: str, artifact: "Artifact") -> None:
+        await self.execute(
+            "INSERT INTO artifacts(run_id, step_id, key, artifact_type, content_text, content_json, created_at) VALUES (?,?,?,?,?,?,?)",
+            (
+                run_id,
+                artifact.step_id,
+                artifact.key,
+                artifact.artifact_type,
+                artifact.content_text or "",
+                json.dumps(artifact.content_json or {}),
+                utc_now(),
+            ),
+        )
+
+    async def add_control_action(self, run_id: str, payload: dict) -> None:
+        await self.execute(
+            "INSERT INTO control_actions(run_id, action_type, payload_json, created_at) VALUES (?,?,?,?)",
+            (run_id, payload.get("control"), json.dumps(payload), utc_now()),
+        )
+
+    async def add_memory_item(
+        self, kind: str, title: str, content: str, tags: List[str], pinned: bool = False, relevance_score: float = 0.0
+    ) -> int:
+        async with aiosqlite.connect(self.path) as db:
+            cursor = await db.execute(
+                "INSERT INTO memory_items(created_at, updated_at, kind, title, content, tags_json, pinned_bool, relevance_score) VALUES (?,?,?,?,?,?,?,?)",
+                (utc_now(), utc_now(), kind, title, content, json.dumps(tags), 1 if pinned else 0, relevance_score),
+            )
+            await db.commit()
+            return cursor.lastrowid
+
+    async def update_memory_item(
+        self, item_id: int, title: Optional[str] = None, content: Optional[str] = None, pinned: Optional[bool] = None
+    ) -> None:
+        row = await self.fetchone("SELECT title, content, pinned_bool FROM memory_items WHERE id=?", (item_id,))
+        if not row:
+            return
+        new_title = title if title is not None else row["title"]
+        new_content = content if content is not None else row["content"]
+        new_pinned = pinned if pinned is not None else row["pinned_bool"]
+        await self.execute(
+            "UPDATE memory_items SET title=?, content=?, pinned_bool=?, updated_at=? WHERE id=?",
+            (new_title, new_content, 1 if new_pinned else 0, utc_now(), item_id),
+        )
+
+    async def delete_memory_item(self, item_id: int) -> None:
+        await self.execute("DELETE FROM memory_items WHERE id=?", (item_id,))
+        await self.execute("DELETE FROM run_memory_links WHERE memory_item_id=?", (item_id,))
+
+    async def search_memory(self, query: str, limit: int = 10) -> List[dict]:
+        pattern = f"%{query}%"
+        rows = await self.fetchall(
+            "SELECT id, kind, title, content, tags_json, pinned_bool, relevance_score, updated_at FROM memory_items "
+            "WHERE title LIKE ? OR content LIKE ? ORDER BY pinned_bool DESC, relevance_score DESC, updated_at DESC LIMIT ?",
+            (pattern, pattern, limit),
+        )
+        return [
+            {
+                "id": r["id"],
+                "kind": r["kind"],
+                "title": r["title"],
+                "content": r["content"],
+                "tags": json.loads(r["tags_json"] or "[]"),
+                "pinned": bool(r["pinned_bool"]),
+                "relevance_score": r["relevance_score"],
+                "updated_at": r["updated_at"],
+            }
+            for r in rows
+        ]
+
+    async def list_memory(self, limit: int = 50) -> List[dict]:
+        rows = await self.fetchall(
+            "SELECT id, kind, title, content, tags_json, pinned_bool, relevance_score, updated_at FROM memory_items "
+            "ORDER BY pinned_bool DESC, relevance_score DESC, updated_at DESC LIMIT ?",
+            (limit,),
+        )
+        return [
+            {
+                "id": r["id"],
+                "kind": r["kind"],
+                "title": r["title"],
+                "content": r["content"],
+                "tags": json.loads(r["tags_json"] or "[]"),
+                "pinned": bool(r["pinned_bool"]),
+                "relevance_score": r["relevance_score"],
+                "updated_at": r["updated_at"],
+            }
+            for r in rows
+        ]
+
+    async def link_memory_to_run(self, run_id: str, memory_item_id: int, reason: str) -> None:
+        await self.execute(
+            "INSERT INTO run_memory_links(run_id, memory_item_id, reason) VALUES (?,?,?)",
+            (run_id, memory_item_id, reason),
+        )
+
+    async def get_run_memory(self, run_id: str) -> List[dict]:
+        rows = await self.fetchall(
+            "SELECT m.id, m.title, m.content, m.tags_json, m.pinned_bool FROM memory_items m "
+            "JOIN run_memory_links l ON m.id = l.memory_item_id WHERE l.run_id=?",
+            (run_id,),
+        )
+        return [
+            {
+                "id": r["id"],
+                "title": r["title"],
+                "content": r["content"],
+                "tags": json.loads(r["tags_json"] or "[]"),
+                "pinned": bool(r["pinned_bool"]),
+            }
+            for r in rows
+        ]

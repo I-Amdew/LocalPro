@@ -1,7 +1,7 @@
 import json
 import os
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, Optional
 
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
@@ -10,22 +10,51 @@ from pydantic import BaseModel, Field
 CONFIG_PATH = Path("config.json")
 
 
+class EndpointConfig(BaseModel):
+    base_url: str
+    model_id: str
+
+
 class AppSettings(BaseModel):
-    lm_studio_base_url: str = Field(
-        default="http://localhost:1234/v1",
-        description="Base URL for the LM Studio OpenAI-compatible API.",
+    # Legacy defaults (single endpoint)
+    lm_studio_base_url: str = "http://localhost:1234/v1"
+    model_orch: str = "openai/gpt-oss-20b"
+    model_qwen8: str = "qwen/qwen3-v1-8b"
+    model_qwen4: str = "qwen/qwen-4b"
+
+    # Per-role endpoints/models
+    orch_endpoint: EndpointConfig = Field(
+        default_factory=lambda: EndpointConfig(base_url="http://localhost:1234/v1", model_id="openai/gpt-oss-20b")
     )
-    model_orch: str = Field(default="openai/gpt-oss-20b")
-    model_qwen8: str = Field(default="qwen/qwen3-v1-8b")
-    model_qwen4: str = Field(default="qwen/qwen-4b")
-    tavily_api_key: Optional[str] = Field(default=None)
+    worker_a_endpoint: EndpointConfig = Field(
+        default_factory=lambda: EndpointConfig(base_url="http://localhost:1234/v1", model_id="qwen/qwen3-v1-8b")
+    )
+    worker_b_endpoint: EndpointConfig = Field(
+        default_factory=lambda: EndpointConfig(base_url="http://localhost:1234/v1", model_id="qwen/qwen3-v1-8b")
+    )
+    worker_c_endpoint: EndpointConfig = Field(
+        default_factory=lambda: EndpointConfig(base_url="http://localhost:1234/v1", model_id="qwen/qwen3-v1-8b")
+    )
+    router_endpoint: EndpointConfig = Field(
+        default_factory=lambda: EndpointConfig(base_url="http://localhost:1234/v1", model_id="qwen/qwen-4b")
+    )
+    summarizer_endpoint: EndpointConfig = Field(
+        default_factory=lambda: EndpointConfig(base_url="http://localhost:1234/v1", model_id="qwen/qwen-4b")
+    )
+    verifier_endpoint: EndpointConfig = Field(
+        default_factory=lambda: EndpointConfig(base_url="http://localhost:1234/v1", model_id="qwen/qwen3-v1-8b")
+    )
+
+    tavily_api_key: Optional[str] = None
     search_depth_mode: str = Field(default="auto")
-    max_results_base: int = Field(default=6)
-    max_results_high: int = Field(default=10)
-    extract_depth: str = Field(default="basic")
-    database_path: str = Field(default="app_data.db")
-    port: int = Field(default=8000)
-    strict_mode: bool = Field(default=False)
+    max_results_base: int = 6
+    max_results_high: int = 10
+    extract_depth: str = "basic"
+    database_path: str = "app_data.db"
+    port: int = 8000
+    strict_mode: bool = False
+    reasoning_depth_default: str = "AUTO"
+    discovery_base_urls: list[str] = Field(default_factory=lambda: ["http://localhost:1234/v1"])
 
     def to_safe_dict(self) -> dict:
         data = self.model_dump()
@@ -49,9 +78,9 @@ def _load_from_env() -> dict:
         "database_path": os.getenv("DATABASE_PATH"),
         "port": os.getenv("PORT"),
         "strict_mode": os.getenv("STRICT_MODE"),
+        "reasoning_depth_default": os.getenv("REASONING_DEPTH_DEFAULT"),
     }
     cleaned = {k: v for k, v in env_map.items() if v not in (None, "")}
-    # Cast numeric/bool fields
     if "max_results_base" in cleaned:
         cleaned["max_results_base"] = int(cleaned["max_results_base"])
     if "max_results_high" in cleaned:
@@ -65,16 +94,18 @@ def _load_from_env() -> dict:
 
 def load_settings() -> AppSettings:
     env_data = _load_from_env()
-    file_data = {}
+    file_data: Dict[str, Any] = {}
     if CONFIG_PATH.exists():
         try:
             file_data = json.loads(CONFIG_PATH.read_text())
         except Exception:
             file_data = {}
     merged = {**env_data, **file_data}
+    # Backfill endpoint fields from legacy
+    if "orch_endpoint" not in merged and "lm_studio_base_url" in merged and "model_orch" in merged:
+        merged["orch_endpoint"] = {"base_url": merged["lm_studio_base_url"], "model_id": merged["model_orch"]}
     return AppSettings(**merged)
 
 
 def save_settings(settings: AppSettings) -> None:
     CONFIG_PATH.write_text(settings.model_dump_json(indent=2))
-

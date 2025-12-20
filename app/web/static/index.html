@@ -21,7 +21,10 @@
     <section class="panel">
       <h2>Ask a question</h2>
       <form id="chatForm">
-        <textarea id="question" rows="4" placeholder="Ask anything..."></textarea>
+        <div class="input-row">
+          <textarea id="question" rows="4" placeholder="Ask anything..."></textarea>
+          <button type="button" id="micBtn" class="ghost">🎤</button>
+        </div>
         <div class="controls">
           <div>
             <label><input type="radio" name="mode" value="auto" checked> Auto reasoning</label>
@@ -32,6 +35,12 @@
               <option value="HIGH">HIGH</option>
               <option value="ULTRA">ULTRA</option>
             </select>
+          </div>
+          <div class="slider-wrap">
+            <label>Reasoning depth</label>
+            <input type="range" id="depthSlider" min="0" max="3" value="1">
+            <span id="depthLabel">MED</span>
+            <label><input type="checkbox" id="depthAuto" checked> AUTO</label>
           </div>
           <div>
             <label>Search depth</label>
@@ -51,6 +60,13 @@
           <div>
             <label><input type="checkbox" id="evidenceDump"> Evidence dump</label>
           </div>
+          <div>
+            <label><input type="checkbox" id="autoMemory" checked> Auto memory</label>
+          </div>
+          <div>
+            <label>STT lang</label>
+            <input type="text" id="sttLang" value="en-US" size="6">
+          </div>
         </div>
         <button type="submit">Run</button>
       </form>
@@ -59,8 +75,20 @@
     </section>
 
     <section class="panel activity">
-      <h2>Activity</h2>
+      <div class="panel-header">
+        <h2>Activity</h2>
+        <button type="button" id="toggleActivity" class="ghost">Collapse</button>
+      </div>
       <div id="activityFeed" class="feed"></div>
+    </section>
+
+    <section class="panel memory">
+      <div class="panel-header">
+        <h2>Memory</h2>
+        <button type="button" id="refreshMemory" class="ghost">Refresh</button>
+      </div>
+      <input type="text" id="memorySearch" placeholder="Search memory...">
+      <div id="memoryList" class="feed small"></div>
     </section>
   </main>
 
@@ -75,15 +103,31 @@
   <div id="settingsModal" class="modal hidden">
     <div class="modal-content">
       <h3>Settings</h3>
-      <label>LM Studio Base URL <input id="cfgBaseUrl"></label>
-      <label>Orchestrator Model <input id="cfgOrch"></label>
-      <label>Worker (Qwen8) Model <input id="cfgQwen8"></label>
-      <label>Router/Summarizer (Qwen4) Model <input id="cfgQwen4"></label>
+      <label>Legacy LM Studio Base URL <input id="cfgBaseUrl"></label>
+      <label>Orchestrator Base URL <input id="cfgOrchBase"></label>
+      <label>Orchestrator Model ID <input id="cfgOrch"></label>
+      <label>Worker A Base URL <input id="cfgWorkerABase"></label>
+      <label>Worker A Model ID <input id="cfgQwen8"></label>
+      <label>Worker B Base URL <input id="cfgWorkerBBase"></label>
+      <label>Worker B Model ID <input id="cfgQwen8B"></label>
+      <label>Worker C Base URL <input id="cfgWorkerCBase"></input></label>
+      <label>Worker C Model ID <input id="cfgQwen8C"></label>
+      <label>Router Base URL <input id="cfgRouterBase"></label>
+      <label>Router Model ID <input id="cfgQwen4"></label>
+      <label>Summarizer Base URL <input id="cfgSummarizerBase"></label>
+      <label>Summarizer Model ID <input id="cfgSummarizer"></label>
+      <label>Verifier Base URL <input id="cfgVerifierBase"></label>
+      <label>Verifier Model ID <input id="cfgVerifier"></label>
       <label>Tavily API Key <input id="cfgTavily" type="password"></label>
       <label>Search depth default <input id="cfgSearchMode"></label>
       <label>Max results base <input id="cfgMaxBase" type="number"></label>
       <label>Max results high <input id="cfgMaxHigh" type="number"></label>
       <label>Extract depth <input id="cfgExtract"></label>
+      <div class="panel-header">
+        <h4>Discovery</h4>
+        <button type="button" id="discoverBtn">Discover models</button>
+      </div>
+      <label>Discovery base URLs (comma-separated) <input id="cfgDiscovery"></label>
       <div class="modal-actions">
         <button id="saveSettings">Save</button>
         <button id="closeSettings">Close</button>

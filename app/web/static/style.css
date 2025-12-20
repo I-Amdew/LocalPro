@@ -49,6 +49,10 @@ button {
   font-weight: bold;
 }
 button:hover { opacity: 0.9; }
+.ghost {
+  background: rgba(255,255,255,0.08);
+  color: #e6edf7;
+}
 .controls {
   display: flex;
   flex-wrap: wrap;
@@ -70,6 +74,14 @@ input, select {
   border-radius: 8px;
   padding: 10px;
 }
+.chat-bubble {
+  padding: 8px 10px;
+  border-radius: 8px;
+  margin-bottom: 8px;
+  max-width: 90%;
+}
+.bubble-user { background: rgba(79,139,255,0.1); margin-left: auto; }
+.bubble-assistant { background: rgba(255,255,255,0.06); }
 .chat-msg { margin-bottom: 8px; }
 .chat-msg .role { font-weight: bold; color: #9fb4d0; }
 .activity .feed {
@@ -89,6 +101,10 @@ input, select {
 #finalAnswer { white-space: pre-wrap; margin-bottom: 8px; }
 #sources { color: #9fb4d0; }
 .hidden { display: none; }
+.input-row { display: flex; gap: 6px; align-items: stretch; }
+#micBtn { min-width: 44px; }
+.panel-header { display: flex; justify-content: space-between; align-items: center; }
+.feed.small { max-height: 300px; }
 .modal {
   position: fixed; inset: 0;
   background: rgba(0,0,0,0.65);
