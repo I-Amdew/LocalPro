@@ -80,11 +80,11 @@ async def get_settings():
 
 @app.post("/settings")
 async def update_settings(request: Request):
+    global settings
     body = await request.json()
     new_settings = AppSettings(**{**settings.model_dump(), **body})
     save_settings(new_settings)
     await db.save_config(new_settings.model_dump())
-    global settings
     settings = new_settings
     lm_client.base_url = settings.lm_studio_base_url
     tavily_client.api_key = settings.tavily_api_key

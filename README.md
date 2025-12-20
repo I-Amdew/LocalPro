@@ -21,6 +21,18 @@ uvicorn app.main:app --reload
 # open http://localhost:8000
 ```
 
+### Windows PowerShell quick start (if `&&` fails or Python not found)
+```powershell
+py -3 -m venv .venv          # or python -m venv .venv if on PATH
+.\.venv\Scripts\Activate.ps1
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+Copy-Item .env.example .env
+uvicorn app.main:app --reload
+```
+Notes:
+- If `Activate.ps1` is blocked, run: `Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass` in that shell.
+- If `python` invokes the Microsoft Store alias, use `py -3` or install Python 3.11+ and ensure “Add to PATH” is enabled.
+
 ## Configuration
 - Per-role endpoints + model IDs (set via Settings UI):
   - Orchestrator, Worker A/B/C, Router, Summarizer, Verifier (each base URL + model id)

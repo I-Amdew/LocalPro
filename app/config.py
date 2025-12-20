@@ -14,6 +14,8 @@ class EndpointConfig(BaseModel):
     base_url: str
     model_id: str
 
+    model_config = {"protected_namespaces": ()}
+
 
 class AppSettings(BaseModel):
     # Legacy defaults (single endpoint)
@@ -61,6 +63,8 @@ class AppSettings(BaseModel):
         if data.get("tavily_api_key"):
             data["tavily_api_key"] = "********"
         return data
+
+    model_config = {"protected_namespaces": ()}
 
 
 def _load_from_env() -> dict:
