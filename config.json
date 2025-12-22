@@ -1,46 +1,48 @@
 {
   "lm_studio_base_url": "http://localhost:1234/v1",
   "model_orch": "openai/gpt-oss-20b",
-  "model_qwen8": "qwen/qwen3-v1-8b",
-  "model_qwen4": "qwen/qwen-4b",
+  "oss_max_tokens": 131072,
+  "model_qwen8": "qwen/qwen3-vl-8b",
+  "model_qwen4": "qwen/qwen3-vl-4b",
   "orch_endpoint": {
-    "base_url": "http://localhost:1234/v1",
+    "base_url": "http://127.0.0.1:1234/v1",
     "model_id": "openai/gpt-oss-20b"
   },
   "worker_a_endpoint": {
-    "base_url": "http://localhost:1234/v1",
-    "model_id": "qwen/qwen3-v1-8b"
+    "base_url": "http://127.0.0.1:1234/v1",
+    "model_id": "qwen/qwen3-vl-8b"
   },
   "worker_b_endpoint": {
-    "base_url": "http://localhost:1234/v1",
-    "model_id": "qwen/qwen3-v1-8b"
+    "base_url": "http://127.0.0.1:1234/v1",
+    "model_id": "qwen/qwen3-vl-8b:2"
   },
   "worker_c_endpoint": {
-    "base_url": "http://localhost:1234/v1",
-    "model_id": "qwen/qwen3-v1-8b"
+    "base_url": "http://127.0.0.1:1234/v1",
+    "model_id": "qwen/qwen3-vl-8b:3"
   },
   "router_endpoint": {
-    "base_url": "http://localhost:1234/v1",
-    "model_id": "qwen/qwen-4b"
+    "base_url": "http://127.0.0.1:1234/v1",
+    "model_id": "qwen/qwen3-vl-4b"
   },
   "summarizer_endpoint": {
-    "base_url": "http://localhost:1234/v1",
-    "model_id": "qwen/qwen-4b"
+    "base_url": "http://127.0.0.1:1234/v1",
+    "model_id": "qwen/qwen3-vl-4b"
   },
   "verifier_endpoint": {
-    "base_url": "http://localhost:1234/v1",
-    "model_id": "qwen/qwen3-v1-8b"
+    "base_url": "http://127.0.0.1:1234/v1",
+    "model_id": "qwen/qwen3-vl-8b"
   },
-  "tavily_api_key": "your_tavily_key_here",
+  "tavily_api_key": "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",
   "search_depth_mode": "auto",
   "max_results_base": 6,
   "max_results_high": 10,
   "extract_depth": "basic",
   "database_path": "app_data.db",
+  "host": "0.0.0.0",
   "port": 8000,
   "strict_mode": false,
   "reasoning_depth_default": "AUTO",
   "discovery_base_urls": [
-    "http://localhost:1234/v1"
+    "http://127.0.0.1:1234/v1"
   ]
 }

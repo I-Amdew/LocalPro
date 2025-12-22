@@ -1,6 +1,6 @@
 from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 ReasoningLevel = Literal["LOW", "MED", "HIGH", "ULTRA"]
@@ -14,6 +14,7 @@ class RouterDecision(BaseModel):
     extract_depth: Literal["basic", "advanced"] = "basic"
     tool_budget: Dict[str, int] = Field(default_factory=dict)
     stop_conditions: Dict[str, Any] = Field(default_factory=dict)
+    expected_passes: int = 1
     notes: Optional[str] = None
 
     model_config = {"extra": "allow"}
@@ -92,6 +93,20 @@ class Artifact(BaseModel):
     model_config = {"extra": "allow"}
 
 
+class UploadRecord(BaseModel):
+    id: int
+    run_id: Optional[str] = None
+    filename: str
+    original_name: str
+    mime: str
+    size_bytes: int
+    status: str = "received"
+    summary_text: Optional[str] = ""
+    created_at: Optional[str] = None
+
+    model_config = {"extra": "allow"}
+
+
 class EventPayload(BaseModel):
     seq: int
     event_type: str
@@ -104,8 +119,60 @@ class StartRunRequest(BaseModel):
     reasoning_mode: Literal["auto", "manual"] = "auto"
     manual_level: ReasoningLevel = "MED"
     evidence_dump: bool = False
+    model_tier: Literal["fast", "deep", "pro", "auto"] = "pro"
+    deep_mode: Literal["auto", "oss", "cluster"] = "auto"
     search_depth_mode: Literal["auto", "basic", "advanced"] = "auto"
     max_results: Optional[int] = None
     strict_mode: bool = False
     auto_memory: bool = True
     reasoning_auto: bool = True
+    upload_ids: List[int] = Field(default_factory=list)
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_inputs(cls, data: Dict[str, Any]) -> Dict[str, Any]:
+        if not isinstance(data, dict):
+            return data
+        tier_raw = str(data.get("model_tier", "") or "").lower()
+        tier_map = {
+            "localauto": "auto",
+            "local-auto": "auto",
+            "auto": "auto",
+            "localfast": "fast",
+            "local-fast": "fast",
+            "localdeep": "deep",
+            "local-deep": "deep",
+            "localpro": "pro",
+            "local-pro": "pro",
+        }
+        if tier_raw:
+            data["model_tier"] = tier_map.get(tier_raw, tier_raw)
+
+        mode_raw = str(data.get("reasoning_mode", "") or "").lower()
+        if data.get("model_tier") == "auto":
+            data["reasoning_mode"] = "auto"
+        elif mode_raw:
+            data["reasoning_mode"] = "manual" if mode_raw == "manual" else "auto"
+        else:
+            data["reasoning_mode"] = "auto"
+
+        level_raw = data.get("manual_level")
+        if level_raw is None:
+            data.pop("manual_level", None)
+        elif isinstance(level_raw, str):
+            level_up = level_raw.upper()
+            if level_up == "AUTO":
+                data.pop("manual_level", None)
+            else:
+                data["manual_level"] = level_up
+
+        if data.get("model_tier") == "auto" and not data.get("manual_level"):
+            data["manual_level"] = "MED"
+
+        deep_mode_raw = data.get("deep_mode")
+        if isinstance(deep_mode_raw, str):
+            data["deep_mode"] = deep_mode_raw.lower()
+
+        return data
+
+    model_config = {"protected_namespaces": ()}

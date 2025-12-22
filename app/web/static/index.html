@@ -2,137 +2,243 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <title>LocalPro Chat Orchestrator</title>
+  <title>LocalPro Chat</title>
   <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
-  <header class="topbar">
-    <div>
-      <h1>ChatGPT Pro (Local)</h1>
-      <p class="sub">Local multi-agent orchestrator with Tavily research.</p>
-    </div>
-    <div class="actions">
-      <button id="settingsBtn">Settings</button>
-      <span id="modelWarning" class="warning"></span>
-    </div>
-  </header>
-
-  <main class="layout">
-    <section class="panel">
-      <h2>Ask a question</h2>
-      <form id="chatForm">
-        <div class="input-row">
-          <textarea id="question" rows="4" placeholder="Ask anything..."></textarea>
-          <button type="button" id="micBtn" class="ghost">🎤</button>
-        </div>
-        <div class="controls">
-          <div>
-            <label><input type="radio" name="mode" value="auto" checked> Auto reasoning</label>
-            <label><input type="radio" name="mode" value="manual"> Manual</label>
-            <select id="manualLevel">
-              <option value="LOW">LOW</option>
-              <option value="MED" selected>MED</option>
-              <option value="HIGH">HIGH</option>
-              <option value="ULTRA">ULTRA</option>
-            </select>
-          </div>
-          <div class="slider-wrap">
-            <label>Reasoning depth</label>
-            <input type="range" id="depthSlider" min="0" max="3" value="1">
-            <span id="depthLabel">MED</span>
-            <label><input type="checkbox" id="depthAuto" checked> AUTO</label>
-          </div>
-          <div>
-            <label>Search depth</label>
-            <select id="searchDepth">
-              <option value="auto">Auto</option>
-              <option value="basic">Basic</option>
-              <option value="advanced">Advanced</option>
-            </select>
-          </div>
-          <div>
-            <label>Max results</label>
-            <input type="number" id="maxResults" value="6" min="1" max="15">
-          </div>
-          <div>
-            <label><input type="checkbox" id="strictMode"> Strict mode</label>
-          </div>
-          <div>
-            <label><input type="checkbox" id="evidenceDump"> Evidence dump</label>
-          </div>
-          <div>
-            <label><input type="checkbox" id="autoMemory" checked> Auto memory</label>
-          </div>
-          <div>
-            <label>STT lang</label>
-            <input type="text" id="sttLang" value="en-US" size="6">
+  <div class="app-shell">
+    <header class="topbar">
+      <div class="topbar-left">
+        <div class="brand">
+          <div class="dot"></div>
+          <div class="brand-text">
+            <h1>LocalPro</h1>
+            <p class="sub">Local chat, shared runs</p>
           </div>
         </div>
-        <button type="submit">Run</button>
-      </form>
+        <div class="status-chip" id="runStatus">Idle</div>
+      </div>
+      <div class="topbar-center">
+        <div class="timer mono" id="runTimer">00:00</div>
+      </div>
+      <div class="topbar-right">
+        <button id="newConversationBtn" class="pill-btn ghost">New chat</button>
+        <button id="settingsBtn" class="icon-btn" title="Settings">⚙</button>
+      </div>
+    </header>
 
-      <div id="chatThread" class="chat-thread"></div>
+    <section class="conversation-header">
+      <div class="model-row">
+        <div class="segment-group">
+          <label class="label">Model</label>
+          <div class="segmented" id="modelTierGroup">
+            <button type="button" class="seg-btn" data-tier="fast">Fast</button>
+            <button type="button" class="seg-btn" data-tier="auto">Auto</button>
+            <button type="button" class="seg-btn" data-tier="deep">Deep</button>
+            <button type="button" class="seg-btn active" data-tier="pro">Pro</button>
+          </div>
+        </div>
+        <div class="inline-control">
+          <label class="label">Reasoning</label>
+          <select id="reasoningLevel"></select>
+        </div>
+        <div class="inline-control hidden" id="deepRouteWrap">
+          <label class="label">Routing</label>
+          <select id="deepRoute">
+            <option value="auto" selected>Auto (decide best lane)</option>
+            <option value="oss">Fixed: OSS</option>
+            <option value="cluster">Fixed: Cluster</option>
+          </select>
+        </div>
+        <span id="modelWarning" class="warning-pill hidden" aria-live="polite"></span>
+      </div>
     </section>
 
-    <section class="panel activity">
-      <div class="panel-header">
-        <h2>Activity</h2>
-        <button type="button" id="toggleActivity" class="ghost">Collapse</button>
+    <section class="mobile-banner mobile-only">
+      <div class="banner-copy">
+        <p class="label">Mobile mode</p>
+        <h3>Follow this run on your phone</h3>
+        <p class="sub">Stays in sync on desktop and phone; one query at a time.</p>
+        <p class="sub">Open: <a href="http://192.168.5.112:8000">http://192.168.5.112:8000</a></p>
       </div>
-      <div id="activityFeed" class="feed"></div>
+      <div class="mobile-actions">
+        <button id="mobileNewConversationBtn" class="pill-btn ghost">New chat</button>
+        <button id="mobileOpenSettingsHint" class="pill-btn ghost" disabled>Settings on desktop</button>
+      </div>
     </section>
 
-    <section class="panel memory">
-      <div class="panel-header">
-        <h2>Memory</h2>
-        <button type="button" id="refreshMemory" class="ghost">Refresh</button>
+    <div class="ticker-bar">
+      <div class="ticker-left">
+        <span class="dot pulse-dot"></span>
+        <div id="liveTicker" class="ticker-text" title="Click to toggle reasoning history">Idle</div>
       </div>
-      <input type="text" id="memorySearch" placeholder="Search memory...">
-      <div id="memoryList" class="feed small"></div>
-    </section>
-  </main>
+      <div class="ticker-right">
+        <div id="runProgress" class="progress-bar"><div id="runProgressFill"></div></div>
+      </div>
+    </div>
 
-  <section class="panel result">
-    <h2>Final answer</h2>
-    <div id="finalAnswer"></div>
-    <div id="confidence"></div>
-    <div id="sources"></div>
-    <div id="evidence" class="hidden"></div>
-  </section>
+    <main class="main-rail">
+      <div class="chat-rail">
+        <div id="emptyState" class="empty-state hidden">
+          <p class="label">Start a conversation</p>
+          <h2>What can I help with?</h2>
+          <p class="sub">Upload files, search the web, or ask anything. We'll show reasoning, sources, and activity per reply.</p>
+          <div class="suggestion-grid">
+            <button class="suggestion-card" type="button" data-prompt="Summarize this PDF and list three action items.">Summarize this PDF and list three action items.</button>
+            <button class="suggestion-card" type="button" data-prompt="Compare the latest AI chips from NVIDIA and AMD.">Compare the latest AI chips from NVIDIA and AMD.</button>
+            <button class="suggestion-card" type="button" data-prompt="Draft a project kickoff email with timeline and owners.">Draft a project kickoff email with timeline and owners.</button>
+            <button class="suggestion-card" type="button" data-prompt="Find 3 recent articles on EU AI policy and cite them.">Find 3 recent articles on EU AI policy and cite them.</button>
+          </div>
+          <div class="capabilities-pill">Supports uploads, web search, and on-device models.</div>
+        </div>
 
-  <div id="settingsModal" class="modal hidden">
-    <div class="modal-content">
-      <h3>Settings</h3>
-      <label>Legacy LM Studio Base URL <input id="cfgBaseUrl"></label>
-      <label>Orchestrator Base URL <input id="cfgOrchBase"></label>
-      <label>Orchestrator Model ID <input id="cfgOrch"></label>
-      <label>Worker A Base URL <input id="cfgWorkerABase"></label>
-      <label>Worker A Model ID <input id="cfgQwen8"></label>
-      <label>Worker B Base URL <input id="cfgWorkerBBase"></label>
-      <label>Worker B Model ID <input id="cfgQwen8B"></label>
-      <label>Worker C Base URL <input id="cfgWorkerCBase"></input></label>
-      <label>Worker C Model ID <input id="cfgQwen8C"></label>
-      <label>Router Base URL <input id="cfgRouterBase"></label>
-      <label>Router Model ID <input id="cfgQwen4"></label>
-      <label>Summarizer Base URL <input id="cfgSummarizerBase"></label>
-      <label>Summarizer Model ID <input id="cfgSummarizer"></label>
-      <label>Verifier Base URL <input id="cfgVerifierBase"></label>
-      <label>Verifier Model ID <input id="cfgVerifier"></label>
-      <label>Tavily API Key <input id="cfgTavily" type="password"></label>
-      <label>Search depth default <input id="cfgSearchMode"></label>
-      <label>Max results base <input id="cfgMaxBase" type="number"></label>
-      <label>Max results high <input id="cfgMaxHigh" type="number"></label>
-      <label>Extract depth <input id="cfgExtract"></label>
-      <div class="panel-header">
-        <h4>Discovery</h4>
-        <button type="button" id="discoverBtn">Discover models</button>
+        <div id="chatThread" class="chat-thread"></div>
+
+        <div class="attachment-strip hidden" id="attachmentStrip">
+          <div id="uploadDrop" class="dropzone">
+            <button type="button" id="dismissUploadDrop" class="icon-btn ghost close-upload" title="Hide uploads">x</button>
+            <div>
+              <p class="label">Uploads</p>
+              <p class="sub">Drop files or tap attach. Images/PDFs go to vision + secretary.</p>
+            </div>
+            <div class="drop-actions">
+              <button type="button" id="attachBtn" class="pill-btn ghost">Attach</button>
+              <input id="fileInput" type="file" accept="image/*,.pdf" multiple hidden>
+            </div>
+          </div>
+          <button type="button" id="showUploadDrop" class="pill-btn ghost hidden">Show uploads</button>
+          <div id="attachmentList" class="attachment-list strip"></div>
+        </div>
+
+        <form id="chatForm" class="composer">
+          <div class="composer-shell">
+            <div class="composer-main">
+              <div class="composer-left">
+                <button type="button" id="attachMenu" class="icon-btn ghost" title="Tools">+</button>
+              </div>
+              <textarea id="question" rows="3" placeholder="Message"></textarea>
+              <div class="composer-right">
+                <button type="button" id="micBtn" class="icon-btn" title="Speak">🎤</button>
+                <button type="submit" class="send-btn" title="Send">
+                  <span class="send-icon">↑</span>
+                </button>
+              </div>
+            </div>
+            <div class="composer-footer">
+              <div class="helper">Enter to send • Shift+Enter for new line</div>
+              <div class="meta-row">
+                <span class="pill">Tier: <span id="reasoningBadge">Auto</span></span>
+                <span class="pill live" id="sttStatus">Mic idle</span>
+                <span class="pill" id="charCount">0 chars</span>
+                <span class="pill" id="progressText">Progress: 0%</span>
+                <span class="pill" id="etaText">ETA: --</span>
+              </div>
+            </div>
+          </div>
+        </form>
+
+        <div class="answer-meta">
+          <div id="confidence" class="sub"></div>
+          <div id="sources"></div>
+        </div>
       </div>
-      <label>Discovery base URLs (comma-separated) <input id="cfgDiscovery"></label>
-      <div class="modal-actions">
-        <button id="saveSettings">Save</button>
-        <button id="closeSettings">Close</button>
+    </main>
+
+    <aside class="drawer hidden" id="reasoningPanel" aria-label="Reasoning drawer">
+      <div class="drawer-head">
+        <div>
+          <p class="label">Details</p>
+          <h3>Reasoning & Sources</h3>
+          <p class="sub" id="drawerSubline"></p>
+        </div>
+        <div class="drawer-actions">
+          <button type="button" class="pill-btn ghost" id="drawerClose">Close</button>
+        </div>
       </div>
-      <p id="settingsStatus" class="status"></p>
+      <div class="drawer-tabs" role="tablist">
+        <button class="tab-btn active" type="button" data-tab="activity" aria-selected="true">Activity</button>
+        <button class="tab-btn" type="button" data-tab="reasoning" aria-selected="false">Reasoning</button>
+        <button class="tab-btn" type="button" data-tab="sources" aria-selected="false">Sources</button>
+      </div>
+      <div class="drawer-panels">
+        <div class="tab-panel" data-tab="activity" id="tabActivity" role="tabpanel">
+          <div id="reasoningFeed" class="feed thinking-feed"></div>
+        </div>
+        <div class="tab-panel hidden" data-tab="reasoning" id="tabReasoning" role="tabpanel"></div>
+        <div class="tab-panel hidden" data-tab="sources" id="tabSources" role="tabpanel"></div>
+      </div>
+    </aside>
+    <div id="drawerOverlay" class="drawer-overlay hidden"></div>
+
+    <div id="settingsModal" class="modal hidden">
+      <div class="modal-content">
+        <div class="modal-head">
+          <div>
+            <p class="label">Environment</p>
+            <h3>Settings</h3>
+          </div>
+          <button id="closeSettings" type="button" class="icon-btn">✕</button>
+        </div>
+
+        <div class="settings-grid">
+          <div class="settings-group">
+            <p class="label">LM Studio defaults</p>
+            <label>Legacy Base URL <input id="cfgBaseUrl"></label>
+            <label>Tavily API Key <input id="cfgTavily" type="password"></label>
+            <label>Search depth default <input id="cfgSearchMode"></label>
+            <label>Max results base <input id="cfgMaxBase" type="number"></label>
+            <label>Max results high <input id="cfgMaxHigh" type="number"></label>
+            <label>Extract depth <input id="cfgExtract"></label>
+          </div>
+
+          <div class="settings-group">
+            <p class="label">Models</p>
+            <label>Orchestrator Base URL <input id="cfgOrchBase"></label>
+            <label>Orchestrator Model ID <input id="cfgOrch"></label>
+            <label>Router Base URL <input id="cfgRouterBase"></label>
+            <label>Router Model ID <input id="cfgQwen4"></label>
+            <label>Summarizer Base URL <input id="cfgSummarizerBase"></label>
+            <label>Summarizer Model ID <input id="cfgSummarizer"></label>
+            <label>Verifier Base URL <input id="cfgVerifierBase"></label>
+            <label>Verifier Model ID <input id="cfgVerifier"></label>
+          </div>
+
+          <div class="settings-group">
+            <p class="label">Workers</p>
+            <label>Worker A Base URL <input id="cfgWorkerABase"></label>
+            <label>Worker A Model ID <input id="cfgQwen8"></label>
+            <label>Worker B Base URL <input id="cfgWorkerBBase"></label>
+            <label>Worker B Model ID <input id="cfgQwen8B"></label>
+            <label>Worker C Base URL <input id="cfgWorkerCBase"></label>
+            <label>Worker C Model ID <input id="cfgQwen8C"></label>
+          </div>
+
+          <div class="settings-group">
+            <p class="label">Tier presets</p>
+            <label>Fast Base URL <input id="cfgFastBase"></label>
+            <label>Fast Model ID <input id="cfgFastModel"></label>
+            <label>Deep Planner Base URL <input id="cfgDeepPlannerBase"></label>
+            <label>Deep Planner Model ID <input id="cfgDeepPlanner"></label>
+            <label>Deep Orchestrator Base URL <input id="cfgDeepOrchBase"></label>
+            <label>Deep Orchestrator Model ID <input id="cfgDeepOrch"></label>
+          </div>
+
+          <div class="settings-group">
+            <p class="label">Discovery</p>
+            <label>Discovery base URLs (comma) <input id="cfgDiscovery"></label>
+            <div class="panel-actions">
+              <button type="button" id="discoverBtn" class="pill-btn ghost">Discover models</button>
+              <button type="button" id="applyDefaults" class="pill-btn ghost">Use recommended defaults</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="modal-actions">
+          <button id="saveSettings" class="primary">Save</button>
+          <button id="closeSettingsFooter" type="button" class="ghost">Close</button>
+        </div>
+        <p id="settingsStatus" class="status"></p>
+      </div>
     </div>
   </div>
 

@@ -1,5 +1,16 @@
 """Prompt profiles for the micromanager orchestrator and worker fielders."""
 
+TOOLBOX_GUIDE = """
+Tooling you can request (add to tool_requests[] in your JSON output):
+- live_date / time_now: ask for current UTC date/time.
+- calculator: provide an expression to evaluate.
+- code_eval: short, read-only Python snippets (no file writes/network).
+- image_zoom / pdf_scan: specify what to zoom or which PDF pages/sections to skim; backend will extract text only.
+"""
+SEARCH_GUIDE = """
+You must drive Tavily search/extract by filling queries[] with 3-6 specific web searches (include variations and recency hints like "past month" when relevant). Do not answer from memory; the backend will run the searches and extraction, you only return queries, sources (url,title,snippet), claims, gaps, and optional tool_requests[]. Keep output strict JSON.
+"""
+
 # Orchestrator micromanager system prompt
 MICROMANAGER_SYSTEM = """
 SYSTEM (ORCHESTRATOR - GPT-OSS-20B)
@@ -26,6 +37,7 @@ NON-NEGOTIABLES
 6) No chain-of-thought in user-visible output. Only operational summaries and evidence.
 7) Respect reasoning_depth (LOW/MED/HIGH/ULTRA). Higher depth -> more steps, higher tool budgets, stricter verification (>=2 sources per claim when possible), more retries/backtracks. ULTRA requires advanced search and strict PASS before finalizing.
 8) Use memory context if provided; pull relevant items explicitly and cite them as memory, not as fresh web evidence.
+9) Calibrate the final answer length and structure to the initial ask and total work needed (very short when the ask is narrow; concise bullets for medium tasks; compact but complete paragraphs for deep research). State if another pass or follow-ups are needed.
 
 HOW TO WORK
 A) Build Step Plan JSON.
@@ -57,7 +69,8 @@ You are the Router. Decide whether web research is needed and choose a reasoning
 Consider memory context if provided. Output strict JSON with keys:
 { "needs_web": bool, "reasoning_level": "LOW|MED|HIGH|ULTRA", "topic":"general|news|finance|science|tech",
   "max_results": int, "extract_depth":"basic|advanced", "tool_budget": {"tavily_search": int, "tavily_extract": int},
-  "stop_conditions": {}, "notes": "" }
+  "stop_conditions": {}, "expected_passes": 1, "notes": "" }
+expected_passes should be 1 for easy factual answers, 2 when verification is likely to trigger a rerun, 3 for very deep or adversarial work.
 No extra text.
 """
 
@@ -66,38 +79,50 @@ RESEARCH_PRIMARY_SYSTEM = """
 SYSTEM (WORKER: ResearchPrimary)
 Return evidence only, not a final answer.
 Prefer primary/official sources and definitions.
-Output JSON: queries, sources (with excerpts), claims (claim->urls), gaps.
+Use tool_requests[] when you need live_date, calculator, code_eval, image_zoom, or pdf_scan helpers (see toolbox below).
+Use Tavily by providing queries[] (3-6 targeted web searches with variations/time hints) and leave execution to the backend.
+Output JSON: queries, sources (with excerpts), claims (claim->urls), gaps, tool_requests[] if needed.
+{search}{toolbox}
 No extra text outside JSON.
-"""
+""".format(search=SEARCH_GUIDE.strip(), toolbox=TOOLBOX_GUIDE.strip())
 
 RESEARCH_RECENCY_SYSTEM = """
 SYSTEM (WORKER: ResearchRecency)
 Return evidence only, prioritize latest updates and dated sources.
+Use tool_requests[] when you need live_date, calculator, code_eval, image_zoom, or pdf_scan helpers.
 Output JSON only.
-"""
+Use Tavily by providing queries[] (3-6 targeted web searches with variations/time hints) and leave execution to the backend.
+{search}{toolbox}
+""".format(search=SEARCH_GUIDE.strip(), toolbox=TOOLBOX_GUIDE.strip())
 
 RESEARCH_ADVERSARIAL_SYSTEM = """
 SYSTEM (WORKER: ResearchAdversarial)
 Return evidence only, focus on caveats, conflicts, counterexamples.
+Use tool_requests[] for live_date, calculator, code_eval, image_zoom, or pdf_scan helpers.
 Output JSON only, include conflicts_found[].
-"""
+Use Tavily by providing queries[] (3-6 targeted web searches with variations/time hints) and leave execution to the backend.
+{search}{toolbox}
+""".format(search=SEARCH_GUIDE.strip(), toolbox=TOOLBOX_GUIDE.strip())
 
 MATH_SYSTEM = """
 SYSTEM (WORKER: Math)
 Solve calculations step-by-step and return JSON with steps and result.
+If you need a helper, include tool_requests[] (calculator, code_eval, live_date) in JSON.
 No external facts unless provided.
 """
 
 CRITIC_SYSTEM = """
 SYSTEM (WORKER: Critic)
 Given a draft + claims ledger, list failure modes and missing evidence.
-Return JSON only: issues[], suggested_fix_steps[].
+If you need supporting helpers (live_date, calculator, code_eval, image_zoom/pdf_scan), include tool_requests[].
+Return JSON only: issues[], suggested_fix_steps[], optional tool_requests[].
 """
 
 SUMMARIZER_SYSTEM = """
 SYSTEM (WORKER: Summarizer)
 Turn internal step outputs into short operational status lines and compress long artifacts into short memory notes.
 No chain-of-thought.
+If an asset (image/PDF) needs inspection or you need live_date/calculator/code_eval, surface tool_requests[] with specifics.
 Mark proposed long-term memory as candidate_memory[]. Return JSON only: activity_lines[], memory_notes[], candidate_memory[].
 """
 
@@ -105,6 +130,21 @@ JSON_REPAIR_SYSTEM = """
 SYSTEM (WORKER: JSONRepair)
 You output ONLY valid repaired JSON for the given malformed JSON string.
 No commentary.
+"""
+
+# Vision and upload helpers
+VISION_ANALYST_SYSTEM = """
+SYSTEM (WORKER: VisionAnalyst)
+You receive an image (vision-capable) and must return structured JSON about it.
+Return JSON only with keys: caption (short), objects[] (with name, confidence?), text (visible text), details (notable attributes),
+and safety_notes (if any). Keep it concise and literal.
+"""
+
+UPLOAD_SECRETARY_SYSTEM = """
+SYSTEM (WORKER: UploadSecretary)
+You assist by turning vision analysis + optional text into a compact summary for the main task planner.
+Return JSON only: {summary: string, bullet_points: [..], suggested_queries: [..], tags: [..]}.
+Keep it short and actionable.
 """
 
 VERIFIER_SYSTEM = """

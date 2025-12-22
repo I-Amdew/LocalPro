@@ -138,6 +138,19 @@ class Database:
                     content_json TEXT,
                     created_at TEXT
                 );
+                CREATE TABLE IF NOT EXISTS uploads(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_id TEXT,
+                    filename TEXT,
+                    original_name TEXT,
+                    mime TEXT,
+                    size_bytes INTEGER,
+                    storage_path TEXT,
+                    status TEXT,
+                    summary_text TEXT,
+                    summary_json TEXT,
+                    created_at TEXT
+                );
                 CREATE TABLE IF NOT EXISTS control_actions(
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     run_id TEXT,
@@ -162,6 +175,11 @@ class Database:
                     memory_item_id INTEGER,
                     reason TEXT
                 );
+                CREATE TABLE IF NOT EXISTS conversation_state(
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    reset_at TEXT
+                );
+                INSERT OR IGNORE INTO conversation_state(id, reset_at) VALUES (1, NULL);
                 """
             )
             await db.commit()
@@ -216,11 +234,15 @@ class Database:
     async def update_run_status(self, run_id: str, status: str) -> None:
         await self.execute("UPDATE runs SET status=? WHERE run_id=?", (status, run_id))
 
-    async def add_message(self, run_id: str, role: str, content: str) -> None:
-        await self.execute(
-            "INSERT INTO messages(run_id, role, content, created_at) VALUES (?,?,?,?)",
-            (run_id, role, content, utc_now()),
-        )
+    async def add_message(self, run_id: str, role: str, content: str) -> dict:
+        created_at = utc_now()
+        async with aiosqlite.connect(self.path) as db:
+            cursor = await db.execute(
+                "INSERT INTO messages(run_id, role, content, created_at) VALUES (?,?,?,?)",
+                (run_id, role, content, created_at),
+            )
+            await db.commit()
+            return {"id": cursor.lastrowid, "created_at": created_at}
 
     async def add_task(self, run_id: str, task_type: str, payload: dict, status: str) -> None:
         await self.execute(
@@ -345,6 +367,18 @@ class Database:
             "status": row["status"],
         }
 
+    async def get_latest_run(self, after: Optional[str] = None) -> Optional[dict]:
+        if after:
+            row = await self.fetchone(
+                "SELECT run_id FROM runs WHERE created_at > ? ORDER BY created_at DESC LIMIT 1",
+                (after,),
+            )
+        else:
+            row = await self.fetchone("SELECT run_id FROM runs ORDER BY created_at DESC LIMIT 1")
+        if not row:
+            return None
+        return await self.get_run_summary(row["run_id"])
+
     async def get_sources(self, run_id: str) -> List[dict]:
         rows = await self.fetchall(
             "SELECT lane, url, title, publisher, date_published, snippet, extracted_text FROM sources WHERE run_id=?",
@@ -455,6 +489,80 @@ class Database:
             ),
         )
 
+    async def add_upload(
+        self,
+        run_id: Optional[str],
+        filename: str,
+        original_name: str,
+        mime: str,
+        size_bytes: int,
+        storage_path: str,
+        status: str = "received",
+    ) -> int:
+        async with aiosqlite.connect(self.path) as db:
+            cursor = await db.execute(
+                "INSERT INTO uploads(run_id, filename, original_name, mime, size_bytes, storage_path, status, created_at) VALUES (?,?,?,?,?,?,?,?)",
+                (run_id or "", filename, original_name, mime, size_bytes, storage_path, status, utc_now()),
+            )
+            await db.commit()
+            return cursor.lastrowid
+
+    async def update_upload_status(
+        self, upload_id: int, status: str, summary_text: Optional[str] = None, summary_json: Optional[dict] = None
+    ) -> None:
+        await self.execute(
+            "UPDATE uploads SET status=?, summary_text=?, summary_json=? WHERE id=?",
+            (status, summary_text or "", json.dumps(summary_json or {}), upload_id),
+        )
+
+    async def assign_upload_to_run(self, upload_id: int, run_id: str) -> None:
+        await self.execute("UPDATE uploads SET run_id=? WHERE id=?", (run_id, upload_id))
+
+    async def get_upload(self, upload_id: int) -> Optional[dict]:
+        row = await self.fetchone(
+            "SELECT id, run_id, filename, original_name, mime, size_bytes, storage_path, status, summary_text, summary_json, created_at FROM uploads WHERE id=?",
+            (upload_id,),
+        )
+        if not row:
+            return None
+        return {
+            "id": row["id"],
+            "run_id": row["run_id"],
+            "filename": row["filename"],
+            "original_name": row["original_name"],
+            "mime": row["mime"],
+            "size_bytes": row["size_bytes"],
+            "storage_path": row["storage_path"],
+            "status": row["status"],
+            "summary_text": row["summary_text"],
+            "summary_json": json.loads(row["summary_json"] or "{}"),
+            "created_at": row["created_at"],
+        }
+
+    async def list_uploads(self, run_id: str) -> List[dict]:
+        rows = await self.fetchall(
+            "SELECT id, run_id, filename, original_name, mime, size_bytes, storage_path, status, summary_text, summary_json, created_at FROM uploads WHERE run_id=? ORDER BY id ASC",
+            (run_id,),
+        )
+        out = []
+        for row in rows:
+            out.append(
+                {
+                    "id": row["id"],
+                    "run_id": row["run_id"],
+                    "filename": row["filename"],
+                    "original_name": row["original_name"],
+                    "mime": row["mime"],
+                    "size_bytes": row["size_bytes"],
+                    "storage_path": row["storage_path"],
+                    "status": row["status"],
+                    "summary_text": row["summary_text"],
+                    "summary_json": json.loads(row["summary_json"] or "{}"),
+                    "created_at": row["created_at"],
+                }
+            )
+        return out
+
     async def add_control_action(self, run_id: str, payload: dict) -> None:
         await self.execute(
             "INSERT INTO control_actions(run_id, action_type, payload_json, created_at) VALUES (?,?,?,?)",
@@ -553,3 +661,25 @@ class Database:
             }
             for r in rows
         ]
+
+    async def list_messages(self, limit: int = 200) -> List[dict]:
+        rows = await self.fetchall(
+            "SELECT id, run_id, role, content, created_at FROM messages ORDER BY created_at ASC LIMIT ?",
+            (limit,),
+        )
+        return [dict(r) for r in rows]
+
+    async def reset_conversation(self) -> str:
+        reset_at = utc_now()
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute("DELETE FROM messages")
+            await db.execute(
+                "INSERT OR REPLACE INTO conversation_state(id, reset_at) VALUES (1, ?)",
+                (reset_at,),
+            )
+            await db.commit()
+        return reset_at
+
+    async def get_conversation_reset(self) -> Optional[str]:
+        row = await self.fetchone("SELECT reset_at FROM conversation_state WHERE id=1")
+        return row["reset_at"] if row and row["reset_at"] else None

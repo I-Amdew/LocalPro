@@ -5,8 +5,9 @@ import httpx
 
 
 class LMStudioClient:
-    def __init__(self, base_url: str):
+    def __init__(self, base_url: str, max_output_tokens: Optional[int] = None):
         self.base_url = base_url.rstrip("/")
+        self.max_output_tokens = max_output_tokens
         self.client = httpx.AsyncClient(timeout=60)
 
     async def list_models(self, base_url: Optional[str] = None) -> Dict[str, Any]:
@@ -18,19 +19,22 @@ class LMStudioClient:
     async def chat_completion(
         self,
         model: str,
-        messages: List[Dict[str, str]],
+        messages: List[Dict[str, Any]],
         temperature: float = 0.2,
         max_tokens: int = 512,
         stream: bool = False,
         response_format: Optional[dict] = None,
         base_url: Optional[str] = None,
     ) -> Any:
+        final_max_tokens = max_tokens
+        if self.max_output_tokens:
+            final_max_tokens = min(max_tokens, self.max_output_tokens)
         url = f"{(base_url or self.base_url).rstrip('/')}/chat/completions"
         payload: Dict[str, Any] = {
             "model": model,
             "messages": messages,
             "temperature": temperature,
-            "max_tokens": max_tokens,
+            "max_tokens": final_max_tokens,
             "stream": stream,
         }
         if response_format:
