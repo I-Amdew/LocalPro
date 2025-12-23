@@ -38,5 +38,6 @@ Notes: if activation is blocked, run `Set-ExecutionPolicy -Scope Process -Execut
 - Step-based micromanager orchestrator with reruns/backtracking and depth control.
 - Per-role LM Studio endpoints + Tavily search/extract; live activity feed via SSE.
 - Model tiers: LocalFast (8B linear + tools), LocalDeep (auto chooses OSS vs. Mini Pro lane or lock it manually), LocalAuto (automatically routes each question to the tier that matches its detail level), LocalPro (full OSS + four-level reasoning slider).
+- Resource-aware LocalPro execution that scales worker slots based on available RAM/VRAM and detected LM Studio models.
 - Memory panel with retrieval/save, speech-to-text input, simple SPA UI.
 - Uploads: drop images/PDFs on desktop or mobile; 8B vision labels them and 4B secretary summarizes into the plan.

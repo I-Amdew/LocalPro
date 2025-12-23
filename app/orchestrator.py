@@ -9,6 +9,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+import httpx
 from pypdf import PdfReader
 
 from . import agents
@@ -23,6 +24,7 @@ from .schemas import (
     VerifierReport,
 )
 from .tavily import TavilyClient
+from .system_info import compute_worker_slots, get_resource_snapshot
 
 
 # Reasoning depth mapping
@@ -32,6 +34,9 @@ REASONING_DEPTHS = {
     "HIGH": {"max_steps": 14, "research_rounds": 3, "tool_budget": {"tavily_search": 12, "tavily_extract": 16}, "advanced": True},
     "ULTRA": {"max_steps": 20, "research_rounds": 3, "tool_budget": {"tavily_search": 18, "tavily_extract": 24}, "advanced": True, "strict_verify": True},
 }
+
+# Cache models that LM Studio reports as unloaded or missing.
+UNAVAILABLE_MODELS: Set[Tuple[str, str]] = set()
 
 
 class EventBus:
@@ -71,6 +76,8 @@ async def safe_json_parse(raw: str, lm_client: LMStudioClient, fixer_model: str)
         return json.loads(raw)
     except Exception:
         pass
+    if not fixer_model:
+        return None
     try:
         resp = await lm_client.chat_completion(
             model=fixer_model,
@@ -217,6 +224,33 @@ def guess_needs_web(question: str) -> bool:
     return False
 
 
+def build_fallback_queries(question: str, prompt: str = "") -> List[str]:
+    base = " ".join((question or "").strip().split())
+    if not base:
+        base = " ".join((prompt or "").strip().split())
+    if not base:
+        return []
+    lower = base.lower()
+    variants = [base]
+    if "official" not in lower:
+        variants.append(f"{base} official")
+    if "data" not in lower and "statistics" not in lower:
+        variants.append(f"{base} data")
+    if "report" not in lower and "study" not in lower:
+        variants.append(f"{base} report")
+    if "site:" not in lower:
+        variants.append(f"{base} site:.gov")
+    queries: List[str] = []
+    seen = set()
+    for q in variants:
+        q = q.strip()
+        if not q or q in seen:
+            continue
+        seen.add(q)
+        queries.append(q)
+    return queries[:5]
+
+
 EXPLORATORY_PHRASES = (
     "idea",
     "ideas",
@@ -286,6 +320,7 @@ def profile_system(profile: str) -> str:
         "Math": agents.MATH_SYSTEM,
         "Critic": agents.CRITIC_SYSTEM,
         "Summarizer": agents.SUMMARIZER_SYSTEM,
+        "Writer": agents.WRITER_SYSTEM,
         "JSONRepair": agents.JSON_REPAIR_SYSTEM,
         "Verifier": agents.VERIFIER_SYSTEM,
     }.get(profile, agents.RESEARCH_PRIMARY_SYSTEM)
@@ -295,6 +330,8 @@ def profile_model(profile: str, model_map: Dict[str, Dict[str, str]]) -> Tuple[s
     """Return (base_url, model_id) for a given profile."""
     if profile == "Orchestrator":
         cfg = model_map.get("orch")
+    elif profile == "Writer":
+        cfg = model_map.get("orch") or model_map.get("worker")
     elif profile in ("Summarizer", "Critic", "JSONRepair"):
         cfg = model_map.get("summarizer") or model_map.get("router") or model_map.get("worker")
     elif profile == "Verifier":
@@ -310,6 +347,46 @@ def profile_model(profile: str, model_map: Dict[str, Dict[str, str]]) -> Tuple[s
     return cfg.get("base_url"), cfg.get("model")
 
 
+def candidate_endpoints(profile: str, model_map: Dict[str, Dict[str, str]]) -> List[Tuple[str, str]]:
+    """Return ordered (base_url, model) tuples with fallbacks for a profile."""
+    if profile == "ResearchRecency":
+        order = ["worker_b", "worker", "worker_c", "orch", "summarizer", "router"]
+    elif profile == "ResearchAdversarial":
+        order = ["worker_c", "worker", "worker_b", "orch", "summarizer", "router"]
+    elif profile == "ResearchPrimary":
+        order = ["worker", "worker_b", "worker_c", "orch", "summarizer", "router"]
+    elif profile == "Orchestrator":
+        order = ["orch", "worker", "summarizer", "router"]
+    elif profile == "Writer":
+        order = ["orch", "worker", "summarizer", "router"]
+    elif profile == "Verifier":
+        order = ["verifier", "worker", "orch", "summarizer"]
+    elif profile in ("Summarizer", "Critic", "JSONRepair"):
+        order = ["summarizer", "worker", "router", "orch"]
+    else:
+        order = ["worker", "orch", "summarizer", "router", "verifier"]
+    seen: Set[Tuple[str, str]] = set()
+    candidates: List[Tuple[str, str]] = []
+    for key in order:
+        cfg = model_map.get(key) or {}
+        base_url = cfg.get("base_url")
+        model = cfg.get("model")
+        if not base_url or not model:
+            continue
+        pair = (base_url, model)
+        if pair in UNAVAILABLE_MODELS:
+            continue
+        if pair in seen:
+            continue
+        seen.add(pair)
+        candidates.append(pair)
+    # Ensure the explicit profile mapping is included even if it's non-standard.
+    primary = profile_model(profile, model_map)
+    if primary[0] and primary[1] and primary not in seen:
+        candidates.insert(0, primary)
+    return candidates
+
+
 def select_model_suite(
     base_map: Dict[str, Dict[str, str]], tier: str, deep_route: str
 ) -> Tuple[Dict[str, Dict[str, str]], Dict[str, str], Dict[str, str], bool, str]:
@@ -322,11 +399,12 @@ def select_model_suite(
     verifier = base_map.get("verifier") or base_map.get("worker") or base_map.get("orch", {})
     if tier == "fast":
         fast_ep = base_map.get("fast") or base_map.get("worker") or base_map.get("orch", {})
+        primary_worker = base_map.get("worker") or fast_ep
         suite = {
             "orch": fast_ep,
             "worker": fast_ep,
-            "worker_b": fast_ep,
-            "worker_c": fast_ep,
+            "worker_b": base_map.get("worker_b") or primary_worker,
+            "worker_c": base_map.get("worker_c") or primary_worker,
             "router": summarizer,
             "summarizer": summarizer,
             "verifier": verifier,
@@ -335,11 +413,12 @@ def select_model_suite(
     if tier == "deep":
         if deep_route == "oss":
             oss_ep = base_map.get("orch") or base_map.get("worker") or {}
+            primary_worker = base_map.get("worker") or oss_ep
             suite = {
                 "orch": oss_ep,
-                "worker": oss_ep,
-                "worker_b": oss_ep,
-                "worker_c": oss_ep,
+                "worker": primary_worker,
+                "worker_b": base_map.get("worker_b") or primary_worker,
+                "worker_c": base_map.get("worker_c") or primary_worker,
                 "router": summarizer,
                 "summarizer": summarizer,
                 "verifier": verifier,
@@ -375,8 +454,15 @@ def resolve_auto_tier(decision: RouterDecision) -> str:
     return "fast"
 
 
-def build_linear_plan(question: str, decision: RouterDecision, depth_profile: dict, needs_verify: bool = True) -> StepPlan:
-    """Deterministic lightweight plan for fast/oss-linear modes."""
+def build_linear_plan(
+    question: str,
+    decision: RouterDecision,
+    depth_profile: dict,
+    needs_verify: bool = True,
+    worker_slots: int = 1,
+    prefer_parallel: bool = False,
+) -> StepPlan:
+    """Deterministic lightweight plan for fast/oss-linear modes with optional parallel research lanes."""
     steps: List[dict] = [
         {
             "step_id": 1,
@@ -389,36 +475,90 @@ def build_linear_plan(question: str, decision: RouterDecision, depth_profile: di
             "acceptance_criteria": ["criteria captured"],
             "on_fail": {"action": "rerun_step"},
         },
+    ]
+    next_step_id = 2
+    research_steps: List[dict] = []
+    parallel_research = prefer_parallel and worker_slots > 1
+    if parallel_research:
+        research_defs = [
+            ("ResearchPrimary", "Research primary", "lane_primary"),
+            ("ResearchRecency", "Research recency", "lane_recency"),
+            ("ResearchAdversarial", "Research adversarial", "lane_adversarial"),
+        ]
+        max_research = min(worker_slots, len(research_defs))
+        for profile, name, key in research_defs[:max_research]:
+            research_steps.append(
+                {
+                    "step_id": next_step_id,
+                    "name": name,
+                    "type": "research",
+                    "depends_on": [1],
+                    "agent_profile": profile,
+                    "inputs": {"use_web": decision.needs_web},
+                    "outputs": [{"artifact_type": "evidence", "key": key}],
+                    "acceptance_criteria": ["notes ready"],
+                    "on_fail": {"action": "rerun_step"},
+                }
+            )
+            next_step_id += 1
+        steps.extend(research_steps)
+        if len(research_steps) > 1:
+            merge_id = next_step_id
+            steps.append(
+                {
+                    "step_id": merge_id,
+                    "name": "Merge notes",
+                    "type": "merge",
+                    "depends_on": [s["step_id"] for s in research_steps],
+                    "agent_profile": "Summarizer",
+                    "inputs": {},
+                    "outputs": [{"artifact_type": "ledger", "key": "claims_ledger"}],
+                    "acceptance_criteria": ["ledger_ready"],
+                    "on_fail": {"action": "revise_step"},
+                }
+            )
+            next_step_id += 1
+            draft_dep = merge_id
+        else:
+            draft_dep = research_steps[0]["step_id"]
+    else:
+        steps.append(
+            {
+                "step_id": next_step_id,
+                "name": "Gather notes",
+                "type": "research",
+                "depends_on": [1],
+                "agent_profile": "ResearchPrimary",
+                "inputs": {"use_web": decision.needs_web},
+                "outputs": [{"artifact_type": "evidence", "key": "lane_primary"}],
+                "acceptance_criteria": ["notes ready"],
+                "on_fail": {"action": "rerun_step"},
+            }
+        )
+        draft_dep = next_step_id
+        next_step_id += 1
+    draft_step_id = next_step_id
+    steps.append(
         {
-            "step_id": 2,
-            "name": "Gather notes",
-            "type": "research",
-            "depends_on": [1],
-            "agent_profile": "ResearchPrimary",
-            "inputs": {"use_web": decision.needs_web},
-            "outputs": [{"artifact_type": "evidence", "key": "lane_primary"}],
-            "acceptance_criteria": ["notes ready"],
-            "on_fail": {"action": "rerun_step"},
-        },
-        {
-            "step_id": 3,
+            "step_id": draft_step_id,
             "name": "Draft answer",
             "type": "draft",
-            "depends_on": [2],
-            "agent_profile": "Orchestrator",
+            "depends_on": [draft_dep],
+            "agent_profile": "Writer",
             "inputs": {},
             "outputs": [{"artifact_type": "draft", "key": "draft_answer"}],
             "acceptance_criteria": ["draft_complete"],
             "on_fail": {"action": "revise_step"},
-        },
-    ]
+        }
+    )
+    next_step_id += 1
     if needs_verify:
         steps.append(
             {
-                "step_id": 4,
+                "step_id": next_step_id,
                 "name": "Verify",
                 "type": "verify",
-                "depends_on": [3],
+                "depends_on": [draft_step_id],
                 "agent_profile": "Verifier",
                 "inputs": {},
                 "outputs": [{"artifact_type": "verifier", "key": "verifier_report"}],
@@ -539,7 +679,7 @@ async def build_step_plan(
     plan_prompt = (
         "Produce a JSON step plan for answering the question. "
         "Include step_id, name, type, depends_on (list of ids), agent_profile, acceptance_criteria. "
-        "Keep 6-12 steps for typical questions. "
+        "Keep 6-12 steps for typical questions and use agent_profile 'Writer' for the draft step. "
         "Add global_constraints.expected_passes (1-3) if a verifier rerun is likely, and response_guidance describing how long the final answer should be based on task complexity."
     )
     user_content = (
@@ -637,7 +777,7 @@ async def build_step_plan(
                     "name": "Draft answer",
                     "type": "draft",
                     "depends_on": [5],
-                    "agent_profile": "Orchestrator",
+                    "agent_profile": "Writer",
                     "inputs": {},
                     "outputs": [{"artifact_type": "draft", "key": "draft_answer"}],
                     "acceptance_criteria": ["draft_complete"],
@@ -668,16 +808,44 @@ async def run_worker(
     temperature: float = 0.2,
     max_tokens: int = 700,
 ) -> str:
-    base_url, model = profile_model(profile, model_map)
     system_prompt = profile_system(profile)
-    resp = await lm_client.chat_completion(
-        model=model,
-        messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": prompt}],
-        temperature=temperature,
-        max_tokens=max_tokens,
-        base_url=base_url,
-    )
-    return resp["choices"][0]["message"]["content"]
+    last_error: Optional[Exception] = None
+    for base_url, model in candidate_endpoints(profile, model_map):
+        try:
+            resp = await lm_client.chat_completion(
+                model=model,
+                messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": prompt}],
+                temperature=temperature,
+                max_tokens=max_tokens,
+                base_url=base_url,
+            )
+            return resp["choices"][0]["message"]["content"]
+        except httpx.HTTPStatusError as exc:
+            last_error = exc
+            detail = ""
+            try:
+                detail = exc.response.text or ""
+            except Exception:
+                detail = ""
+            detail_lower = detail.lower()
+            # Retry with fallback models if the current model is unavailable or unloaded.
+            if exc.response is not None and exc.response.status_code in (400, 404):
+                if (
+                    "model unloaded" in detail_lower
+                    or "model not found" in detail_lower
+                    or "invalid model identifier" in detail_lower
+                    or "valid downloaded model" in detail_lower
+                ):
+                    UNAVAILABLE_MODELS.add((base_url, model))
+                    continue
+            # For other status errors, try fallbacks but keep the last error.
+            continue
+        except httpx.RequestError as exc:
+            last_error = exc
+            continue
+    if last_error:
+        raise last_error
+    raise RuntimeError("No available model endpoint for profile.")
 
 
 async def generate_step_prompt(
@@ -705,6 +873,8 @@ async def generate_step_prompt(
             "\nReturn JSON with queries (3-6 specific Tavily web searches), sources (url,title,snippet), claims, gaps, tool_requests[] if needed. "
             "Queries are executed by the backend; include variations and recency hints when relevant. Do not provide a final answer."
         )
+    if step.type == "draft":
+        prompt += "\nReturn the final answer only (plain text). Do not output JSON or tool-call markup."
     if answer_guidance and step.type in {"draft", "analysis", "merge", "verify"}:
         prompt += f"\nAnswer guidance: {answer_guidance}"
     return prompt
@@ -850,6 +1020,26 @@ async def allocate_ready_steps(
     return [s.step_id for s in ready_steps]
 
 
+def format_tavily_error(resp: Dict[str, Any]) -> str:
+    if not resp:
+        return "tavily_error"
+    message = str(resp.get("error") or "tavily_error")
+    detail = resp.get("detail")
+    if isinstance(detail, dict):
+        detail_msg = (
+            detail.get("detail", {}).get("error")
+            or detail.get("error")
+            or detail.get("message")
+        )
+        detail = detail_msg or json.dumps(detail)
+    if detail:
+        message = f"{message}: {detail}"
+    status = resp.get("status_code")
+    if status:
+        message = f"{status} {message}"
+    return message
+
+
 async def execute_research_step(
     run_id: str,
     question: str,
@@ -864,16 +1054,36 @@ async def execute_research_step(
     bus: EventBus,
     model_map: Dict[str, Dict[str, str]],
 ) -> Tuple[Dict[str, Any], List[Artifact], str]:
-    raw = await run_worker(lm_client, step.agent_profile, model_map, prompt, temperature=0.4, max_tokens=700)
-    parsed = await safe_json_parse(raw, lm_client, model_map["worker"])
+    raw = None
+    try:
+        raw = await run_worker(lm_client, step.agent_profile, model_map, prompt, temperature=0.4, max_tokens=700)
+    except Exception as exc:
+        await bus.emit(
+            run_id,
+            "client_note",
+            {"note": f"Research model failed; using fallback queries. ({type(exc).__name__})"},
+        )
+    fixer_model = (
+        (model_map.get("worker") or {}).get("model")
+        or (model_map.get("summarizer") or {}).get("model")
+        or (model_map.get("orch") or {}).get("model")
+        or ""
+    )
+    parsed = await safe_json_parse(raw, lm_client, fixer_model) if raw else None
     if not parsed:
-        parsed = {"queries": [prompt], "sources": [], "claims": [], "gaps": [], "tool_requests": []}
+        parsed = {
+            "queries": build_fallback_queries(question, prompt),
+            "sources": [],
+            "claims": [],
+            "gaps": [],
+            "tool_requests": [],
+        }
     queries = parsed.get("queries", [])
     if not isinstance(queries, list):
         queries = []
     queries = [str(q).strip() for q in queries if str(q).strip()]
     if not queries:
-        queries = [question] if question else [prompt]
+        queries = build_fallback_queries(question, prompt)
         parsed["queries"] = queries
     artifacts: List[Artifact] = []
     use_web = decision.needs_web
@@ -907,7 +1117,11 @@ async def execute_research_step(
             )
             await db.add_search(run_id, f"Step{step.step_id}", query, search_depth, per_query_max, search_resp)
             if search_resp.get("error"):
-                await bus.emit(run_id, "tavily_error", {"step": step.step_id, "message": search_resp.get("error")})
+                await bus.emit(
+                    run_id,
+                    "tavily_error",
+                    {"step": step.step_id, "message": format_tavily_error(search_resp)},
+                )
             for res in search_resp.get("results", [])[: per_query_max]:
                 src = {
                     "url": res.get("url"),
@@ -935,6 +1149,12 @@ async def execute_research_step(
             await bus.emit(run_id, "tavily_extract", {"step": step.step_id, "urls": url_slice})
             extract_resp = await tavily.extract(url_slice, extract_depth=decision.extract_depth if decision else "basic")
             await db.add_extract(run_id, f"Step{step.step_id}", ",".join(url_slice), decision.extract_depth, extract_resp)
+            if extract_resp.get("error"):
+                await bus.emit(
+                    run_id,
+                    "tavily_error",
+                    {"step": step.step_id, "message": format_tavily_error(extract_resp)},
+                )
             if extract_resp.get("results"):
                 gathered_sources = []
                 for res in extract_resp["results"]:
@@ -1057,7 +1277,12 @@ async def execute_step(
         )
         return merged, [artifact], prompt
     elif step.type == "draft":
-        draft_profile = step.agent_profile or "Orchestrator"
+        draft_profile = (step.agent_profile or "").strip()
+        draft_lower = draft_profile.lower()
+        if not draft_profile or draft_lower == "orchestrator":
+            draft_profile = "Writer"
+        elif draft_lower == "writer":
+            draft_profile = "Writer"
         draft_resp = await run_worker(lm_client, draft_profile, model_map, prompt, temperature=0.3, max_tokens=800)
         artifact = Artifact(
             step_id=step.step_id,
@@ -1079,7 +1304,13 @@ async def execute_step(
         report = await run_worker(
             lm_client, verifier_profile, model_map, verifier_prompt, temperature=0.0, max_tokens=700
         )
-        parsed = await safe_json_parse(report, lm_client, model_map["verifier"])
+        verifier_model = (
+            (model_map.get("verifier") or {}).get("model")
+            or (model_map.get("worker") or {}).get("model")
+            or (model_map.get("orch") or {}).get("model")
+            or ""
+        )
+        parsed = await safe_json_parse(report, lm_client, verifier_model)
         if not parsed:
             parsed = {"issues": [], "verdict": "PASS", "extra_steps": []}
         artifact = Artifact(
@@ -1245,6 +1476,7 @@ async def run_question(
     lm_client: LMStudioClient,
     tavily: TavilyClient,
     settings_models: Dict[str, Dict[str, str]],
+    model_availability: Optional[Dict[str, Any]] = None,
     upload_ids: Optional[List[int]] = None,
 ) -> None:
     """Main orchestration loop for a single run (now with parallel step execution)."""
@@ -1299,11 +1531,6 @@ async def run_question(
         )
         # Copy so we can safely adjust per-run without mutating global settings
         active_models = {k: (v.copy() if isinstance(v, dict) else v) for k, v in active_models.items()}
-        # Ensure research steps use the tool-savvy orchestrator model when web search is needed.
-        if router_decision.needs_web and active_models.get("orch"):
-            for role in ("worker", "worker_b", "worker_c"):
-                if active_models.get(role) != active_models["orch"]:
-                    active_models[role] = active_models["orch"]
         decision_payload = router_decision.model_dump()
         decision_payload.update(
             {
@@ -1313,8 +1540,26 @@ async def run_question(
                 "execution_mode": execution_mode,
             }
         )
+        try:
+            resource_snapshot = get_resource_snapshot()
+            worker_budget = compute_worker_slots(active_models, model_tier, model_availability, resource_snapshot)
+            max_parallel_slots = worker_budget.get("max_parallel", 1)
+        except Exception:
+            resource_snapshot = {}
+            worker_budget = {"max_parallel": 1, "configured": 1, "variants": 1, "ram_slots": 1, "vram_slots": 1}
+            max_parallel_slots = 1
+        if max_parallel_slots > 1 and not allow_parallel:
+            allow_parallel = True
+        if not allow_parallel:
+            max_parallel_slots = 1
+        decision_payload["resource_budget"] = worker_budget
         await db.update_run_router(run_id, decision_payload)
         await bus.emit(run_id, "router_decision", decision_payload)
+        await bus.emit(
+            run_id,
+            "resource_budget",
+            {"budget": worker_budget, "resources": resource_snapshot, "allow_parallel": allow_parallel},
+        )
         if strict_mode:
             await bus.emit(run_id, "strict_mode", {"enabled": True})
         tier_note = model_tier.upper()
@@ -1342,11 +1587,27 @@ async def run_question(
                     memory_context = (memory_context + "; " if memory_context else "") + f"Uploads: {upload_summary}"
 
         if execution_mode in ("fast_linear", "oss_linear"):
-            step_plan = build_linear_plan(question, router_decision, depth_profile, needs_verify=True)
+            step_plan = build_linear_plan(
+                question,
+                router_decision,
+                depth_profile,
+                needs_verify=True,
+                worker_slots=max_parallel_slots,
+                prefer_parallel=allow_parallel,
+            )
         else:
             step_plan = await build_step_plan(
                 lm_client, active_models["orch"], question, router_decision, depth_profile, memory_context, planner_endpoint=planner_endpoint
             )
+        for step in step_plan.steps:
+            if step.type != "draft":
+                continue
+            profile = (step.agent_profile or "").strip()
+            profile_lower = profile.lower()
+            if not profile or profile_lower == "orchestrator":
+                step.agent_profile = "Writer"
+            elif profile_lower == "writer":
+                step.agent_profile = "Writer"
         if len(step_plan.steps) > depth_profile.get("max_steps", len(step_plan.steps)):
             step_plan.steps = step_plan.steps[: depth_profile["max_steps"]]
         step_plan.global_constraints.setdefault("expected_passes", router_decision.expected_passes)
@@ -1453,10 +1714,17 @@ async def run_question(
             ready_steps = [
                 s for s in step_plan.steps if s.step_id not in completed_steps and s.step_id not in running_tasks and deps_satisfied(s)
             ]
-            if not allow_parallel and ready_steps:
-                ready_steps = sorted(ready_steps, key=lambda s: s.step_id)[:1]
-            if ready_steps:
-                start_ids = await allocate_ready_steps(lm_client, fast_endpoint, ready_steps, artifacts, len(running_tasks)) if allow_parallel else [ready_steps[0].step_id]
+            capacity = max_parallel_slots - len(running_tasks)
+            if not allow_parallel:
+                # Force one-at-a-time execution in linear modes.
+                capacity = 1 - len(running_tasks)
+            if ready_steps and capacity > 0:
+                start_ids = (
+                    await allocate_ready_steps(lm_client, fast_endpoint, ready_steps, artifacts, len(running_tasks))
+                    if allow_parallel
+                    else [ready_steps[0].step_id]
+                )
+                start_ids = start_ids[:capacity]
                 for step in ready_steps:
                     if step.step_id in start_ids and step.step_id not in running_tasks:
                         running_tasks[step.step_id] = await start_step(step, list(artifacts))
@@ -1554,7 +1822,7 @@ async def run_question(
             )
             try:
                 final_answer = await run_worker(
-                    lm_client, "Orchestrator", active_models, fallback_prompt, temperature=0.25, max_tokens=700
+                    lm_client, "Writer", active_models, fallback_prompt, temperature=0.25, max_tokens=700
                 )
             except Exception:
                 final_answer = final_answer or "Unable to produce an answer with the available context."

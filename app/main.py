@@ -14,6 +14,7 @@ from .llm import LMStudioClient
 from .orchestrator import EventBus, new_run_id, run_question
 from .schemas import StartRunRequest
 from .tavily import TavilyClient
+from .system_info import compute_worker_slots, get_resource_snapshot
 
 
 settings = load_settings()
@@ -52,7 +53,7 @@ def build_model_map(settings_obj: AppSettings, availability: Optional[Dict[str, 
                 if mid:
                     available_ids.add(mid)
 
-        def fallback(role: str, target: str) -> None:
+        def fallback(role: str, target: str, allow_unloaded: bool = False) -> None:
             info = availability.get(role)
             if info is None:
                 return
@@ -61,12 +62,18 @@ def build_model_map(settings_obj: AppSettings, availability: Optional[Dict[str, 
             if not cfg or not target_cfg:
                 return
             configured_id = cfg.get("model")
+            configured_url = cfg.get("base_url")
+            if not configured_id or not configured_url:
+                model_map[role] = target_cfg
+                return
             missing = info.get("ok") is False or (configured_id and configured_id not in available_ids)
             if missing:
+                if allow_unloaded and not info.get("error"):
+                    return
                 model_map[role] = target_cfg
 
-        fallback("worker_b", "worker")
-        fallback("worker_c", "worker")
+        fallback("worker_b", "worker", allow_unloaded=True)
+        fallback("worker_c", "worker", allow_unloaded=True)
         fallback("fast", "worker")
         fallback("deep_planner", "worker")
         fallback("deep_orch", "orch")
@@ -89,6 +96,13 @@ async def refresh_model_check(settings_obj: AppSettings) -> Dict[str, Any]:
             checks[role] = {"ok": ok, "missing": [] if ok else [cfg["model"]], "available": ids}
         except Exception as exc:
             checks[role] = {"ok": False, "error": str(exc)}
+    resources = get_resource_snapshot()
+    checks["resources"] = resources
+    try:
+        active_map = build_model_map(settings_obj, checks)
+        checks["worker_slots"] = compute_worker_slots(active_map, "pro", checks, resources)
+    except Exception:
+        pass
     model_check = checks
     return checks
 
@@ -202,8 +216,8 @@ async def start_run(payload: StartRunRequest):
         await db.update_upload_status(uid, "queued")
     asyncio.create_task(
         run_question(
-            run_id=run_id,
-            question=payload.question,
+        run_id=run_id,
+        question=payload.question,
             decision_mode=payload.reasoning_mode,
             manual_level=payload.manual_level,
             model_tier=payload.model_tier,
@@ -214,11 +228,12 @@ async def start_run(payload: StartRunRequest):
             auto_memory=payload.auto_memory,
             db=db,
             bus=bus,
-            lm_client=lm_client,
-            tavily=tavily_client,
-            settings_models=models,
-            upload_ids=upload_ids,
-        )
+        lm_client=lm_client,
+        tavily=tavily_client,
+        settings_models=models,
+        model_availability=model_check,
+        upload_ids=upload_ids,
+    )
     )
     return {"run_id": run_id}
 

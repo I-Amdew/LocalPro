@@ -10,15 +10,15 @@
   },
   "worker_a_endpoint": {
     "base_url": "http://127.0.0.1:1234/v1",
-    "model_id": "qwen/qwen3-vl-8b"
+    "model_id": "qwen/qwen3-vl-4b"
   },
   "worker_b_endpoint": {
     "base_url": "http://127.0.0.1:1234/v1",
-    "model_id": "qwen/qwen3-vl-8b:2"
+    "model_id": "qwen/qwen3-vl-4b:2"
   },
   "worker_c_endpoint": {
     "base_url": "http://127.0.0.1:1234/v1",
-    "model_id": "qwen/qwen3-vl-8b:3"
+    "model_id": "qwen/qwen3-vl-4b:3"
   },
   "router_endpoint": {
     "base_url": "http://127.0.0.1:1234/v1",

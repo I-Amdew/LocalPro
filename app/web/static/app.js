@@ -25,9 +25,7 @@ let currentTier = "pro";
 let runDetails = {};
 let runEvents = {};
 let selectedRunId = null;
-let tabScrollPositions = { activity: 0, reasoning: 0, sources: 0 };
 let thinkingPlaceholders = {};
-let activeDrawerTab = "activity";
 let uploadPanelVisible = false;
 let draggingUploads = false;
 let settingsDefaults = {
@@ -38,6 +36,52 @@ let settingsDefaults = {
   max_results_override: 0,
   stt_lang: "en-US",
 };
+let settingsSnapshot = null;
+const LOCAL_PREFS_KEY = "localpro_prefs_v1";
+const DRAWER_MEDIA_QUERY = "(min-width: 1100px)";
+
+function loadLocalPrefs() {
+  try {
+    const raw = localStorage.getItem(LOCAL_PREFS_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw);
+    const prefs = {};
+    if (typeof parsed.auto_memory === "boolean") prefs.auto_memory = parsed.auto_memory;
+    if (typeof parsed.evidence_dump === "boolean") prefs.evidence_dump = parsed.evidence_dump;
+    if (typeof parsed.max_results_override === "number" && Number.isFinite(parsed.max_results_override)) {
+      prefs.max_results_override = parsed.max_results_override;
+    }
+    if (typeof parsed.stt_lang === "string" && parsed.stt_lang.trim()) {
+      prefs.stt_lang = parsed.stt_lang.trim();
+    }
+    return prefs;
+  } catch (_) {
+    return {};
+  }
+}
+
+function saveLocalPrefs(prefs) {
+  try {
+    localStorage.setItem(LOCAL_PREFS_KEY, JSON.stringify(prefs));
+  } catch (_) {}
+}
+
+function isDesktopDrawer() {
+  return window.matchMedia(DRAWER_MEDIA_QUERY).matches;
+}
+
+function syncDrawerLayout() {
+  const panel = el("reasoningPanel");
+  const overlay = el("drawerOverlay");
+  if (!panel || !overlay) return;
+  if (isDesktopDrawer()) {
+    panel.classList.add("open");
+    panel.classList.remove("hidden");
+    overlay.classList.add("hidden");
+  } else if (!panel.classList.contains("open")) {
+    panel.classList.add("hidden");
+  }
+}
 
 function el(id) {
   return document.getElementById(id);
@@ -67,21 +111,21 @@ function setStatus(text, tone = "idle") {
   if (!chip) return;
   chip.textContent = text;
   if (tone === "live") {
-    chip.style.background = "rgba(122,215,255,0.18)";
-    chip.style.borderColor = "rgba(122,215,255,0.4)";
-    chip.style.color = "#eaf1ff";
+    chip.style.background = "rgba(16,163,127,0.18)";
+    chip.style.borderColor = "rgba(16,163,127,0.4)";
+    chip.style.color = "#0c3a2f";
   } else if (tone === "error") {
-    chip.style.background = "rgba(255,125,125,0.14)";
-    chip.style.borderColor = "rgba(255,125,125,0.4)";
-    chip.style.color = "#ffd6d6";
+    chip.style.background = "rgba(180,35,24,0.14)";
+    chip.style.borderColor = "rgba(180,35,24,0.35)";
+    chip.style.color = "#6d1b11";
   } else if (tone === "done") {
-    chip.style.background = "rgba(125,255,163,0.12)";
-    chip.style.borderColor = "rgba(125,255,163,0.35)";
-    chip.style.color = "#eaf1ff";
+    chip.style.background = "rgba(15,138,95,0.14)";
+    chip.style.borderColor = "rgba(15,138,95,0.35)";
+    chip.style.color = "#0d3b2b";
   } else {
-    chip.style.background = "rgba(255,255,255,0.06)";
-    chip.style.borderColor = "rgba(255,255,255,0.15)";
-    chip.style.color = "#eaf1ff";
+    chip.style.background = "rgba(16,163,127,0.1)";
+    chip.style.borderColor = "rgba(16,163,127,0.22)";
+    chip.style.color = "#0f1115";
   }
 }
 
@@ -325,8 +369,20 @@ function stopStreaming(runId) {
 function appendActivity(entry) {
   // Streamlined: activity echoes into the reasoning feed; keep list only if element exists.
   const payload = typeof entry === "string" ? { text: entry } : entry || {};
+  if (Array.isArray(payload.lines)) {
+    payload.lines.forEach((line) => {
+      if (!line || !line.text) return;
+      pushReasoning(
+        line.text,
+        line.tone || payload.tone || "info",
+        line.lane || payload.lane || "thinking",
+        line.urls || payload.urls || []
+      );
+    });
+    return;
+  }
   if (!payload.text) return;
-  pushReasoning(payload.text, payload.tone || "info", payload.lane || "orch", payload.urls || []);
+  pushReasoning(payload.text, payload.tone || "info", payload.lane || "thinking", payload.urls || []);
   const feed = el("activityFeed");
   if (!feed) return;
   const div = document.createElement("div");
@@ -527,6 +583,7 @@ function eventSeverity(type) {
     [
       "run_started",
       "router_decision",
+      "resource_budget",
       "plan_created",
       "step_completed",
       "control_action",
@@ -575,154 +632,142 @@ function scheduleLiveFlush() {
   liveFlushTimer = setTimeout(() => flushLiveEvents(), 2000);
 }
 
+function normalizeNote(note) {
+  if (!note) return "";
+  const match = note.match(/^([A-Za-z0-9_-]+) mode: [^()]+\(route ([^)]+)\)/i);
+  if (match) {
+    const tier = match[1].toUpperCase();
+    const route = match[2];
+    return `Running in ${tier} mode (route ${route}).`;
+  }
+  return note;
+}
+
 function summarizeLiveEvents(events) {
-  const stats = {
-    searches: 0,
-    searchQueries: [],
-    extracts: 0,
-    stepsStarted: [],
-    stepsCompleted: [],
-    memHits: 0,
-    memSaved: 0,
-    controls: [],
-    loops: 0,
-    router: null,
-    planSteps: null,
-    strict: false,
-    finished: null,
-    errors: [],
-    warnings: [],
-    notes: [],
-    question: "",
-    urls: [],
-    uploads: [],
+  const lines = [];
+  const seenNotes = new Set();
+  let usedQuestion = false;
+  const pushLine = (text, opts = {}) => {
+    if (!text) return;
+    lines.push({ text, ...opts });
   };
-  let lane = "orch";
   (events || []).forEach((ev) => {
-    if (ev.lane) lane = ev.lane;
-    if (Array.isArray(ev.urls)) stats.urls.push(...ev.urls);
     const d = ev.detail || {};
     switch (ev.type) {
-      case "run_started":
-        stats.question = d.question || stats.question || pendingQuestion;
-        break;
-      case "router_decision":
-        stats.router = d;
-        break;
-      case "plan_created":
-        stats.planSteps = Number(d.steps || stats.planSteps || 0);
-        break;
-      case "step_started":
-        stats.stepsStarted.push(d.name || (d.step_id ? `Step ${d.step_id}` : "Step started"));
-        break;
-      case "step_completed":
-        stats.stepsCompleted.push(d.name || (d.step_id ? `Step ${d.step_id}` : "Step completed"));
-        break;
-      case "tavily_search":
-        stats.searches += 1;
-        if (d.query) stats.searchQueries.push(d.query);
-        break;
-      case "tavily_extract":
-        stats.extracts += d.urls && d.urls.length ? d.urls.length : 1;
-        break;
-      case "tavily_error":
-        stats.errors.push(d.message || "Tavily search unavailable");
-        break;
-      case "memory_retrieved":
-        stats.memHits += Number(d.count || 0);
-        break;
-      case "memory_saved":
-        stats.memSaved += Number(d.count || 0);
-        break;
-      case "control_action":
-        if (d.control || d.action_type) stats.controls.push(d.control || d.action_type);
-        break;
-      case "loop_iteration":
-        stats.loops += 1;
-        break;
-      case "strict_mode":
-        stats.strict = true;
-        break;
-      case "archived":
-        stats.finished = d;
-        break;
-      case "error":
-        if (d.message) stats.errors.push(d.message);
-        break;
-      case "step_error": {
-        const label = d.name || (d.step ? `Step ${d.step}` : "Step");
-        const msg = d.message || "error";
-        stats.warnings.push(`${label}: ${msg}`);
+      case "run_started": {
+        const question = d.question || pendingQuestion;
+        if (question && !questionShownInLive) {
+          pushLine(`Starting on: ${question}`);
+          usedQuestion = true;
+        }
         break;
       }
+      case "router_decision": {
+        const tierName = d.model_tier ? tierLabel(d.model_tier) : tierLabel(currentTier);
+        const reasoning = d.reasoning_level || "AUTO";
+        const webText = d.needs_web ? "with web search" : "no web search";
+        const routeText = d.deep_route ? `, route ${deepRouteLabel(d.deep_route)}` : "";
+        const maxText = d.max_results ? ` (max ${d.max_results})` : "";
+        pushLine(`Choosing ${tierName} (${reasoning}) ${webText}${routeText}${maxText}.`);
+        break;
+      }
+      case "resource_budget": {
+        const budget = d.budget || d;
+        const slots = budget?.max_parallel || budget?.max || budget?.slots;
+        if (slots) pushLine(`Provisioning ${slots} worker slot${slots === 1 ? "" : "s"}.`);
+        break;
+      }
+      case "strict_mode":
+        if (d.enabled) pushLine("Strict verification enabled.");
+        break;
+      case "plan_created": {
+        const steps = Number(d.steps || d.expected_total_steps || 0);
+        if (steps) pushLine(`Planning ${steps} step${steps === 1 ? "" : "s"}.`);
+        break;
+      }
+      case "step_started":
+        pushLine(`Working on: ${d.name || (d.step_id ? `Step ${d.step_id}` : "next step")}.`);
+        break;
+      case "step_completed":
+        pushLine(`Finished: ${d.name || (d.step_id ? `Step ${d.step_id}` : "step")}.`);
+        break;
+      case "tavily_search":
+        pushLine(d.query ? `Searching the web for: ${d.query}.` : "Searching the web.");
+        break;
+      case "tavily_extract": {
+        const urls = d.urls || [];
+        const hosts = condenseList(urls.map((u) => hostFromUrl(u)).filter(Boolean), 3);
+        if (hosts) {
+          pushLine(`Reading sources from ${hosts}.`, { urls });
+        } else if (urls.length) {
+          pushLine(`Reading ${urls.length} source${urls.length === 1 ? "" : "s"}.`, { urls });
+        } else {
+          pushLine("Reading sources.");
+        }
+        break;
+      }
+      case "tavily_error":
+        pushLine(`Search tool error: ${d.message || "Tavily unavailable"}.`, { tone: "warn" });
+        break;
+      case "memory_retrieved": {
+        const count = Number(d.count || 0);
+        pushLine(count ? `Checking memory (${count} hit${count === 1 ? "" : "s"}).` : "Checking memory.");
+        break;
+      }
+      case "memory_saved": {
+        const count = Number(d.count || 0);
+        if (count) pushLine(`Saved ${count} note${count === 1 ? "" : "s"} to memory.`);
+        break;
+      }
+      case "control_action": {
+        const label = d.control || d.action_type;
+        if (label) pushLine(`Running control check: ${label}.`);
+        break;
+      }
+      case "loop_iteration":
+        pushLine(d.iteration ? `Verifying draft (pass ${d.iteration}).` : "Verifying draft.");
+        break;
       case "upload_received":
-        stats.uploads.push(d.name || `Upload ${d.upload_id || ""}`);
+        if (d.name) pushLine(`Received upload: ${d.name}.`);
         break;
       case "upload_processed":
-        stats.uploads.push(d.name || `Upload ${d.upload_id || ""}`);
-        if (d.summary) stats.notes.push(`Upload: ${d.summary}`);
+        if (d.name) pushLine(`Processed upload: ${d.name}.`);
+        if (d.summary) pushLine(`Upload notes: ${d.summary}.`);
         break;
       case "upload_failed":
-        stats.errors.push(d.error || `Upload failed: ${d.name || ""}`);
+        pushLine(`Upload failed: ${d.name || d.upload_id || "file"}.`, { tone: "warn" });
+        break;
+      case "archived":
+        pushLine(`Wrapping up${d.confidence ? ` (confidence ${d.confidence})` : ""}.`);
+        break;
+      case "step_error": {
+        const label = d.name || (d.step_id ? `Step ${d.step_id}` : "Step");
+        const msg = d.message || "error";
+        pushLine(`${label} hit an issue: ${msg}.`, { tone: "warn" });
+        break;
+      }
+      case "error":
+        if (d.message) pushLine(`Error: ${d.message}.`, { tone: "error" });
+        break;
+      case "client_note":
+        if (d.note && !seenNotes.has(d.note)) {
+          pushLine(normalizeNote(d.note));
+          seenNotes.add(d.note);
+        }
         break;
       default:
         break;
     }
-    if (d.note && !stats.notes.includes(d.note)) {
-      stats.notes.push(d.note);
+    if (d.note && !seenNotes.has(d.note)) {
+      pushLine(normalizeNote(d.note));
+      seenNotes.add(d.note);
     }
   });
-  if (!stats.question && pendingQuestion) {
-    stats.question = pendingQuestion;
+  if (!lines.length) {
+    pushLine("Working...");
   }
-  const hasErrors = stats.errors.length > 0;
-  const hasWarnings = stats.warnings.length > 0;
-  let tone = hasErrors ? "error" : hasWarnings ? "warn" : "info";
-  const snippets = [];
-  const usedQuestion = !!(stats.question && !questionShownInLive);
-  if (usedQuestion) snippets.push(`Plan: ${stats.question}`);
-  if (stats.router) {
-    const r = stats.router;
-    const tier = r.model_tier ? tierLabel(r.model_tier) : "Router";
-    const web = r.needs_web ? " + web" : "";
-    const max = r.max_results ? ` (max ${r.max_results})` : "";
-    const route = r.deep_route ? ` via ${r.deep_route}` : "";
-    snippets.push(`Router chose ${tier} ${r.reasoning_level || ""}${web}${max}${route}`.trim());
-  }
-  if (stats.uploads.length) snippets.push(`Uploads: ${condenseList(stats.uploads, 3)}`);
-  if (stats.strict) snippets.push("Strict verify on");
-  if (stats.planSteps !== null && stats.planSteps !== undefined) snippets.push(`${stats.planSteps} steps planned`);
-  const started = condenseList(stats.stepsStarted, 3);
-  if (started) snippets.push(`Starting: ${started}`);
-  const completed = condenseList(stats.stepsCompleted, 3);
-  if (completed) snippets.push(`Finished: ${completed}`);
-  if (stats.searches) {
-    const qPreview = condenseList(stats.searchQueries, 2);
-    snippets.push(qPreview ? `Searching ${qPreview}` : `Searching (${stats.searches} queries)`);
-  }
-  if (stats.extracts) snippets.push(`Digesting ${stats.extracts} source${stats.extracts > 1 ? "s" : ""}`);
-  if (stats.memHits) snippets.push(`Memory hits: ${stats.memHits}`);
-  if (stats.memSaved) snippets.push(`Saved to memory (${stats.memSaved})`);
-  if (stats.loops) snippets.push(`Verifier rerun x${stats.loops}`);
-  if (stats.controls.length) snippets.push(`Control checks: ${stats.controls.join(", ")}`);
-  if (stats.finished) snippets.push(`Wrap-up (confidence ${stats.finished.confidence || "n/a"})`);
-  if (stats.errors.length) {
-    snippets.push(`Issue: ${stats.errors[0]}`);
-    tone = "error";
-  } else if (stats.warnings.length) {
-    snippets.push(`Check: ${stats.warnings[stats.warnings.length - 1]}`);
-  } else if (stats.notes.length) {
-    snippets.push(stats.notes.slice(-2).join(" | "));
-  }
-  if (!snippets.length) {
-    snippets.push(`Activity (${events.length} update${events.length === 1 ? "" : "s"})`);
-  }
-  const text = snippets.join(" · ");
-  const urls = Array.from(new Set(stats.urls)).slice(0, 5);
-  return { text, tone, lane, urls, usedQuestion };
-}
-
-function flushLiveEvents() {
+  return { lines, usedQuestion };
+}function flushLiveEvents() {
   clearTimeout(liveFlushTimer);
   liveFlushTimer = null;
   if (!liveEventBuffer.length) return;
@@ -757,38 +802,110 @@ function updateLiveTicker(text, urls = []) {
   ticker.classList.add("pulse");
 }
 
-function renderHistory(runId = selectedRunId || currentRunId) {
+function registerCitation(url, map) {
+  if (!url) return null;
+  if (!map.has(url)) {
+    map.set(url, map.size + 1);
+  }
+  return map.get(url);
+}
+
+function formatDuration(log = []) {
+  const times = (log || []).map((h) => h.ts).filter(Boolean);
+  if (times.length < 2) return null;
+  return formatTime(Math.max(...times) - Math.min(...times));
+}
+
+function renderInlineCitations(urls = [], citationMap, sourceMeta) {
+  const uniq = Array.from(new Set((urls || []).filter(Boolean)));
+  if (!uniq.length) return "";
+  const bits = uniq.map((url) => {
+    const idx = registerCitation(url, citationMap);
+    if (url && !sourceMeta[url]) {
+      sourceMeta[url] = { url, title: hostFromUrl(url) };
+    }
+    return `<sup class="cite">[${idx}]</sup>`;
+  });
+  return bits.length ? " " + bits.join("") : "";
+}
+
+function renderCitationList(container, citationMap, sourceMeta) {
+  if (!container || !citationMap.size) return;
+  const block = document.createElement("div");
+  block.className = "citations-block";
+  const title = document.createElement("div");
+  title.className = "label";
+  title.textContent = "Citations";
+  block.appendChild(title);
+  const list = document.createElement("ol");
+  list.className = "citation-list";
+  Array.from(citationMap.entries())
+    .sort((a, b) => a[1] - b[1])
+    .forEach(([url, idx]) => {
+      const li = document.createElement("li");
+      const badge = document.createElement("span");
+      badge.className = "cite-index";
+      badge.textContent = `[${idx}]`;
+      const link = document.createElement("a");
+      link.href = url;
+      link.target = "_blank";
+      link.rel = "noopener noreferrer";
+      const meta = sourceMeta[url] || {};
+      link.textContent = meta.title || hostFromUrl(url);
+      li.appendChild(badge);
+      li.appendChild(link);
+      list.appendChild(li);
+    });
+  block.appendChild(list);
+  container.appendChild(block);
+}
+
+function renderHistory(runId = selectedRunId || currentRunId, logOverride = null) {
   const feed = el("reasoningFeed");
   if (!feed) return;
+  const envelope = (runId && runDetails[runId]) || {};
+  const log =
+    logOverride ||
+    (runId
+      ? (runEvents[runId] && runEvents[runId].length ? runEvents[runId] : envelope.activity_events || [])
+      : historyLog);
+  const sources = envelope.sources || [];
+  const visited = envelope.visited_sources || [];
+  const citationMap = new Map();
+  const sourceMeta = {};
+  sources.forEach((s) => {
+    if (s && s.url) {
+      if (!sourceMeta[s.url]) sourceMeta[s.url] = s;
+      registerCitation(s.url, citationMap);
+    }
+  });
+  visited.forEach((s) => {
+    if (s && s.url && !sourceMeta[s.url]) sourceMeta[s.url] = s;
+  });
   feed.innerHTML = "";
-  const log = runId
-    ? runEvents[runId] || []
-    : historyLog;
+  const header = document.createElement("div");
+  header.className = "thinking-header";
+  header.textContent = "Thinking";
+  feed.appendChild(header);
   (log || []).forEach((h) => {
     const row = document.createElement("div");
     row.className = `thought ${h.tone || "info"}`;
-    const laneTag = document.createElement("span");
-    laneTag.className = "lane";
-    laneTag.textContent = (h.lane || "orch").toUpperCase();
     const body = document.createElement("div");
-    const links =
-      h.urls && h.urls.length
-        ? "<br><small>" + h.urls.slice(0, 5).map((u) => `<a href="${u}" target="_blank">${u}</a>`).join(", ") + "</small>"
-        : "";
-    body.innerHTML = escapeAndBreak(h.text) + links;
-    row.appendChild(laneTag);
+    const inlineCites = renderInlineCitations(h.urls || [], citationMap, sourceMeta);
+    body.innerHTML = escapeAndBreak(h.text) + inlineCites;
     row.appendChild(body);
     feed.appendChild(row);
   });
+  renderCitationList(feed, citationMap, sourceMeta);
   feed.scrollTop = feed.scrollHeight;
 }
-
 function addHistory(text, lane = "orch", urls = [], tone = "info") {
-  historyLog.push({ text, lane, urls, tone });
+  const entry = { text, lane, urls, tone, ts: Date.now() };
+  historyLog.push(entry);
   if (historyLog.length > 150) historyLog.shift();
   if (currentRunId) {
     if (!runEvents[currentRunId]) runEvents[currentRunId] = [];
-    runEvents[currentRunId].push({ text, lane, urls, tone });
+    runEvents[currentRunId].push(entry);
     if (runEvents[currentRunId].length > 200) runEvents[currentRunId].shift();
   }
   updateLiveTicker(text, urls);
@@ -799,10 +916,38 @@ function pushReasoning(text, tone = "info", lane = "orch", urls = []) {
   addHistory(text, lane, urls, tone);
 }
 
+function renderResourceSnapshot(modelCheck = {}) {
+  const resEl = el("resourceStats");
+  const budgetEl = el("agentBudget");
+  if (!resEl || !budgetEl) return;
+  const resources = modelCheck.resources || {};
+  const ram = resources.ram || {};
+  const gpus = Array.isArray(resources.gpus) ? resources.gpus : [];
+  const fmt = (v) => (typeof v === "number" ? v.toFixed(v >= 10 ? 0 : 1) : v || "?");
+  const ramPart = ram.total_gb ? `RAM free ${fmt(ram.available_gb)}/${fmt(ram.total_gb)} GB` : "RAM: n/a";
+  const gpuHealthy = gpus.filter((g) => g && !g.error && g.free_gb !== undefined);
+  let gpuPart = "GPU: not detected";
+  if (gpuHealthy.length) {
+    gpuPart = gpuHealthy
+      .map((g) => `${g.name || "GPU"} free ${fmt(g.free_gb)} GB (total ${fmt(g.total_gb)} GB)`)
+      .join("; ");
+  } else if (gpus.length && gpus[0].error) {
+    gpuPart = `GPU error: ${gpus[0].error}`;
+  }
+  resEl.textContent = `${ramPart} | ${gpuPart}`;
+  const budget = modelCheck.worker_slots || modelCheck.budget || {};
+  if (budget.max_parallel) {
+    budgetEl.textContent = `Agent slots: ${budget.max_parallel} (config ${budget.configured || "?"}, variants ${budget.variants || "?"}, RAM cap ${budget.ram_slots || "-"}, VRAM cap ${budget.vram_slots || "-"})`;
+  } else {
+    budgetEl.textContent = "Agent slots: estimating...";
+  }
+}
+
 async function loadSettings() {
   const res = await fetch("/settings");
   const data = await res.json();
   const s = data.settings;
+  settingsSnapshot = s || {};
   settingsDefaults = {
     search_depth_mode: s.search_depth_mode || "auto",
     strict_mode: !!s.strict_mode,
@@ -811,33 +956,29 @@ async function loadSettings() {
     max_results_override: 0,
     stt_lang: "en-US",
   };
+  const localPrefs = loadLocalPrefs();
+  settingsDefaults = {
+    ...settingsDefaults,
+    ...localPrefs,
+    strict_mode: !!s.strict_mode,
+  };
   el("cfgBaseUrl").value = s.lm_studio_base_url || "";
-  el("cfgOrchBase").value = s.orch_endpoint.base_url || "";
-  el("cfgOrch").value = s.orch_endpoint.model_id || "";
-  el("cfgWorkerABase").value = s.worker_a_endpoint.base_url || "";
-  el("cfgQwen8").value = s.worker_a_endpoint.model_id || "";
-  el("cfgWorkerBBase").value = s.worker_b_endpoint.base_url || "";
-  el("cfgQwen8B").value = s.worker_b_endpoint.model_id || "";
-  el("cfgWorkerCBase").value = s.worker_c_endpoint.base_url || "";
-  el("cfgQwen8C").value = s.worker_c_endpoint.model_id || "";
-  el("cfgFastBase").value = s.fast_endpoint?.base_url || s.worker_a_endpoint.base_url || "";
-  el("cfgFastModel").value = s.fast_endpoint?.model_id || s.worker_a_endpoint.model_id || "";
-  el("cfgDeepPlannerBase").value = s.deep_planner_endpoint?.base_url || s.worker_a_endpoint.base_url || "";
-  el("cfgDeepPlanner").value = s.deep_planner_endpoint?.model_id || s.worker_a_endpoint.model_id || "";
-  el("cfgDeepOrchBase").value = s.deep_orchestrator_endpoint?.base_url || s.router_endpoint.base_url || "";
-  el("cfgDeepOrch").value = s.deep_orchestrator_endpoint?.model_id || s.router_endpoint.model_id || "";
-  el("cfgRouterBase").value = s.router_endpoint.base_url || "";
-  el("cfgQwen4").value = s.router_endpoint.model_id || "";
-  el("cfgSummarizerBase").value = s.summarizer_endpoint.base_url || "";
-  el("cfgSummarizer").value = s.summarizer_endpoint.model_id || "";
-  el("cfgVerifierBase").value = s.verifier_endpoint.base_url || "";
-  el("cfgVerifier").value = s.verifier_endpoint.model_id || "";
   el("cfgTavily").value = s.tavily_api_key || "";
   el("cfgSearchMode").value = s.search_depth_mode || "auto";
   el("cfgMaxBase").value = s.max_results_base || 6;
   el("cfgMaxHigh").value = s.max_results_high || 10;
   el("cfgExtract").value = s.extract_depth || "basic";
   el("cfgDiscovery").value = (s.discovery_base_urls || []).join(", ");
+  const strictToggle = el("cfgStrictMode");
+  if (strictToggle) strictToggle.checked = settingsDefaults.strict_mode;
+  const autoMemoryToggle = el("cfgAutoMemory");
+  if (autoMemoryToggle) autoMemoryToggle.checked = settingsDefaults.auto_memory;
+  const evidenceToggle = el("cfgEvidenceDump");
+  if (evidenceToggle) evidenceToggle.checked = settingsDefaults.evidence_dump;
+  const maxOverrideInput = el("cfgMaxOverride");
+  if (maxOverrideInput) maxOverrideInput.value = settingsDefaults.max_results_override || 0;
+  const sttLangInput = el("sttLang");
+  if (sttLangInput) sttLangInput.value = settingsDefaults.stt_lang || "en-US";
   const modelWarning = el("modelWarning");
   if (modelWarning) {
     modelWarning.textContent = "";
@@ -855,11 +996,6 @@ async function loadSettings() {
       }
     }
   }
-  // Auto-fill defaults if core fields are empty to smooth setup.
-  if (!s.orch_endpoint.model_id || !s.router_endpoint.model_id) {
-    applyRecommended();
-    el("settingsStatus").textContent = "Auto-filled recommended defaults (not saved yet).";
-  }
   // Auto-discover if models are missing and we haven't tried yet.
   const baseUrls = el("cfgDiscovery").value.split(",").map((v) => v.trim()).filter(Boolean);
   if (!triedAutoDiscover && baseUrls.length && missingRoles.length) {
@@ -867,6 +1003,7 @@ async function loadSettings() {
     el("settingsStatus").textContent = "Auto-discovering available models...";
     await autoDiscoverAndReport(baseUrls);
   }
+  renderResourceSnapshot(data.model_check || {});
   toggleModal(false);
 }
 
@@ -877,18 +1014,23 @@ function toggleModal(show) {
 
 async function saveSettings() {
   const tavKey = el("cfgTavily").value;
+  const baseUrl = el("cfgBaseUrl").value;
+  const snapshot = settingsSnapshot || {};
+  const priorBaseUrl = snapshot.lm_studio_base_url || baseUrl;
+  const endpointKeys = [
+    "orch_endpoint",
+    "worker_a_endpoint",
+    "worker_b_endpoint",
+    "worker_c_endpoint",
+    "fast_endpoint",
+    "deep_planner_endpoint",
+    "deep_orchestrator_endpoint",
+    "router_endpoint",
+    "summarizer_endpoint",
+    "verifier_endpoint",
+  ];
   const payload = {
-    lm_studio_base_url: el("cfgBaseUrl").value,
-    orch_endpoint: { base_url: el("cfgOrchBase").value, model_id: el("cfgOrch").value },
-    worker_a_endpoint: { base_url: el("cfgWorkerABase").value, model_id: el("cfgQwen8").value },
-    worker_b_endpoint: { base_url: el("cfgWorkerBBase").value, model_id: el("cfgQwen8B").value },
-    worker_c_endpoint: { base_url: el("cfgWorkerCBase").value, model_id: el("cfgQwen8C").value },
-    fast_endpoint: { base_url: el("cfgFastBase").value, model_id: el("cfgFastModel").value },
-    deep_planner_endpoint: { base_url: el("cfgDeepPlannerBase").value, model_id: el("cfgDeepPlanner").value },
-    deep_orchestrator_endpoint: { base_url: el("cfgDeepOrchBase").value, model_id: el("cfgDeepOrch").value },
-    router_endpoint: { base_url: el("cfgRouterBase").value, model_id: el("cfgQwen4").value },
-    summarizer_endpoint: { base_url: el("cfgSummarizerBase").value, model_id: el("cfgSummarizer").value },
-    verifier_endpoint: { base_url: el("cfgVerifierBase").value, model_id: el("cfgVerifier").value },
+    lm_studio_base_url: baseUrl,
     tavily_api_key: tavKey === "********" ? undefined : tavKey,
     search_depth_mode: el("cfgSearchMode").value,
     max_results_base: Number(el("cfgMaxBase").value),
@@ -896,6 +1038,27 @@ async function saveSettings() {
     extract_depth: el("cfgExtract").value,
     discovery_base_urls: el("cfgDiscovery").value.split(",").map((v) => v.trim()).filter(Boolean),
   };
+  const strictToggle = el("cfgStrictMode");
+  if (strictToggle) payload.strict_mode = strictToggle.checked;
+  const maxOverrideRaw = el("cfgMaxOverride") ? Number(el("cfgMaxOverride").value) : settingsDefaults.max_results_override;
+  const localPrefs = {
+    auto_memory: el("cfgAutoMemory") ? el("cfgAutoMemory").checked : settingsDefaults.auto_memory,
+    evidence_dump: el("cfgEvidenceDump") ? el("cfgEvidenceDump").checked : settingsDefaults.evidence_dump,
+    max_results_override: Number.isFinite(maxOverrideRaw) ? maxOverrideRaw : 0,
+    stt_lang: (el("sttLang")?.value || "en-US").trim() || "en-US",
+  };
+  settingsDefaults = {
+    ...settingsDefaults,
+    ...localPrefs,
+    strict_mode: payload.strict_mode ?? settingsDefaults.strict_mode,
+  };
+  saveLocalPrefs(localPrefs);
+  endpointKeys.forEach((key) => {
+    const current = snapshot[key];
+    if (!current || !current.model_id) return;
+    const nextBaseUrl = current.base_url && current.base_url !== priorBaseUrl ? current.base_url : baseUrl;
+    payload[key] = { base_url: nextBaseUrl, model_id: current.model_id };
+  });
   const res = await fetch("/settings", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -934,32 +1097,6 @@ async function autoDiscoverAndReport(base_urls) {
   } catch (err) {
     el("settingsStatus").textContent = "Discovery failed.";
   }
-}
-
-function applyRecommended() {
-  el("cfgBaseUrl").value = "http://127.0.0.1:1234/v1";
-  el("cfgOrchBase").value = "http://127.0.0.1:1234/v1";
-  el("cfgOrch").value = "openai/gpt-oss-20b";
-  el("cfgWorkerABase").value = "http://127.0.0.1:1234/v1";
-  el("cfgQwen8").value = "qwen/qwen3-vl-8b";
-  el("cfgWorkerBBase").value = "http://127.0.0.1:1234/v1";
-  el("cfgQwen8B").value = "qwen/qwen3-vl-8b:2";
-  el("cfgWorkerCBase").value = "http://127.0.0.1:1234/v1";
-  el("cfgQwen8C").value = "qwen/qwen3-vl-8b:3";
-  el("cfgRouterBase").value = "http://127.0.0.1:1234/v1";
-  el("cfgQwen4").value = "qwen/qwen3-vl-4b";
-  el("cfgSummarizerBase").value = "http://127.0.0.1:1234/v1";
-  el("cfgSummarizer").value = "qwen/qwen3-vl-4b";
-  el("cfgVerifierBase").value = "http://127.0.0.1:1234/v1";
-  el("cfgVerifier").value = "qwen/qwen3-vl-8b";
-  el("cfgFastBase").value = "http://127.0.0.1:1234/v1";
-  el("cfgFastModel").value = "qwen/qwen3-vl-8b";
-  el("cfgDeepPlannerBase").value = "http://127.0.0.1:1234/v1";
-  el("cfgDeepPlanner").value = "qwen/qwen3-vl-8b";
-  el("cfgDeepOrchBase").value = "http://127.0.0.1:1234/v1";
-  el("cfgDeepOrch").value = "qwen/qwen3-vl-4b";
-  el("cfgDiscovery").value = "http://127.0.0.1:1234/v1";
-  el("settingsStatus").textContent = "Filled with recommended defaults.";
 }
 
 const REASONING_BY_TIER = {
@@ -1181,6 +1318,10 @@ function handleEvent(type, p) {
       queueLiveEvent("router_decision", p, "router");
       break;
     }
+    case "resource_budget":
+      renderResourceSnapshot({ resources: p.resources, worker_slots: p.budget || p.worker_slots });
+      queueLiveEvent("resource_budget", p.budget || p, "orch");
+      break;
     case "strict_mode":
       queueLiveEvent("strict_mode", p, "verifier");
       break;
@@ -1359,27 +1500,52 @@ function tryParseJson(text) {
   }
 }
 
+const FINAL_TEXT_KEYS = [
+  "final_text",
+  "final_answer",
+  "finalAnswer",
+  "final_response",
+  "finalResponse",
+  "draft_answer",
+  "answer",
+  "final",
+  "result",
+  "output",
+  "response",
+  "text",
+  "message",
+  "content",
+];
+
 function extractFinalText(raw) {
   if (raw === null || raw === undefined) return "";
   if (typeof raw === "string") {
     const trimmed = raw.trim();
+    if (!trimmed) return "";
     if ((trimmed.startsWith("{") && trimmed.endsWith("}")) || (trimmed.startsWith("[") && trimmed.endsWith("]"))) {
       const parsed = tryParseJson(trimmed);
-      if (parsed) return extractFinalText(parsed) || "";
-      return "";
+      if (parsed) {
+        const extracted = extractFinalText(parsed);
+        return extracted || trimmed;
+      }
+      return trimmed;
     }
     return trimmed;
   }
+  if (Array.isArray(raw)) {
+    for (const item of raw) {
+      const extracted = extractFinalText(item);
+      if (extracted) return extracted;
+    }
+    return "";
+  }
   if (typeof raw === "object") {
-    return (
-      raw.final_text ||
-      raw.draft_answer ||
-      raw.answer ||
-      raw.text ||
-      raw.message ||
-      raw.content ||
-      ""
-    );
+    for (const key of FINAL_TEXT_KEYS) {
+      if (!Object.prototype.hasOwnProperty.call(raw, key)) continue;
+      const extracted = extractFinalText(raw[key]);
+      if (extracted) return extracted;
+    }
+    return "";
   }
   return String(raw);
 }
@@ -1410,6 +1576,7 @@ function buildAnswerEnvelope(data = {}) {
       reasoning_level: routerDecision.reasoning_level || run.reasoning_mode || "AUTO",
       confidence: run.confidence || "",
     },
+    run_meta: run,
     reasoning_summary: buildReasoningSummary(run, sources, claims, routerDecision),
     activity_events: runEvents[run.run_id] || [],
     sources,
@@ -1423,16 +1590,11 @@ function addMessageActions(bubble, runId, envelope) {
   if (existing) existing.remove();
   const actions = document.createElement("div");
   actions.className = "bubble-actions";
-  const reasoningBtn = document.createElement("button");
-  reasoningBtn.type = "button";
-  reasoningBtn.className = "bubble-action";
-  reasoningBtn.textContent = "Reasoning";
-  reasoningBtn.onclick = () => openDrawer("reasoning", runId);
-  const sourcesBtn = document.createElement("button");
-  sourcesBtn.type = "button";
-  sourcesBtn.className = "bubble-action";
-  sourcesBtn.textContent = "Sources";
-  sourcesBtn.onclick = () => openDrawer("sources", runId);
+  const activityBtn = document.createElement("button");
+  activityBtn.type = "button";
+  activityBtn.className = "bubble-action";
+  activityBtn.textContent = "Activity";
+  activityBtn.onclick = () => openDrawer(runId);
   const copyBtn = document.createElement("button");
   copyBtn.type = "button";
   copyBtn.className = "bubble-action";
@@ -1442,8 +1604,7 @@ function addMessageActions(bubble, runId, envelope) {
       await navigator.clipboard.writeText(envelope?.final_text || "");
     } catch (_) {}
   };
-  actions.appendChild(reasoningBtn);
-  actions.appendChild(sourcesBtn);
+  actions.appendChild(activityBtn);
   actions.appendChild(copyBtn);
   bubble.appendChild(actions);
 }
@@ -1484,109 +1645,28 @@ function highlightSelectedMessage(runId) {
 
 function isDrawerOpen() {
   const panel = el("reasoningPanel");
-  return panel && panel.classList.contains("open");
+  if (!panel) return false;
+  if (isDesktopDrawer()) return !panel.classList.contains("hidden");
+  return panel.classList.contains("open");
 }
 
-function populateDrawer(runId = selectedRunId, tab = activeDrawerTab) {
+function populateDrawer(runId = selectedRunId, logOverride = null) {
   const panel = el("reasoningPanel");
   if (!panel || !runId) return;
   const envelope = runDetails[runId] || {};
   const sub = el("drawerSubline");
   const idx = getResponseIndex(runId);
   if (sub) sub.textContent = idx ? `For response #${idx}` : "";
-  renderHistory(runId);
-  const reasoningPanel = el("tabReasoning");
-  if (reasoningPanel) {
-    reasoningPanel.innerHTML = "";
-    const list = envelope.reasoning_summary || [];
-    if (!list.length) {
-      reasoningPanel.innerHTML = '<p class="sub">No reasoning available for this response.</p>';
-    } else {
-      const ul = document.createElement("ul");
-      ul.className = "thinking-steps";
-      list.forEach((item, idx2) => {
-        const li = document.createElement("li");
-        li.innerHTML = `<span>•</span><span>${escapeAndBreak(item)}</span>`;
-        if (idx2 === 0) li.style.fontWeight = "700";
-        ul.appendChild(li);
-      });
-      reasoningPanel.appendChild(ul);
-    }
-  }
-  const sourcesPanel = el("tabSources");
-  if (sourcesPanel) {
-    sourcesPanel.innerHTML = "";
-    const cited = envelope.sources || [];
-    const visited = envelope.visited_sources || [];
-    const citedHeader = document.createElement("p");
-    citedHeader.className = "label";
-    citedHeader.textContent = "Cited sources";
-    sourcesPanel.appendChild(citedHeader);
-    if (!cited.length) {
-      const empty = document.createElement("div");
-      empty.className = "sub";
-      empty.textContent = "No sources used. This answer was generated without browsing.";
-      sourcesPanel.appendChild(empty);
-    } else {
-      const list = document.createElement("ul");
-      list.className = "thinking-steps";
-      cited.forEach((s, idx3) => {
-        const li = document.createElement("li");
-        const label = s.title || s.url || `Source ${idx3 + 1}`;
-        li.innerHTML = `<span>[${idx3 + 1}]</span><span><a href="${s.url}" target="_blank">${label}</a></span>`;
-        list.appendChild(li);
-      });
-      sourcesPanel.appendChild(list);
-    }
-    const visitedHeader = document.createElement("p");
-    visitedHeader.className = "label";
-    visitedHeader.textContent = "Visited / considered";
-    sourcesPanel.appendChild(visitedHeader);
-    if (!visited.length) {
-      const emptyVisited = document.createElement("div");
-      emptyVisited.className = "sub";
-      emptyVisited.textContent = "No additional pages were visited.";
-      sourcesPanel.appendChild(emptyVisited);
-    } else {
-      const list = document.createElement("ul");
-      list.className = "thinking-steps";
-      visited.slice(0, 8).forEach((s, idx4) => {
-        const li = document.createElement("li");
-        const label = s.title || s.url || `Visited ${idx4 + 1}`;
-        li.innerHTML = `<span>•</span><span><a href="${s.url}" target="_blank">${label}</a></span>`;
-        list.appendChild(li);
-      });
-      sourcesPanel.appendChild(list);
-    }
-  }
-  activeDrawerTab = tab;
-  switchDrawerTab(tab);
+  const log =
+    logOverride ||
+    (runEvents[runId] && runEvents[runId].length ? runEvents[runId] : envelope.activity_events || []);
+  const durationEl = el("drawerDuration");
+  if (durationEl) durationEl.textContent = formatDuration(log) || "";
+  renderHistory(runId, log);
   highlightSelectedMessage(runId);
 }
 
-function switchDrawerTab(tab) {
-  const panels = document.querySelectorAll(".tab-panel");
-  const tabs = document.querySelectorAll(".drawer-tabs .tab-btn");
-  const currentPanel = document.querySelector('.tab-panel:not(.hidden)');
-  if (currentPanel) {
-    tabScrollPositions[activeDrawerTab] = currentPanel.scrollTop;
-  }
-  tabs.forEach((btn) => {
-    const isActive = btn.dataset.tab === tab;
-    btn.classList.toggle("active", isActive);
-    btn.setAttribute("aria-selected", isActive ? "true" : "false");
-  });
-  panels.forEach((panel) => {
-    const isMatch = panel.dataset.tab === tab;
-    panel.classList.toggle("hidden", !isMatch);
-    if (isMatch && tabScrollPositions[tab] && typeof tabScrollPositions[tab] === "number") {
-      panel.scrollTop = tabScrollPositions[tab];
-    }
-  });
-  activeDrawerTab = tab;
-}
-
-function openDrawer(tab = "activity", runId = null) {
+function openDrawer(runId = null) {
   const panel = el("reasoningPanel");
   const overlay = el("drawerOverlay");
   if (!panel || !overlay) return;
@@ -1594,17 +1674,22 @@ function openDrawer(tab = "activity", runId = null) {
   selectedRunId = targetRun;
   panel.classList.add("open");
   panel.classList.remove("hidden");
-  overlay.classList.remove("hidden");
-  switchDrawerTab(tab);
-  populateDrawer(targetRun, tab);
+  if (!isDesktopDrawer()) {
+    overlay.classList.remove("hidden");
+  }
+  populateDrawer(targetRun);
 }
-
 function closeDrawer() {
   const panel = el("reasoningPanel");
   const overlay = el("drawerOverlay");
   if (panel) {
-    panel.classList.remove("open");
-    panel.classList.add("hidden");
+    if (isDesktopDrawer()) {
+      panel.classList.add("open");
+      panel.classList.remove("hidden");
+    } else {
+      panel.classList.remove("open");
+      panel.classList.add("hidden");
+    }
   }
   if (overlay) overlay.classList.add("hidden");
 }
@@ -1648,7 +1733,7 @@ async function fetchArtifacts(runId, opts = {}) {
     if (summary) pushReasoning(summary.text, "info", "web", summary.urls);
   }
   if (selectedRunId === run.run_id && isDrawerOpen()) {
-    populateDrawer(run.run_id, activeDrawerTab);
+    populateDrawer(run.run_id);
   }
 }
 
@@ -1731,6 +1816,7 @@ document.addEventListener("DOMContentLoaded", () => {
   });
   setTier(currentTier);
   closeDrawer();
+  syncDrawerLayout();
   hideUploadPanelIfIdle();
   updateEmptyState();
   document.querySelectorAll(".suggestion-card").forEach((card) => {
@@ -1765,7 +1851,6 @@ document.addEventListener("DOMContentLoaded", () => {
   });
   el("saveSettings").addEventListener("click", saveSettings);
   el("discoverBtn").addEventListener("click", discoverModels);
-  el("applyDefaults").addEventListener("click", applyRecommended);
 
   el("reasoningLevel").addEventListener("change", updateReasoningBadge);
   const deepRouteSelect = el("deepRoute");
@@ -1773,21 +1858,14 @@ document.addEventListener("DOMContentLoaded", () => {
     deepRouteSelect.addEventListener("change", updateReasoningBadge);
   }
   const liveTicker = el("liveTicker");
-  if (liveTicker) liveTicker.addEventListener("click", () => openDrawer("activity", selectedRunId || currentRunId));
+  if (liveTicker) liveTicker.addEventListener("click", () => openDrawer(selectedRunId || currentRunId));
   const drawerClose = el("drawerClose");
   if (drawerClose) {
     drawerClose.addEventListener("click", () => closeDrawer());
   }
   const drawerOverlay = el("drawerOverlay");
   if (drawerOverlay) drawerOverlay.addEventListener("click", closeDrawer);
-  document.querySelectorAll(".drawer-tabs .tab-btn").forEach((btn) => {
-    btn.addEventListener("click", () => {
-      const tab = btn.dataset.tab || "activity";
-      switchDrawerTab(tab);
-      populateDrawer(selectedRunId, tab);
-    });
-  });
-
+  window.addEventListener("resize", () => syncDrawerLayout());
   const drop = el("uploadDrop");
   if (drop) {
     drop.addEventListener("dragover", (e) => {
@@ -1860,7 +1938,7 @@ document.addEventListener("DOMContentLoaded", () => {
       const runId = bubble.dataset.runId;
       selectedRunId = runId || selectedRunId;
       highlightSelectedMessage(runId);
-      if (isDrawerOpen()) populateDrawer(runId, activeDrawerTab);
+      if (isDrawerOpen()) populateDrawer(runId);
     });
   }
 

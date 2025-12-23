@@ -126,6 +126,13 @@ If an asset (image/PDF) needs inspection or you need live_date/calculator/code_e
 Mark proposed long-term memory as candidate_memory[]. Return JSON only: activity_lines[], memory_notes[], candidate_memory[].
 """
 
+WRITER_SYSTEM = """
+SYSTEM (WORKER: Writer)
+You are the final response writer. Use the question and provided context to answer directly.
+Return plain text only. Do not output JSON or tool-call markup (no <|channel|> tags, no to=web.*).
+No chain-of-thought; only the answer. If evidence is missing, say so briefly.
+"""
+
 JSON_REPAIR_SYSTEM = """
 SYSTEM (WORKER: JSONRepair)
 You output ONLY valid repaired JSON for the given malformed JSON string.

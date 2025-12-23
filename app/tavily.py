@@ -60,7 +60,12 @@ class TavilyClient:
             resp.raise_for_status()
             return resp.json()
         except httpx.HTTPStatusError as e:
-            return {"error": "http_status", "status_code": e.response.status_code, "detail": e.response.text}
+            detail: Any
+            try:
+                detail = e.response.json()
+            except Exception:
+                detail = e.response.text
+            return {"error": "http_status", "status_code": e.response.status_code, "detail": detail}
         except httpx.RequestError as e:
             return {"error": "request_failed", "detail": str(e)}
 
