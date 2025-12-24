@@ -19,7 +19,13 @@
 
       <button id="newConversationBtn" class="sidebar-btn primary">+ New chat</button>
 
-      <div class="sidebar-group">
+      <div class="sidebar-section conversations">
+        <p class="label">Chats</p>
+        <input id="conversationSearch" type="search" placeholder="Search chats">
+        <div id="conversationList" class="conversation-list"></div>
+      </div>
+
+      <div class="sidebar-section">
         <p class="label">Model</p>
         <div class="segmented" id="modelTierGroup">
           <button type="button" class="seg-btn" data-tier="fast">Fast</button>
@@ -29,12 +35,13 @@
         </div>
       </div>
 
-      <div class="sidebar-group" id="reasoningControl">
+      <div class="sidebar-section" id="reasoningControl">
         <label class="label" for="reasoningLevel">Reasoning</label>
         <select id="reasoningLevel"></select>
+        <div class="pill inline-pill">Tier: <span id="reasoningBadge">Auto</span></div>
       </div>
 
-      <div class="sidebar-group hidden" id="deepRouteWrap">
+      <div class="sidebar-section hidden" id="deepRouteWrap">
         <label class="label" for="deepRoute">Routing</label>
         <select id="deepRoute">
           <option value="auto" selected>Auto (decide best lane)</option>
@@ -43,53 +50,61 @@
         </select>
       </div>
 
-      <div class="sidebar-group status-group">
-        <p class="label">Run status</p>
-        <div class="status-row">
-          <span class="status-chip" id="runStatus">Idle</span>
-          <span class="timer mono" id="runTimer">00:00</span>
-        </div>
-        <div class="status-row">
-          <span class="meta-chip" id="progressText">Progress: 0%</span>
-          <span class="meta-chip" id="etaText">ETA: --</span>
-        </div>
-        <div id="runProgress" class="progress-bar"><div id="runProgressFill"></div></div>
-        <div id="liveTicker" class="ticker-text" title="Click to toggle reasoning history">Idle</div>
+      <div class="sidebar-section">
+        <p class="label">Status</p>
+        <p class="sub">Live narration preview is above the chat.</p>
       </div>
 
       <button id="settingsBtn" class="sidebar-btn ghost">Settings</button>
 
       <div class="sidebar-foot">
         <p class="label">Mobile</p>
-        <p class="sub">Open: <a href="http://192.168.5.112:8000">http://192.168.5.112:8000</a></p>
+        <p class="sub">Open: <a id="shareLink" href="#" rel="noopener">Loading...</a></p>
       </div>
     </aside>
 
     <main class="chat-pane">
       <header class="chat-header">
         <div class="header-left">
-          <div class="header-title">LocalPro Chat</div>
+          <button id="sidebarToggleBtn" class="icon-btn ghost mobile-only" title="Menu">Menu</button>
+          <div class="header-title">
+            <button id="conversationTitle" class="title-btn" type="button" title="Rename chat">LocalPro Chat</button>
+            <span id="conversationMeta" class="header-meta"></span>
+          </div>
           <span id="modelWarning" class="warning-pill hidden" aria-live="polite"></span>
         </div>
         <div class="header-actions">
+          <button id="activityToggleBtn" class="pill-btn ghost">Narration</button>
+          <button id="memoryBtn" class="pill-btn ghost">Memory</button>
           <button id="mobileNewConversationBtn" class="pill-btn ghost mobile-only">New chat</button>
           <button id="mobileOpenSettingsHint" class="pill-btn ghost mobile-only" disabled>Settings on desktop</button>
         </div>
       </header>
+
+      <section class="runbar">
+        <div class="runbar-row">
+          <span class="status-chip" id="runStatus">Idle</span>
+          <span class="timer mono" id="runTimer">00:00</span>
+          <span class="meta-chip" id="progressText">Progress: 0%</span>
+          <span class="meta-chip" id="etaText">ETA: --</span>
+        </div>
+        <div id="runProgress" class="progress-bar"><div id="runProgressFill"></div></div>
+        <div id="liveTicker" class="ticker-text" title="Click to toggle narration">Idle</div>
+      </section>
 
       <section class="mobile-banner mobile-only">
         <div class="banner-copy">
           <p class="label">Mobile mode</p>
           <h3>Follow this run on your phone</h3>
           <p class="sub">Stays in sync on desktop and phone; one query at a time.</p>
-          <p class="sub">Open: <a href="http://192.168.5.112:8000">http://192.168.5.112:8000</a></p>
+          <p class="sub">Open: <a id="shareLinkMobile" href="#" rel="noopener">Loading...</a></p>
         </div>
       </section>
 
       <div id="emptyState" class="empty-state hidden">
         <p class="label">Start a conversation</p>
         <h2>What can I help with?</h2>
-        <p class="sub">Upload files, search the web, or ask anything. We'll show reasoning, sources, and activity per reply.</p>
+        <p class="sub">Upload files, search the web, or ask anything. We'll show narrated progress, sources, and activity per reply.</p>
         <div class="suggestion-grid">
           <button class="suggestion-card" type="button" data-prompt="Summarize this PDF and list three action items.">Summarize this PDF and list three action items.</button>
           <button class="suggestion-card" type="button" data-prompt="Compare the latest AI chips from NVIDIA and AMD.">Compare the latest AI chips from NVIDIA and AMD.</button>
@@ -130,9 +145,9 @@
             </div>
           </div>
           <div class="composer-footer">
-            <div class="helper">Enter to send. Shift+Enter for new line.</div>
+            <div class="helper" id="promptHelper">Enter to send. Shift+Enter for new line.</div>
             <div class="meta-row">
-              <span class="pill">Tier: <span id="reasoningBadge">Auto</span></span>
+              <button type="button" id="endPromptBtn" class="pill-btn ghost end-prompt hidden">End prompt</button>
               <span class="pill live" id="sttStatus">Mic idle</span>
               <span class="pill" id="charCount">0 chars</span>
             </div>
@@ -146,11 +161,11 @@
       </div>
     </main>
 
-    <aside class="activity-pane drawer" id="reasoningPanel" aria-label="Reasoning drawer">
+    <aside class="activity-pane drawer hidden" id="reasoningPanel" aria-label="Narration drawer">
       <div class="drawer-head">
         <div>
-          <p class="label">Activity</p>
-          <h3>Thinking</h3>
+          <p class="label">Narration</p>
+          <h3>4B narration</h3>
           <p class="sub" id="drawerSubline"></p>
         </div>
         <div class="drawer-actions">
@@ -160,15 +175,15 @@
         </div>
       </div>
       <div class="drawer-body">
-        <div id="reasoningFeed" class="feed thinking-feed"></div>
-        <div class="activity-log">
-          <p class="label">Activity log</p>
-          <div id="activityFeed" class="feed activity-feed"></div>
+        <div class="panel-section">
+          <p class="label">4B narration</p>
+          <div id="reasoningFeed" class="feed thinking-feed"></div>
         </div>
       </div>
     </aside>
 
     <div id="drawerOverlay" class="drawer-overlay hidden"></div>
+    <div id="sidebarOverlay" class="drawer-overlay hidden"></div>
 
     <div id="settingsModal" class="modal hidden">
       <div class="modal-content">
@@ -189,6 +204,20 @@
               <button type="button" id="discoverBtn" class="pill-btn ghost">Refresh models</button>
             </div>
             <p class="sub">Models are loaded dynamically; roles auto-map from what LM Studio exposes.</p>
+          </div>
+
+          <div class="settings-group">
+            <p class="label">Models</p>
+            <label>Orchestrator <select id="cfgModelOrch"></select></label>
+            <label>Worker A <select id="cfgModelWorker"></select></label>
+            <label>Worker B <select id="cfgModelWorkerB"></select></label>
+            <label>Worker C <select id="cfgModelWorkerC"></select></label>
+            <label>Fast tier <select id="cfgModelFast"></select></label>
+            <label>Deep planner <select id="cfgModelDeepPlanner"></select></label>
+            <label>Deep orchestrator <select id="cfgModelDeepOrch"></select></label>
+            <label>Router <select id="cfgModelRouter"></select></label>
+            <label>Summarizer <select id="cfgModelSummarizer"></select></label>
+            <label>Verifier <select id="cfgModelVerifier"></select></label>
           </div>
 
           <div class="settings-group">
@@ -230,6 +259,23 @@
           <button id="closeSettingsFooter" type="button" class="ghost">Close</button>
         </div>
         <p id="settingsStatus" class="status"></p>
+      </div>
+    </div>
+
+    <div id="memoryModal" class="modal hidden">
+      <div class="modal-content">
+        <div class="modal-head">
+          <div>
+            <p class="label">Cross-chat</p>
+            <h3>Memory</h3>
+          </div>
+          <button id="closeMemory" type="button" class="icon-btn">Close</button>
+        </div>
+        <div class="memory-toolbar">
+          <input id="memorySearch" type="search" placeholder="Search memory">
+          <button id="refreshMemory" type="button" class="pill-btn ghost">Refresh</button>
+        </div>
+        <div id="memoryList" class="memory-list"></div>
       </div>
     </div>
   </div>

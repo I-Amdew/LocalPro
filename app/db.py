@@ -1,4 +1,5 @@
 import json
+import uuid
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -20,8 +21,20 @@ class Database:
             await db.executescript(
                 """
                 PRAGMA journal_mode=WAL;
+                CREATE TABLE IF NOT EXISTS conversations(
+                    id TEXT PRIMARY KEY,
+                    created_at TEXT,
+                    updated_at TEXT,
+                    title TEXT,
+                    model_tier TEXT,
+                    reasoning_mode TEXT,
+                    manual_level TEXT,
+                    deep_mode TEXT,
+                    archived INTEGER DEFAULT 0
+                );
                 CREATE TABLE IF NOT EXISTS runs(
                     run_id TEXT PRIMARY KEY,
+                    conversation_id TEXT,
                     created_at TEXT,
                     user_question TEXT,
                     reasoning_mode TEXT,
@@ -33,6 +46,7 @@ class Database:
                 CREATE TABLE IF NOT EXISTS messages(
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     run_id TEXT,
+                    conversation_id TEXT,
                     role TEXT,
                     content TEXT,
                     created_at TEXT
@@ -177,11 +191,91 @@ class Database:
                 );
                 CREATE TABLE IF NOT EXISTS conversation_state(
                     id INTEGER PRIMARY KEY CHECK (id = 1),
-                    reset_at TEXT
+                    reset_at TEXT,
+                    default_conversation_id TEXT
                 );
                 INSERT OR IGNORE INTO conversation_state(id, reset_at) VALUES (1, NULL);
+                CREATE TABLE IF NOT EXISTS prompt_state(
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    prompt_text TEXT,
+                    run_id TEXT,
+                    updated_at TEXT
+                );
+                INSERT OR IGNORE INTO prompt_state(id, prompt_text, run_id, updated_at) VALUES (1, NULL, NULL, NULL);
                 """
             )
+            async def column_exists(table: str, column: str) -> bool:
+                cursor = await db.execute(f"PRAGMA table_info({table})")
+                rows = await cursor.fetchall()
+                await cursor.close()
+                return any(row[1] == column for row in rows)
+
+            async def ensure_column(table: str, column: str, decl: str) -> None:
+                if not await column_exists(table, column):
+                    await db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+
+            await ensure_column("runs", "conversation_id", "TEXT")
+            await ensure_column("messages", "conversation_id", "TEXT")
+            await ensure_column("conversation_state", "default_conversation_id", "TEXT")
+
+            cursor = await db.execute("SELECT id FROM conversations LIMIT 1")
+            existing = await cursor.fetchone()
+            await cursor.close()
+
+            if not existing:
+                convo_id = uuid.uuid4().hex
+                cursor = await db.execute("SELECT MIN(created_at), MAX(created_at) FROM runs")
+                row = await cursor.fetchone()
+                await cursor.close()
+                created_at = row[0] if row and row[0] else utc_now()
+                updated_at = row[1] if row and row[1] else created_at
+                cursor = await db.execute("SELECT user_question FROM runs ORDER BY created_at ASC LIMIT 1")
+                row = await cursor.fetchone()
+                await cursor.close()
+                title = row[0] if row and row[0] else "Legacy chat"
+                await db.execute(
+                    "INSERT INTO conversations(id, created_at, updated_at, title, model_tier, reasoning_mode, manual_level, deep_mode, archived) "
+                    "VALUES (?,?,?,?,?,?,?,?,0)",
+                    (convo_id, created_at, updated_at, title, "pro", "auto", "MED", "auto"),
+                )
+                await db.execute(
+                    "UPDATE conversation_state SET default_conversation_id=? WHERE id=1",
+                    (convo_id,),
+                )
+                await db.execute(
+                    "UPDATE runs SET conversation_id=? WHERE conversation_id IS NULL OR conversation_id=''",
+                    (convo_id,),
+                )
+                await db.execute(
+                    "UPDATE messages SET conversation_id=? WHERE conversation_id IS NULL OR conversation_id=''",
+                    (convo_id,),
+                )
+            else:
+                cursor = await db.execute("SELECT default_conversation_id FROM conversation_state WHERE id=1")
+                row = await cursor.fetchone()
+                await cursor.close()
+                default_id = row[0] if row else None
+                if not default_id:
+                    cursor = await db.execute(
+                        "SELECT id FROM conversations ORDER BY updated_at DESC, created_at DESC LIMIT 1"
+                    )
+                    row = await cursor.fetchone()
+                    await cursor.close()
+                    default_id = row[0] if row else None
+                    if default_id:
+                        await db.execute(
+                            "UPDATE conversation_state SET default_conversation_id=? WHERE id=1",
+                            (default_id,),
+                        )
+                if default_id:
+                    await db.execute(
+                        "UPDATE runs SET conversation_id=? WHERE conversation_id IS NULL OR conversation_id=''",
+                        (default_id,),
+                    )
+                    await db.execute(
+                        "UPDATE messages SET conversation_id=? WHERE conversation_id IS NULL OR conversation_id=''",
+                        (default_id,),
+                    )
             await db.commit()
 
     async def execute(self, query: str, params: Tuple[Any, ...] = ()) -> None:
@@ -204,14 +298,17 @@ class Database:
     async def insert_run(
         self,
         run_id: str,
+        conversation_id: str,
         question: str,
         reasoning_mode: str,
         status: str = "running",
     ) -> None:
+        created_at = utc_now()
         await self.execute(
-            "INSERT INTO runs(run_id, created_at, user_question, reasoning_mode, status) VALUES (?,?,?,?,?)",
-            (run_id, utc_now(), question, reasoning_mode, status),
+            "INSERT INTO runs(run_id, conversation_id, created_at, user_question, reasoning_mode, status) VALUES (?,?,?,?,?,?)",
+            (run_id, conversation_id, created_at, question, reasoning_mode, status),
         )
+        await self.touch_conversation(conversation_id, updated_at=created_at)
 
     async def update_run_router(self, run_id: str, router_decision_json: dict) -> None:
         await self.execute(
@@ -234,14 +331,15 @@ class Database:
     async def update_run_status(self, run_id: str, status: str) -> None:
         await self.execute("UPDATE runs SET status=? WHERE run_id=?", (status, run_id))
 
-    async def add_message(self, run_id: str, role: str, content: str) -> dict:
+    async def add_message(self, run_id: str, conversation_id: str, role: str, content: str) -> dict:
         created_at = utc_now()
         async with aiosqlite.connect(self.path) as db:
             cursor = await db.execute(
-                "INSERT INTO messages(run_id, role, content, created_at) VALUES (?,?,?,?)",
-                (run_id, role, content, created_at),
+                "INSERT INTO messages(run_id, conversation_id, role, content, created_at) VALUES (?,?,?,?,?)",
+                (run_id, conversation_id, role, content, created_at),
             )
             await db.commit()
+            await self.touch_conversation(conversation_id, updated_at=created_at)
             return {"id": cursor.lastrowid, "created_at": created_at}
 
     async def add_task(self, run_id: str, task_type: str, payload: dict, status: str) -> None:
@@ -351,13 +449,15 @@ class Database:
 
     async def get_run_summary(self, run_id: str) -> Optional[dict]:
         row = await self.fetchone(
-            "SELECT run_id, created_at, user_question, reasoning_mode, router_decision_json, final_answer, confidence, status FROM runs WHERE run_id=?",
+            "SELECT run_id, conversation_id, created_at, user_question, reasoning_mode, router_decision_json, final_answer, confidence, status "
+            "FROM runs WHERE run_id=?",
             (run_id,),
         )
         if not row:
             return None
         return {
             "run_id": row["run_id"],
+            "conversation_id": row["conversation_id"],
             "created_at": row["created_at"],
             "user_question": row["user_question"],
             "reasoning_mode": row["reasoning_mode"],
@@ -367,14 +467,24 @@ class Database:
             "status": row["status"],
         }
 
-    async def get_latest_run(self, after: Optional[str] = None) -> Optional[dict]:
+    async def get_latest_run(self, after: Optional[str] = None, conversation_id: Optional[str] = None) -> Optional[dict]:
+        params: Tuple[Any, ...]
+        clauses = []
+        if conversation_id:
+            clauses.append("conversation_id=?")
         if after:
-            row = await self.fetchone(
-                "SELECT run_id FROM runs WHERE created_at > ? ORDER BY created_at DESC LIMIT 1",
-                (after,),
-            )
-        else:
-            row = await self.fetchone("SELECT run_id FROM runs ORDER BY created_at DESC LIMIT 1")
+            clauses.append("created_at > ?")
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        params_list: List[Any] = []
+        if conversation_id:
+            params_list.append(conversation_id)
+        if after:
+            params_list.append(after)
+        params = tuple(params_list)
+        row = await self.fetchone(
+            f"SELECT run_id FROM runs {where} ORDER BY created_at DESC LIMIT 1",
+            params,
+        )
         if not row:
             return None
         return await self.get_run_summary(row["run_id"])
@@ -662,19 +772,228 @@ class Database:
             for r in rows
         ]
 
-    async def list_messages(self, limit: int = 200) -> List[dict]:
+    async def set_default_conversation_id(self, conversation_id: str) -> None:
+        await self.execute(
+            "UPDATE conversation_state SET default_conversation_id=? WHERE id=1",
+            (conversation_id,),
+        )
+
+    async def get_default_conversation_id(self) -> Optional[str]:
+        row = await self.fetchone("SELECT default_conversation_id FROM conversation_state WHERE id=1")
+        if row and row["default_conversation_id"]:
+            return row["default_conversation_id"]
+        latest = await self.fetchone(
+            "SELECT id FROM conversations ORDER BY updated_at DESC, created_at DESC LIMIT 1"
+        )
+        if latest and latest["id"]:
+            await self.set_default_conversation_id(latest["id"])
+            return latest["id"]
+        return None
+
+    async def touch_conversation(self, conversation_id: Optional[str], updated_at: Optional[str] = None) -> Optional[str]:
+        if not conversation_id:
+            return None
+        stamp = updated_at or utc_now()
+        await self.execute("UPDATE conversations SET updated_at=? WHERE id=?", (stamp, conversation_id))
+        return stamp
+
+    async def create_conversation(
+        self,
+        title: Optional[str] = None,
+        model_tier: str = "pro",
+        reasoning_mode: str = "auto",
+        manual_level: str = "MED",
+        deep_mode: str = "auto",
+    ) -> dict:
+        convo_id = uuid.uuid4().hex
+        created_at = utc_now()
+        await self.execute(
+            "INSERT INTO conversations(id, created_at, updated_at, title, model_tier, reasoning_mode, manual_level, deep_mode, archived) "
+            "VALUES (?,?,?,?,?,?,?,?,0)",
+            (convo_id, created_at, created_at, title or "New chat", model_tier, reasoning_mode, manual_level, deep_mode),
+        )
+        default_id = await self.get_default_conversation_id()
+        if not default_id:
+            await self.set_default_conversation_id(convo_id)
+        return {
+            "id": convo_id,
+            "created_at": created_at,
+            "updated_at": created_at,
+            "title": title or "New chat",
+            "model_tier": model_tier,
+            "reasoning_mode": reasoning_mode,
+            "manual_level": manual_level,
+            "deep_mode": deep_mode,
+            "archived": False,
+        }
+
+    async def get_conversation(self, conversation_id: str) -> Optional[dict]:
+        row = await self.fetchone(
+            "SELECT id, created_at, updated_at, title, model_tier, reasoning_mode, manual_level, deep_mode, archived "
+            "FROM conversations WHERE id=?",
+            (conversation_id,),
+        )
+        if not row:
+            return None
+        return {
+            "id": row["id"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+            "title": row["title"],
+            "model_tier": row["model_tier"],
+            "reasoning_mode": row["reasoning_mode"],
+            "manual_level": row["manual_level"],
+            "deep_mode": row["deep_mode"],
+            "archived": bool(row["archived"]),
+        }
+
+    async def list_conversations(self, include_archived: bool = False, limit: int = 200) -> List[dict]:
+        where = "" if include_archived else "WHERE archived=0"
         rows = await self.fetchall(
-            "SELECT id, run_id, role, content, created_at FROM messages ORDER BY created_at ASC LIMIT ?",
+            "SELECT id, created_at, updated_at, title, model_tier, reasoning_mode, manual_level, deep_mode, archived, "
+            "(SELECT run_id FROM runs WHERE conversation_id=conversations.id ORDER BY created_at DESC LIMIT 1) AS latest_run_id, "
+            "(SELECT status FROM runs WHERE conversation_id=conversations.id ORDER BY created_at DESC LIMIT 1) AS latest_status, "
+            "(SELECT content FROM messages WHERE conversation_id=conversations.id ORDER BY created_at DESC LIMIT 1) AS latest_message, "
+            "(SELECT role FROM messages WHERE conversation_id=conversations.id ORDER BY created_at DESC LIMIT 1) AS latest_role, "
+            "(SELECT created_at FROM messages WHERE conversation_id=conversations.id ORDER BY created_at DESC LIMIT 1) AS latest_message_at "
+            f"FROM conversations {where} ORDER BY updated_at DESC, created_at DESC LIMIT ?",
             (limit,),
+        )
+        return [
+            {
+                "id": r["id"],
+                "created_at": r["created_at"],
+                "updated_at": r["updated_at"],
+                "title": r["title"],
+                "model_tier": r["model_tier"],
+                "reasoning_mode": r["reasoning_mode"],
+                "manual_level": r["manual_level"],
+                "deep_mode": r["deep_mode"],
+                "archived": bool(r["archived"]),
+                "latest_run_id": r["latest_run_id"],
+                "latest_status": r["latest_status"],
+                "latest_message": r["latest_message"],
+                "latest_role": r["latest_role"],
+                "latest_message_at": r["latest_message_at"],
+            }
+            for r in rows
+        ]
+
+    async def update_conversation(
+        self,
+        conversation_id: str,
+        title: Optional[str] = None,
+        model_tier: Optional[str] = None,
+        reasoning_mode: Optional[str] = None,
+        manual_level: Optional[str] = None,
+        deep_mode: Optional[str] = None,
+    ) -> Optional[dict]:
+        row = await self.fetchone(
+            "SELECT title, model_tier, reasoning_mode, manual_level, deep_mode FROM conversations WHERE id=?",
+            (conversation_id,),
+        )
+        if not row:
+            return None
+        next_title = title if title is not None else row["title"]
+        next_tier = model_tier if model_tier is not None else row["model_tier"]
+        next_reasoning = reasoning_mode if reasoning_mode is not None else row["reasoning_mode"]
+        next_manual = manual_level if manual_level is not None else row["manual_level"]
+        next_deep = deep_mode if deep_mode is not None else row["deep_mode"]
+        updated_at = utc_now()
+        await self.execute(
+            "UPDATE conversations SET title=?, model_tier=?, reasoning_mode=?, manual_level=?, deep_mode=?, updated_at=? WHERE id=?",
+            (next_title, next_tier, next_reasoning, next_manual, next_deep, updated_at, conversation_id),
+        )
+        return await self.get_conversation(conversation_id)
+
+    async def ensure_conversation_title(self, conversation_id: str, title: str) -> None:
+        row = await self.fetchone("SELECT title FROM conversations WHERE id=?", (conversation_id,))
+        if not row:
+            return
+        current = (row["title"] or "").strip()
+        if current and current.lower() not in ("new chat", "legacy chat"):
+            return
+        await self.execute(
+            "UPDATE conversations SET title=?, updated_at=? WHERE id=?",
+            (title, utc_now(), conversation_id),
+        )
+
+    async def delete_conversation(self, conversation_id: str) -> None:
+        await self.execute("DELETE FROM messages WHERE conversation_id=?", (conversation_id,))
+        for table in (
+            "tasks",
+            "searches",
+            "extracts",
+            "sources",
+            "claims",
+            "drafts",
+            "verifier_reports",
+            "events",
+            "step_plans",
+            "step_runs",
+            "artifacts",
+            "uploads",
+            "control_actions",
+            "run_memory_links",
+        ):
+            await self.execute(
+                f"DELETE FROM {table} WHERE run_id IN (SELECT run_id FROM runs WHERE conversation_id=?)",
+                (conversation_id,),
+            )
+        await self.execute("DELETE FROM runs WHERE conversation_id=?", (conversation_id,))
+        await self.execute("DELETE FROM conversations WHERE id=?", (conversation_id,))
+
+    async def get_prompt_state(self) -> Optional[dict]:
+        row = await self.fetchone("SELECT prompt_text, run_id, updated_at FROM prompt_state WHERE id=1")
+        if not row or not row["prompt_text"]:
+            return None
+        return {
+            "prompt_text": row["prompt_text"],
+            "run_id": row["run_id"],
+            "updated_at": row["updated_at"],
+        }
+
+    async def set_prompt_state(self, prompt_text: str, run_id: Optional[str] = None) -> dict:
+        updated_at = utc_now()
+        await self.execute(
+            "INSERT OR REPLACE INTO prompt_state(id, prompt_text, run_id, updated_at) VALUES (1, ?, ?, ?)",
+            (prompt_text, run_id, updated_at),
+        )
+        return {"prompt_text": prompt_text, "run_id": run_id, "updated_at": updated_at}
+
+    async def clear_prompt_state(self, updated_at: Optional[str] = None) -> str:
+        stamp = updated_at or utc_now()
+        await self.execute(
+            "UPDATE prompt_state SET prompt_text=NULL, run_id=NULL, updated_at=? WHERE id=1",
+            (stamp,),
+        )
+        return stamp
+
+    async def list_messages(self, conversation_id: Optional[str] = None, limit: int = 200) -> List[dict]:
+        convo_id = conversation_id or await self.get_default_conversation_id()
+        if not convo_id:
+            return []
+        rows = await self.fetchall(
+            "SELECT id, run_id, conversation_id, role, content, created_at "
+            "FROM messages WHERE conversation_id=? ORDER BY created_at ASC LIMIT ?",
+            (convo_id, limit),
         )
         return [dict(r) for r in rows]
 
-    async def reset_conversation(self) -> str:
+    async def reset_conversation(self, conversation_id: Optional[str] = None) -> str:
         reset_at = utc_now()
+        convo_id = conversation_id or await self.get_default_conversation_id()
         async with aiosqlite.connect(self.path) as db:
-            await db.execute("DELETE FROM messages")
+            if convo_id:
+                await db.execute("DELETE FROM messages WHERE conversation_id=?", (convo_id,))
+            else:
+                await db.execute("DELETE FROM messages")
             await db.execute(
-                "INSERT OR REPLACE INTO conversation_state(id, reset_at) VALUES (1, ?)",
+                "INSERT OR REPLACE INTO conversation_state(id, reset_at, default_conversation_id) VALUES (1, ?, ?)",
+                (reset_at, convo_id),
+            )
+            await db.execute(
+                "UPDATE prompt_state SET prompt_text=NULL, run_id=NULL, updated_at=? WHERE id=1",
                 (reset_at,),
             )
             await db.commit()

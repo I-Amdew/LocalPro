@@ -66,7 +66,7 @@ def get_resource_snapshot() -> Dict[str, Any]:
 
 
 def _worker_variants(model_map: Dict[str, Dict[str, str]], availability: Optional[Dict[str, Any]]) -> int:
-    """Count distinct worker-like models that look usable."""
+    """Count distinct worker-like model IDs that look usable."""
     roles = ("worker", "worker_b", "worker_c")
     configured: Set[str] = set()
     for role in roles:
@@ -77,10 +77,11 @@ def _worker_variants(model_map: Dict[str, Dict[str, str]], availability: Optiona
     if availability:
         prefixes = {m.split(":")[0] for m in configured if m}
         discovered: Set[str] = set()
-        for info in availability.values():
+        for role in roles:
+            info = availability.get(role) if isinstance(availability, dict) else None
             if not isinstance(info, dict):
                 continue
-            for mid in info.get("available", []):
+            for mid in info.get("available", []) or []:
                 if not mid:
                     continue
                 prefix = mid.split(":")[0]
@@ -104,16 +105,14 @@ def compute_worker_slots(
     - RAM/VRAM headroom by tier
     """
     variants = _worker_variants(model_map, availability)
-    configured_slots = max(
-        1,
-        len(
-            {
-                cfg.get("model")
-                for cfg in (model_map.get(r) or {} for r in ("worker", "worker_b", "worker_c"))
-                if cfg.get("model")
-            }
-        ),
+    worker_roles = ("worker", "worker_b", "worker_c")
+    configured_slots = sum(
+        1
+        for role in worker_roles
+        if (model_map.get(role) or {}).get("model") and (model_map.get(role) or {}).get("base_url")
     )
+    if configured_slots <= 0:
+        configured_slots = 1
     base_slots = max(variants, configured_slots)
 
     ram_slots: Optional[int] = None

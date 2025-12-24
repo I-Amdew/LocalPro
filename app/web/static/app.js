@@ -1,5 +1,6 @@
 let currentRunId = null;
 let evtSource = null;
+let globalEventSource = null;
 let cachedArtifacts = null;
 let sttRecognition = null;
 let sttActive = false;
@@ -16,11 +17,21 @@ let liveEventBuffer = [];
 let liveFlushTimer = null;
 let pendingQuestion = "";
 let questionShownInLive = false;
+let multiAgentMode = false;
 let latestRunPoll = null;
 let pendingUploads = [];
 let renderedMessages = new Set();
 let pendingLocalMessages = [];
-let conversationResetAt = null;
+let conversations = [];
+let activeConversationId = null;
+let unreadConversations = new Set();
+let conversationSearch = "";
+let conversationRefreshTimer = null;
+let conversationSettingsTimer = null;
+let memorySearchTimer = null;
+let activePrompt = null;
+let activePromptRunId = null;
+let promptLocked = false;
 let currentTier = "pro";
 let runDetails = {};
 let runEvents = {};
@@ -38,7 +49,138 @@ let settingsDefaults = {
 };
 let settingsSnapshot = null;
 const LOCAL_PREFS_KEY = "localpro_prefs_v1";
+const API_BASE_STORAGE_KEY = "localpro_api_base_v1";
+const ACTIVE_CONVERSATION_KEY = "localpro_active_conversation_v1";
 const DRAWER_MEDIA_QUERY = "(min-width: 1100px)";
+const SIDEBAR_OPEN_CLASS = "sidebar-open";
+const DEFAULT_HELPER_TEXT = "Enter to send. Shift+Enter for new line.";
+const APP_BASE_URL = (() => {
+  const normalized = normalizeBaseUrl(document.baseURI || window.location.href);
+  if (normalized) return new URL(normalized);
+  return new URL("/", window.location.origin);
+})();
+const NARRATION_PREFIX = "4B";
+function getInitialApiBase() {
+  const params = new URLSearchParams(window.location.search);
+  const fromQuery = params.get("api") || params.get("api_base");
+  let normalized = normalizeBaseUrl(fromQuery);
+  if (normalized) {
+    try {
+      localStorage.setItem(API_BASE_STORAGE_KEY, normalized);
+    } catch (_) {}
+    return normalized;
+  }
+  normalized = normalizeBaseUrl(window.LOCALPRO_API_BASE_URL || window.LOCALPRO_API_BASE);
+  if (normalized) return normalized;
+  const meta = document.querySelector('meta[name="localpro-api-base"]');
+  normalized = normalizeBaseUrl(meta ? meta.getAttribute("content") : null);
+  if (normalized) return normalized;
+  try {
+    normalized = normalizeBaseUrl(localStorage.getItem(API_BASE_STORAGE_KEY));
+  } catch (_) {
+    normalized = null;
+  }
+  if (normalized) return normalized;
+  return APP_BASE_URL.href;
+}
+let apiBaseUrl = getInitialApiBase();
+let apiReady = false;
+
+function resolveEndpoint(path) {
+  const raw = path || "";
+  const clean = raw.replace(/^\/+/, "");
+  return new URL(clean, apiBaseUrl).href;
+}
+
+function normalizeBaseUrl(value) {
+  if (!value) return null;
+  const raw = value instanceof URL ? value.href : String(value);
+  if (!raw.trim()) return null;
+  try {
+    const base = new URL(raw, window.location.href);
+    base.search = "";
+    base.hash = "";
+    let path = (base.pathname || "/").replace(/\/+$/, "");
+    if (path.endsWith("/api")) {
+      path = path.slice(0, -4) || "/";
+    }
+    const lastSegment = path.split("/").pop() || "";
+    const looksLikeFile = lastSegment.includes(".");
+    if (looksLikeFile) {
+      path = path.slice(0, path.lastIndexOf("/") + 1) || "/";
+    } else if (!path.endsWith("/")) {
+      path += "/";
+    }
+    base.pathname = path;
+    return base.href;
+  } catch {
+    return null;
+  }
+}
+
+function setApiBaseUrl(value, persist = true) {
+  const normalized = normalizeBaseUrl(value);
+  if (!normalized) return false;
+  apiBaseUrl = normalized;
+  if (persist) {
+    try {
+      localStorage.setItem(API_BASE_STORAGE_KEY, normalized);
+    } catch (_) {}
+  }
+  updateShareLinks();
+  return true;
+}
+
+function updateShareLinks() {
+  let origin = "";
+  try {
+    origin = new URL(apiBaseUrl || APP_BASE_URL.href || window.location.origin).origin;
+  } catch (_) {
+    origin = window.location.origin;
+  }
+  if (!origin || origin === "null") return;
+  const link = el("shareLink");
+  if (link) {
+    link.textContent = origin;
+    link.href = origin;
+  }
+  const mobile = el("shareLinkMobile");
+  if (mobile) {
+    mobile.textContent = origin;
+    mobile.href = origin;
+  }
+}
+
+async function checkApiBase(baseUrl) {
+  const target = new URL("api/run/latest", baseUrl).href;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 2500);
+  try {
+    const res = await fetch(target, { signal: controller.signal });
+    return res.ok;
+  } catch (_) {
+    return false;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function ensureApiBase() {
+  const candidates = [apiBaseUrl, APP_BASE_URL.href, window.location.origin];
+  const seen = new Set();
+  for (const candidate of candidates) {
+    const normalized = normalizeBaseUrl(candidate);
+    if (!normalized || seen.has(normalized)) continue;
+    seen.add(normalized);
+    if (await checkApiBase(normalized)) {
+      if (normalized !== apiBaseUrl) setApiBaseUrl(normalized);
+      apiReady = true;
+      return true;
+    }
+  }
+  apiReady = false;
+  return false;
+}
 
 function loadLocalPrefs() {
   try {
@@ -75,12 +217,21 @@ function syncDrawerLayout() {
   const overlay = el("drawerOverlay");
   if (!panel || !overlay) return;
   if (isDesktopDrawer()) {
-    panel.classList.add("open");
-    panel.classList.remove("hidden");
+    if (panel.classList.contains("open")) {
+      panel.classList.remove("hidden");
+    } else {
+      panel.classList.add("hidden");
+    }
     overlay.classList.add("hidden");
   } else if (!panel.classList.contains("open")) {
     panel.classList.add("hidden");
   }
+}
+
+function setSidebarOpen(open) {
+  const overlay = el("sidebarOverlay");
+  document.body.classList.toggle(SIDEBAR_OPEN_CLASS, open);
+  if (overlay) overlay.classList.toggle("hidden", !open);
 }
 
 function el(id) {
@@ -163,6 +314,72 @@ function updateEtaCountdown() {
   }
 }
 
+function setQuestionValue(value, opts = {}) {
+  const input = el("question");
+  if (!input) return false;
+  if (promptLocked && !opts.force) return false;
+  input.value = value || "";
+  updateCharCount();
+  return true;
+}
+
+function updatePromptUI(opts = {}) {
+  const input = el("question");
+  const endBtn = el("endPromptBtn");
+  const helper = el("promptHelper");
+  const sendBtn = document.querySelector("#chatForm .send-btn");
+  const clear = opts.clear !== false;
+  if (input) {
+    if (activePrompt) {
+      input.value = activePrompt;
+      input.readOnly = true;
+      input.classList.add("prompt-locked");
+    } else {
+      input.readOnly = false;
+      input.classList.remove("prompt-locked");
+      if (clear) input.value = "";
+    }
+  }
+  if (sendBtn) sendBtn.disabled = !!activePrompt;
+  if (endBtn) endBtn.classList.toggle("hidden", !activePrompt);
+  if (helper) helper.textContent = activePrompt ? "Prompt locked. End it to start a new one." : DEFAULT_HELPER_TEXT;
+  updateCharCount();
+}
+
+function applyPromptState(prompt, opts = {}) {
+  if (prompt && typeof prompt.prompt_text === "string" && prompt.prompt_text.trim()) {
+    activePrompt = prompt.prompt_text.trim();
+    activePromptRunId = prompt.run_id || null;
+    promptLocked = true;
+  } else {
+    activePrompt = null;
+    activePromptRunId = null;
+    promptLocked = false;
+  }
+  updatePromptUI(opts);
+}
+
+async function syncPromptState(opts = {}) {
+  try {
+    const res = await fetch(resolveEndpoint("/api/prompt"));
+    if (!res.ok) return;
+    const data = await res.json();
+    applyPromptState(data.prompt || null, opts);
+  } catch (_) {
+    // ignore prompt sync failures
+  }
+}
+
+async function endPrompt() {
+  try {
+    const res = await fetch(resolveEndpoint("/api/prompt"), { method: "DELETE" });
+    if (!res.ok) throw new Error("End prompt failed");
+    applyPromptState(null, { clear: true });
+  } catch (_) {
+    appendActivity("Failed to end the prompt.");
+  }
+}
+
 function startNewConversation(opts = {}) {
   const keepQuestion = opts.keepQuestion || false;
   const keepUploads = opts.keepUploads || false;
@@ -193,8 +410,7 @@ function startNewConversation(opts = {}) {
   el("confidence").textContent = "";
   el("sources").textContent = "";
   if (!keepQuestion) {
-    el("question").value = "";
-    updateCharCount();
+    if (!promptLocked) setQuestionValue("", { force: true });
   }
   if (!keepUploads) {
     pendingUploads = [];
@@ -210,40 +426,333 @@ function startNewConversation(opts = {}) {
   }
   closeDrawer();
   updateEmptyState();
+  if (promptLocked) updatePromptUI({ clear: false });
   if (!silent) appendActivity("Ready for a new shared conversation.");
 }
 
-async function syncConversationHistory() {
+function loadActiveConversationId() {
   try {
-    const res = await fetch("/api/conversation");
+    return localStorage.getItem(ACTIVE_CONVERSATION_KEY);
+  } catch (_) {
+    return null;
+  }
+}
+
+function storeActiveConversationId(id) {
+  try {
+    if (id) {
+      localStorage.setItem(ACTIVE_CONVERSATION_KEY, id);
+    } else {
+      localStorage.removeItem(ACTIVE_CONVERSATION_KEY);
+    }
+  } catch (_) {}
+}
+
+function formatConversationTime(value) {
+  if (!value) return "";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "";
+  const now = new Date();
+  const sameDay = date.toDateString() === now.toDateString();
+  if (sameDay) {
+    return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  }
+  const sameYear = date.getFullYear() === now.getFullYear();
+  const base = date.toLocaleDateString([], { month: "short", day: "numeric" });
+  return sameYear ? base : `${base} '${String(date.getFullYear()).slice(-2)}`;
+}
+
+function conversationPreview(convo) {
+  const snippet = (convo.latest_message || "").trim();
+  if (!snippet) return "No messages yet.";
+  const prefix = convo.latest_role === "user" ? "You: " : "LocalPro: ";
+  return `${prefix}${snippet}`;
+}
+
+function getConversationById(conversationId) {
+  return conversations.find((c) => c.id === conversationId) || null;
+}
+
+function renderConversationList() {
+  const list = el("conversationList");
+  if (!list) return;
+  list.innerHTML = "";
+  const needle = conversationSearch.trim().toLowerCase();
+  const filtered = conversations.filter((convo) => {
+    if (!needle) return true;
+    const hay = `${convo.title || ""} ${convo.latest_message || ""}`.toLowerCase();
+    return hay.includes(needle);
+  });
+  if (!filtered.length) {
+    const empty = document.createElement("div");
+    empty.className = "conversation-empty";
+    empty.textContent = needle ? "No chats match that search." : "No chats yet.";
+    list.appendChild(empty);
+    return;
+  }
+  filtered.forEach((convo) => {
+    const item = document.createElement("div");
+    item.className = "conversation-item";
+    if (convo.id === activeConversationId) item.classList.add("active");
+    if (unreadConversations.has(convo.id)) item.classList.add("unread");
+    const select = document.createElement("button");
+    select.type = "button";
+    select.className = "conversation-select";
+    select.onclick = () => selectConversation(convo.id);
+    const title = document.createElement("div");
+    title.className = "conversation-title";
+    title.textContent = convo.title || "New chat";
+    const meta = document.createElement("div");
+    meta.className = "conversation-meta";
+    meta.textContent = conversationPreview(convo);
+    select.appendChild(title);
+    select.appendChild(meta);
+    const time = document.createElement("div");
+    time.className = "conversation-time";
+    time.textContent = formatConversationTime(convo.latest_message_at || convo.updated_at);
+    const actions = document.createElement("div");
+    actions.className = "conversation-actions";
+    const delBtn = document.createElement("button");
+    delBtn.type = "button";
+    delBtn.className = "icon-btn ghost conversation-delete";
+    delBtn.textContent = "Delete";
+    delBtn.title = "Delete chat";
+    delBtn.onclick = (e) => {
+      e.stopPropagation();
+      deleteConversation(convo.id);
+    };
+    actions.appendChild(delBtn);
+    item.appendChild(select);
+    item.appendChild(time);
+    item.appendChild(actions);
+    list.appendChild(item);
+  });
+}
+
+function updateConversationHeader(convo) {
+  const titleEl = el("conversationTitle");
+  if (titleEl) titleEl.textContent = convo?.title || "New chat";
+  const metaEl = el("conversationMeta");
+  if (metaEl) {
+    const updated = formatConversationTime(convo?.updated_at);
+    metaEl.textContent = updated ? `Updated ${updated}` : "";
+  }
+}
+
+function scheduleConversationRefresh() {
+  if (conversationRefreshTimer) clearTimeout(conversationRefreshTimer);
+  conversationRefreshTimer = setTimeout(() => {
+    fetchConversations();
+  }, 400);
+}
+
+async function fetchConversations(opts = {}) {
+  try {
+    const res = await fetch(resolveEndpoint("/api/conversations"));
     if (!res.ok) return;
     const data = await res.json();
-    conversationResetAt = data.reset_at || conversationResetAt;
+    conversations = data.conversations || [];
+    renderConversationList();
+    if (activeConversationId) {
+      const convo = getConversationById(activeConversationId);
+      if (convo) updateConversationHeader(convo);
+    }
+    if (opts.ensureActive && !activeConversationId && conversations.length) {
+      await selectConversation(conversations[0].id, { force: true });
+    }
+  } catch (_) {
+    // ignore list failures
+  }
+}
+
+function getReasoningSettings() {
+  const selected = el("reasoningLevel")?.value || "AUTO";
+  const deepRoute = (el("deepRoute") && el("deepRoute").value) || "auto";
+  let reasoningMode = "manual";
+  let manualLevel = "LOW";
+  if (currentTier === "fast") {
+    reasoningMode = "manual";
+    manualLevel = "LOW";
+  } else if (currentTier === "auto") {
+    reasoningMode = "auto";
+    manualLevel = "MED";
+  } else {
+    const reasoningAuto = selected === "AUTO";
+    reasoningMode = reasoningAuto ? "auto" : "manual";
+    manualLevel = reasoningAuto ? (currentTier === "deep" ? "HIGH" : "MED") : selected;
+  }
+  return { reasoningMode, manualLevel, deepRoute };
+}
+
+function getConversationSettingsFromUI() {
+  const settings = getReasoningSettings();
+  return {
+    model_tier: currentTier,
+    reasoning_mode: settings.reasoningMode,
+    manual_level: settings.manualLevel,
+    deep_mode: currentTier === "deep" ? settings.deepRoute : "auto",
+  };
+}
+
+async function persistConversationSettings() {
+  if (!activeConversationId) return;
+  const payload = getConversationSettingsFromUI();
+  try {
+    const res = await fetch(resolveEndpoint(`/api/conversations/${activeConversationId}`), {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    if (res.ok) {
+      const data = await res.json();
+      const updated = data.conversation;
+      if (updated) {
+        const idx = conversations.findIndex((c) => c.id === updated.id);
+        if (idx >= 0) conversations[idx] = updated;
+        activeConversationId = updated.id;
+        updateConversationHeader(updated);
+        renderConversationList();
+      }
+    }
+  } catch (_) {
+    // ignore update failures
+  }
+}
+
+function scheduleConversationSettingsUpdate() {
+  if (!activeConversationId) return;
+  if (conversationSettingsTimer) clearTimeout(conversationSettingsTimer);
+  conversationSettingsTimer = setTimeout(() => {
+    persistConversationSettings();
+  }, 250);
+}
+
+function applyConversationSettings(convo) {
+  if (!convo) return;
+  setTier(convo.model_tier || "pro", { persist: false });
+  const deepRoute = el("deepRoute");
+  if (deepRoute) deepRoute.value = convo.deep_mode || "auto";
+  const select = el("reasoningLevel");
+  if (select) {
+    const useManual = (convo.reasoning_mode || "auto") === "manual";
+    const level = useManual ? convo.manual_level || "MED" : "AUTO";
+    select.value = level;
+  }
+  updateReasoningBadge();
+}
+
+async function loadConversationMessages(conversationId) {
+  try {
+    const res = await fetch(resolveEndpoint(`/api/conversations/${conversationId}/messages`));
+    if (!res.ok) return;
+    const data = await res.json();
     (data.messages || []).forEach((msg) => {
       appendChat(msg.role || "assistant", msg.content || "", { messageId: msg.id, runId: msg.run_id });
     });
-  } catch (err) {
+  } catch (_) {
     // ignore hydration errors
   }
 }
 
-async function resetConversation() {
-  try {
-    const res = await fetch("/api/conversation", { method: "DELETE" });
-    const data = await res.json().catch(() => ({}));
-    conversationResetAt = data.reset_at || new Date().toISOString();
-  } catch (err) {
-    conversationResetAt = new Date().toISOString();
+async function selectConversation(conversationId, opts = {}) {
+  if (!conversationId) return;
+  if (activeConversationId === conversationId && !opts.force) return;
+  activeConversationId = conversationId;
+  storeActiveConversationId(conversationId);
+  unreadConversations.delete(conversationId);
+  const convo = opts.conversation || getConversationById(conversationId);
+  updateConversationHeader(convo);
+  applyConversationSettings(convo);
+  startNewConversation({ keepQuestion: false, keepUploads: false, silent: true, preserveChat: false });
+  await loadConversationMessages(conversationId);
+  if (convo && convo.latest_run_id) {
+    await switchToRun(convo.latest_run_id, { clearChat: false, resetState: false, skipThinking: true });
   }
-  renderedMessages = new Set();
-  pendingLocalMessages = [];
-  startNewConversation({ keepQuestion: false, keepUploads: false, silent: false, preserveChat: false });
+  renderConversationList();
+}
+
+async function createConversation() {
+  const payload = getConversationSettingsFromUI();
+  try {
+    const res = await fetch(resolveEndpoint("/api/conversations"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    if (!res.ok) throw new Error("create failed");
+    const data = await res.json();
+    const convo = data.conversation;
+    if (convo) {
+      conversations = [convo, ...conversations.filter((c) => c.id !== convo.id)];
+      await selectConversation(convo.id, { conversation: convo, force: true });
+      renderConversationList();
+      return convo;
+    }
+  } catch (_) {
+    appendActivity("Failed to create a new chat.");
+  }
+  return null;
+}
+
+async function deleteConversation(conversationId) {
+  const convo = getConversationById(conversationId);
+  const title = convo?.title || "this chat";
+  if (!confirm(`Delete "${title}"? This removes its runs and uploads.`)) return;
+  try {
+    const res = await fetch(resolveEndpoint(`/api/conversations/${conversationId}`), { method: "DELETE" });
+    if (!res.ok) throw new Error("delete failed");
+    unreadConversations.delete(conversationId);
+    conversations = conversations.filter((c) => c.id !== conversationId);
+    if (conversationId === activeConversationId) {
+      activeConversationId = null;
+      storeActiveConversationId(null);
+      if (conversations.length) {
+        await selectConversation(conversations[0].id, { force: true });
+      } else {
+        await createConversation();
+      }
+    } else {
+      renderConversationList();
+    }
+  } catch (_) {
+    appendActivity("Failed to delete chat.");
+  }
+}
+
+async function renameConversation(conversationId, title) {
+  if (!conversationId) return;
+  const nextTitle = (title || "").trim();
+  if (!nextTitle) return;
+  try {
+    const res = await fetch(resolveEndpoint(`/api/conversations/${conversationId}`), {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ title: nextTitle }),
+    });
+    if (!res.ok) throw new Error("rename failed");
+    const data = await res.json();
+    const convo = data.conversation;
+    if (convo) {
+      const idx = conversations.findIndex((c) => c.id === convo.id);
+      if (idx >= 0) conversations[idx] = convo;
+      if (convo.id === activeConversationId) updateConversationHeader(convo);
+      renderConversationList();
+    }
+  } catch (_) {
+    appendActivity("Failed to rename chat.");
+  }
 }
 
 function escapeAndBreak(text) {
   const div = document.createElement("div");
   div.textContent = text || "";
   return div.innerHTML.replace(/\n/g, "<br>");
+}
+
+function withNarrationPrefix(text, lane) {
+  if (!text || lane !== "executor") return text;
+  const prefix = `${NARRATION_PREFIX}: `;
+  return text.startsWith(prefix) ? text : `${prefix}${text}`;
 }
 
 function updateEmptyState() {
@@ -296,6 +805,7 @@ function appendChat(role, text, opts = {}) {
   if (!idKey && !skipPending) pendingLocalMessages.push({ role, text: cleanText, el: wrap });
   el("chatThread").scrollTop = el("chatThread").scrollHeight;
   updateEmptyState();
+  return wrap;
 }
 
 function hasMessageForRun(role, runId) {
@@ -347,15 +857,20 @@ function ensureThinkingPlaceholder(runId) {
 }
 
 function stopStreaming(runId) {
+  const targetRun = runId || currentRunId;
   if (evtSource) {
     try {
       evtSource.close();
     } catch (_) {}
     evtSource = null;
   }
+  stopTimer();
   setStatus("Stopped", "error");
   updateLiveTicker("Generation stopped");
-  const bubble = getAssistantBubble(runId || currentRunId);
+  if (targetRun) {
+    void requestRunStop(targetRun);
+  }
+  const bubble = getAssistantBubble(targetRun);
   if (bubble) {
     bubble.classList.remove("thinking");
     bubble.dataset.state = "stopped";
@@ -372,24 +887,23 @@ function appendActivity(entry) {
   if (Array.isArray(payload.lines)) {
     payload.lines.forEach((line) => {
       if (!line || !line.text) return;
+      const lane = line.lane || payload.lane || "executor";
+      const text = withNarrationPrefix(line.text, lane);
       pushReasoning(
-        line.text,
+        text,
         line.tone || payload.tone || "info",
-        line.lane || payload.lane || "thinking",
+        lane,
         line.urls || payload.urls || []
       );
     });
     return;
   }
   if (!payload.text) return;
-  pushReasoning(payload.text, payload.tone || "info", payload.lane || "thinking", payload.urls || []);
-  const feed = el("activityFeed");
-  if (!feed) return;
-  const div = document.createElement("div");
-  div.className = "event";
-  div.textContent = payload.text;
-  feed.appendChild(div);
-  feed.scrollTop = feed.scrollHeight;
+  {
+    const lane = payload.lane || "executor";
+    const text = withNarrationPrefix(payload.text, lane);
+    pushReasoning(text, payload.tone || "info", lane, payload.urls || []);
+  }
 }
 
 function renderAttachments() {
@@ -536,7 +1050,7 @@ async function uploadFiles(fileList) {
     const form = new FormData();
     form.append("file", file);
     try {
-      const res = await fetch("/api/uploads", { method: "POST", body: form });
+      const res = await fetch(resolveEndpoint("/api/uploads"), { method: "POST", body: form });
       if (!res.ok) {
         let detail = "Upload failed";
         try {
@@ -575,6 +1089,7 @@ function resetLiveStreamState(question = "") {
   liveFlushTimer = null;
   pendingQuestion = question;
   questionShownInLive = false;
+  multiAgentMode = false;
 }
 
 function eventSeverity(type) {
@@ -585,6 +1100,7 @@ function eventSeverity(type) {
       "router_decision",
       "resource_budget",
       "plan_created",
+      "work_log",
       "step_completed",
       "control_action",
       "loop_iteration",
@@ -594,6 +1110,11 @@ function eventSeverity(type) {
       "upload_received",
       "upload_processed",
       "upload_failed",
+      "executor_brief",
+      "allocator_decision",
+      "planner_verifier",
+      "model_unavailable",
+      "model_error",
     ].includes(type)
   ) {
     return "medium";
@@ -643,131 +1164,190 @@ function normalizeNote(note) {
   return note;
 }
 
-function summarizeLiveEvents(events) {
-  const lines = [];
-  const seenNotes = new Set();
-  let usedQuestion = false;
-  const pushLine = (text, opts = {}) => {
-    if (!text) return;
-    lines.push({ text, ...opts });
-  };
+const LANE_LABELS = {
+  orch: "Planner",
+  executor: "Executor",
+  primary: "Primary researcher",
+  recency: "Recency checker",
+  adversarial: "Caveat checker",
+  router: "Router",
+  verifier: "Verifier",
+  memory: "Memory",
+  web: "Web",
+  ui: "UI",
+  worklog: "Status",
+};
+
+function laneLabel(lane) {
+  if (!lane) return "";
+  return LANE_LABELS[lane] || lane;
+}
+
+const MULTI_AGENT_LANES = new Set(["executor", "primary", "recency", "adversarial", "verifier"]);
+
+function hasMultipleLanes(events) {
+  const lanes = new Set();
   (events || []).forEach((ev) => {
-    const d = ev.detail || {};
-    switch (ev.type) {
-      case "run_started": {
-        const question = d.question || pendingQuestion;
-        if (question && !questionShownInLive) {
-          pushLine(`Starting on: ${question}`);
-          usedQuestion = true;
-        }
-        break;
-      }
-      case "router_decision": {
-        const tierName = d.model_tier ? tierLabel(d.model_tier) : tierLabel(currentTier);
-        const reasoning = d.reasoning_level || "AUTO";
-        const webText = d.needs_web ? "with web search" : "no web search";
-        const routeText = d.deep_route ? `, route ${deepRouteLabel(d.deep_route)}` : "";
-        const maxText = d.max_results ? ` (max ${d.max_results})` : "";
-        pushLine(`Choosing ${tierName} (${reasoning}) ${webText}${routeText}${maxText}.`);
-        break;
-      }
-      case "resource_budget": {
-        const budget = d.budget || d;
-        const slots = budget?.max_parallel || budget?.max || budget?.slots;
-        if (slots) pushLine(`Provisioning ${slots} worker slot${slots === 1 ? "" : "s"}.`);
-        break;
-      }
-      case "strict_mode":
-        if (d.enabled) pushLine("Strict verification enabled.");
-        break;
-      case "plan_created": {
-        const steps = Number(d.steps || d.expected_total_steps || 0);
-        if (steps) pushLine(`Planning ${steps} step${steps === 1 ? "" : "s"}.`);
-        break;
-      }
-      case "step_started":
-        pushLine(`Working on: ${d.name || (d.step_id ? `Step ${d.step_id}` : "next step")}.`);
-        break;
-      case "step_completed":
-        pushLine(`Finished: ${d.name || (d.step_id ? `Step ${d.step_id}` : "step")}.`);
-        break;
-      case "tavily_search":
-        pushLine(d.query ? `Searching the web for: ${d.query}.` : "Searching the web.");
-        break;
-      case "tavily_extract": {
-        const urls = d.urls || [];
-        const hosts = condenseList(urls.map((u) => hostFromUrl(u)).filter(Boolean), 3);
-        if (hosts) {
-          pushLine(`Reading sources from ${hosts}.`, { urls });
-        } else if (urls.length) {
-          pushLine(`Reading ${urls.length} source${urls.length === 1 ? "" : "s"}.`, { urls });
-        } else {
-          pushLine("Reading sources.");
-        }
-        break;
-      }
-      case "tavily_error":
-        pushLine(`Search tool error: ${d.message || "Tavily unavailable"}.`, { tone: "warn" });
-        break;
-      case "memory_retrieved": {
-        const count = Number(d.count || 0);
-        pushLine(count ? `Checking memory (${count} hit${count === 1 ? "" : "s"}).` : "Checking memory.");
-        break;
-      }
-      case "memory_saved": {
-        const count = Number(d.count || 0);
-        if (count) pushLine(`Saved ${count} note${count === 1 ? "" : "s"} to memory.`);
-        break;
-      }
-      case "control_action": {
-        const label = d.control || d.action_type;
-        if (label) pushLine(`Running control check: ${label}.`);
-        break;
-      }
-      case "loop_iteration":
-        pushLine(d.iteration ? `Verifying draft (pass ${d.iteration}).` : "Verifying draft.");
-        break;
-      case "upload_received":
-        if (d.name) pushLine(`Received upload: ${d.name}.`);
-        break;
-      case "upload_processed":
-        if (d.name) pushLine(`Processed upload: ${d.name}.`);
-        if (d.summary) pushLine(`Upload notes: ${d.summary}.`);
-        break;
-      case "upload_failed":
-        pushLine(`Upload failed: ${d.name || d.upload_id || "file"}.`, { tone: "warn" });
-        break;
-      case "archived":
-        pushLine(`Wrapping up${d.confidence ? ` (confidence ${d.confidence})` : ""}.`);
-        break;
-      case "step_error": {
-        const label = d.name || (d.step_id ? `Step ${d.step_id}` : "Step");
-        const msg = d.message || "error";
-        pushLine(`${label} hit an issue: ${msg}.`, { tone: "warn" });
-        break;
-      }
-      case "error":
-        if (d.message) pushLine(`Error: ${d.message}.`, { tone: "error" });
-        break;
-      case "client_note":
-        if (d.note && !seenNotes.has(d.note)) {
-          pushLine(normalizeNote(d.note));
-          seenNotes.add(d.note);
-        }
-        break;
-      default:
-        break;
-    }
-    if (d.note && !seenNotes.has(d.note)) {
-      pushLine(normalizeNote(d.note));
-      seenNotes.add(d.note);
-    }
+    const lane = ev.lane;
+    if (!lane || lane === "worklog") return;
+    if (!MULTI_AGENT_LANES.has(lane)) return;
+    lanes.add(lane);
   });
-  if (!lines.length) {
-    pushLine("Working...");
+  return lanes.size > 1;
+}
+
+function shouldPrefixLane(lane, multiLane) {
+  if (!multiLane || !lane) return false;
+  return lane !== "worklog";
+}
+
+function withLane(text, lane, multiLane) {
+  if (!shouldPrefixLane(lane, multiLane)) return text;
+  const label = laneLabel(lane);
+  return label ? `${label}: ${text}` : text;
+}
+
+function inferStepType(detail) {
+  const raw = String(detail?.type || "").toLowerCase();
+  if (raw) return raw;
+  const name = String(detail?.name || "").toLowerCase();
+  if (name.includes("research")) return "research";
+  if (name.includes("search")) return "search";
+  if (name.includes("extract")) return "extract";
+  if (name.includes("merge")) return "merge";
+  if (name.includes("draft") || name.includes("write")) return "draft";
+  if (name.includes("verify") || name.includes("check")) return "verify";
+  if (name.includes("analysis") || name.includes("analy")) return "analysis";
+  return "";
+}
+
+function stepAction(type, phase) {
+  const actions = {
+    analysis: { start: "Sizing up the request", done: "Analysis done" },
+    research: { start: "Gathering sources", done: "Sources gathered" },
+    search: { start: "Searching for sources", done: "Search pass complete" },
+    tavily_search: { start: "Searching for sources", done: "Search pass complete" },
+    extract: { start: "Reading sources", done: "Source notes captured" },
+    tavily_extract: { start: "Reading sources", done: "Source notes captured" },
+    merge: { start: "Combining notes", done: "Notes combined" },
+    draft: { start: "Drafting the response", done: "Draft ready" },
+    verify: { start: "Checking the draft", done: "Verification done" },
+  };
+  const entry = actions[type];
+  if (!entry) return "";
+  return phase === "done" ? entry.done : entry.start;
+}
+
+function shouldIncludeStepName(type, name) {
+  if (!name) return false;
+  const lower = name.toLowerCase();
+  if (lower.includes("lane") || lower.includes("primary") || lower.includes("recency") || lower.includes("adversarial")) {
+    return true;
   }
-  return { lines, usedQuestion };
-}function flushLiveEvents() {
+  if (!type) return true;
+  return !lower.includes(type);
+}
+
+function describeStep(detail, phase) {
+  const name = String(detail?.name || "").trim();
+  const type = inferStepType(detail);
+  const action = stepAction(type, phase);
+  if (action) {
+    const suffix = shouldIncludeStepName(type, name) ? ` (${name})` : "";
+    return `${action}${suffix}.`;
+  }
+  if (phase === "done") return `Finished ${name || "the step"}.`;
+  return `Working on ${name || "the next step"}.`;
+}
+
+function narrationStepAction(detail, phase) {
+  const type = inferStepType(detail);
+  const action = stepAction(type, phase);
+  if (action) return action;
+  return phase === "done" ? "Finished a step" : "Working on the next step";
+}
+
+function normalizeAction(text) {
+  return String(text || "").trim().replace(/\.$/, "");
+}
+
+function narrationForEvent(ev) {
+  const d = ev.detail || {};
+  switch (ev.type) {
+    case "run_started":
+      return "Starting the run";
+    case "router_decision":
+      return "Choosing an approach";
+    case "plan_created":
+      return "Mapping the plan";
+    case "allocator_decision":
+      return "Dispatching tasks";
+    case "memory_retrieved":
+      return "Checking memory";
+    case "memory_saved":
+      return "Saving notes";
+    case "upload_processed":
+      return "Reviewing uploads";
+    case "upload_failed":
+      return "Handling a failed upload";
+    case "step_started":
+      return narrationStepAction(d, "start");
+    case "step_completed":
+      return narrationStepAction(d, "done");
+    case "tavily_search":
+      return "Searching the web";
+    case "tavily_extract":
+      return "Reading sources";
+    case "tool_request":
+      return "Running local tools";
+    case "tool_result":
+      return "Local tools returned";
+    case "control_action":
+      return "Quality checking";
+    case "loop_iteration":
+      return "Verifying the draft";
+    case "tavily_error":
+      return "Web search failed, continuing without it";
+    case "step_error":
+      return "Hit a snag, continuing";
+    case "archived":
+      return "Wrapping up";
+    case "error":
+      return "Hit an error";
+    default:
+      return "";
+  }
+}
+
+function summarizeLiveEvents(events) {
+  const actions = [];
+  const seen = new Set();
+  let usedQuestion = false;
+  let tone = "info";
+  (events || []).forEach((ev) => {
+    if (ev.type === "run_started") {
+      usedQuestion = true;
+    }
+    if (ev.type === "error") {
+      tone = "error";
+    } else if (
+      ["tavily_error", "step_error", "upload_failed", "model_error", "model_unavailable"].includes(ev.type)
+    ) {
+      if (tone !== "error") tone = "warn";
+    }
+    const action = narrationForEvent(ev);
+    const normalized = normalizeAction(action);
+    if (!normalized || seen.has(normalized)) return;
+    seen.add(normalized);
+    actions.push(normalized);
+  });
+  const limited = actions.length > 5 ? actions.slice(-5) : actions;
+  const chain = limited.join(" -> ");
+  const text = chain ? `${NARRATION_PREFIX}: ${chain}.` : `${NARRATION_PREFIX}: Keeping the run moving.`;
+  return { lines: [{ text, tone, lane: "executor" }], usedQuestion };
+}
+
+function flushLiveEvents() {
   clearTimeout(liveFlushTimer);
   liveFlushTimer = null;
   if (!liveEventBuffer.length) return;
@@ -779,6 +1359,8 @@ function summarizeLiveEvents(events) {
 
 function laneFrom(name = "", stepId) {
   const lowered = name.toLowerCase();
+  if (lowered.includes("executor")) return "executor";
+  if (lowered.includes("planner")) return "orch";
   if (lowered.includes("primary")) return "primary";
   if (lowered.includes("recency")) return "recency";
   if (lowered.includes("adversarial")) return "adversarial";
@@ -789,6 +1371,19 @@ function laneFrom(name = "", stepId) {
     const lanes = ["primary", "recency", "adversarial"];
     return lanes[(stepId - 1) % lanes.length];
   }
+  return "orch";
+}
+
+function laneFromProfile(profile = "") {
+  const lowered = String(profile || "").toLowerCase();
+  if (!lowered) return "orch";
+  if (lowered.includes("executor")) return "executor";
+  if (lowered.includes("summarizer")) return "executor";
+  if (lowered.includes("planner") || lowered.includes("orch")) return "orch";
+  if (lowered.includes("recency")) return "recency";
+  if (lowered.includes("adversarial")) return "adversarial";
+  if (lowered.includes("primary")) return "primary";
+  if (lowered.includes("verify")) return "verifier";
   return "orch";
 }
 
@@ -885,7 +1480,7 @@ function renderHistory(runId = selectedRunId || currentRunId, logOverride = null
   feed.innerHTML = "";
   const header = document.createElement("div");
   header.className = "thinking-header";
-  header.textContent = "Thinking";
+  header.textContent = "4B narration";
   feed.appendChild(header);
   (log || []).forEach((h) => {
     const row = document.createElement("div");
@@ -900,6 +1495,7 @@ function renderHistory(runId = selectedRunId || currentRunId, logOverride = null
   feed.scrollTop = feed.scrollHeight;
 }
 function addHistory(text, lane = "orch", urls = [], tone = "info") {
+  if (lane !== "executor") return;
   const entry = { text, lane, urls, tone, ts: Date.now() };
   historyLog.push(entry);
   if (historyLog.length > 150) historyLog.shift();
@@ -937,16 +1533,39 @@ function renderResourceSnapshot(modelCheck = {}) {
   resEl.textContent = `${ramPart} | ${gpuPart}`;
   const budget = modelCheck.worker_slots || modelCheck.budget || {};
   if (budget.max_parallel) {
-    budgetEl.textContent = `Agent slots: ${budget.max_parallel} (config ${budget.configured || "?"}, variants ${budget.variants || "?"}, RAM cap ${budget.ram_slots || "-"}, VRAM cap ${budget.vram_slots || "-"})`;
+    const desired = budget.desired_parallel ? `, target ${budget.desired_parallel}` : "";
+    budgetEl.textContent = `Agent slots: ${budget.max_parallel}${desired} (config ${budget.configured || "?"}, variants ${budget.variants || "?"}, RAM cap ${budget.ram_slots || "-"}, VRAM cap ${budget.vram_slots || "-"})`;
   } else {
     budgetEl.textContent = "Agent slots: estimating...";
   }
 }
 
+async function requestRunStop(runId) {
+  if (!runId) return;
+  try {
+    const res = await fetch(resolveEndpoint(`/api/run/${runId}/stop`), { method: "POST" });
+    if (!res.ok) {
+      appendActivity("Failed to stop the run.");
+    }
+  } catch (_) {
+    appendActivity("Failed to stop the run.");
+  }
+}
+
 async function loadSettings() {
-  const res = await fetch("/settings");
-  const data = await res.json();
-  const s = data.settings;
+  let data = null;
+  try {
+    const res = await fetch(resolveEndpoint("/settings"));
+    if (!res.ok) throw new Error(`Settings ${res.status}`);
+    data = await res.json();
+  } catch (err) {
+    const settingsStatus = el("settingsStatus");
+    if (settingsStatus) settingsStatus.textContent = "Settings unavailable. Check the API base URL.";
+    setStatus("API offline", "error");
+    updateLiveTicker("API offline. Check the server URL.");
+    return false;
+  }
+  const s = data.settings || {};
   settingsSnapshot = s || {};
   settingsDefaults = {
     search_depth_mode: s.search_depth_mode || "auto",
@@ -962,13 +1581,20 @@ async function loadSettings() {
     ...localPrefs,
     strict_mode: !!s.strict_mode,
   };
-  el("cfgBaseUrl").value = s.lm_studio_base_url || "";
-  el("cfgTavily").value = s.tavily_api_key || "";
-  el("cfgSearchMode").value = s.search_depth_mode || "auto";
-  el("cfgMaxBase").value = s.max_results_base || 6;
-  el("cfgMaxHigh").value = s.max_results_high || 10;
-  el("cfgExtract").value = s.extract_depth || "basic";
-  el("cfgDiscovery").value = (s.discovery_base_urls || []).join(", ");
+  const baseUrlInput = el("cfgBaseUrl");
+  if (baseUrlInput) baseUrlInput.value = s.lm_studio_base_url || "";
+  const tavilyInput = el("cfgTavily");
+  if (tavilyInput) tavilyInput.value = s.tavily_api_key || "";
+  const searchModeInput = el("cfgSearchMode");
+  if (searchModeInput) searchModeInput.value = s.search_depth_mode || "auto";
+  const maxBaseInput = el("cfgMaxBase");
+  if (maxBaseInput) maxBaseInput.value = s.max_results_base || 6;
+  const maxHighInput = el("cfgMaxHigh");
+  if (maxHighInput) maxHighInput.value = s.max_results_high || 10;
+  const extractInput = el("cfgExtract");
+  if (extractInput) extractInput.value = s.extract_depth || "basic";
+  const discoveryInput = el("cfgDiscovery");
+  if (discoveryInput) discoveryInput.value = (s.discovery_base_urls || []).join(", ");
   const strictToggle = el("cfgStrictMode");
   if (strictToggle) strictToggle.checked = settingsDefaults.strict_mode;
   const autoMemoryToggle = el("cfgAutoMemory");
@@ -996,20 +1622,126 @@ async function loadSettings() {
       }
     }
   }
+  renderModelSelectors(s, data.model_check || {});
   // Auto-discover if models are missing and we haven't tried yet.
-  const baseUrls = el("cfgDiscovery").value.split(",").map((v) => v.trim()).filter(Boolean);
+  const baseUrls = discoveryInput ? discoveryInput.value.split(",").map((v) => v.trim()).filter(Boolean) : [];
   if (!triedAutoDiscover && baseUrls.length && missingRoles.length) {
     triedAutoDiscover = true;
-    el("settingsStatus").textContent = "Auto-discovering available models...";
+    const settingsStatus = el("settingsStatus");
+    if (settingsStatus) settingsStatus.textContent = "Auto-discovering available models...";
     await autoDiscoverAndReport(baseUrls);
   }
   renderResourceSnapshot(data.model_check || {});
   toggleModal(false);
+  return true;
+}
+
+function renderModelSelectors(settings, modelCheck) {
+  MODEL_ENDPOINT_FIELDS.forEach((field) => {
+    const select = el(field.selectId);
+    if (!select) return;
+    const current = settings?.[field.key]?.model_id || "";
+    const available = modelCheck?.[field.role]?.available || [];
+    const options = Array.from(new Set([current, ...available].filter(Boolean)));
+    select.innerHTML = "";
+    if (!options.length) {
+      const opt = document.createElement("option");
+      opt.value = current || "";
+      opt.textContent = current || "No models detected";
+      select.appendChild(opt);
+      select.disabled = true;
+      return;
+    }
+    select.disabled = false;
+    options.forEach((id) => {
+      const opt = document.createElement("option");
+      opt.value = id;
+      opt.textContent = id;
+      select.appendChild(opt);
+    });
+    select.value = current || options[0];
+  });
 }
 
 function toggleModal(show) {
   const modal = el("settingsModal");
+  if (!modal) return;
   modal.classList[show ? "remove" : "add"]("hidden");
+}
+
+function toggleMemoryModal(show) {
+  const modal = el("memoryModal");
+  if (!modal) return;
+  modal.classList[show ? "remove" : "add"]("hidden");
+}
+
+function renderMemoryList(items = []) {
+  const list = el("memoryList");
+  if (!list) return;
+  list.innerHTML = "";
+  if (!items.length) {
+    const empty = document.createElement("div");
+    empty.className = "conversation-empty";
+    empty.textContent = "No memory saved yet.";
+    list.appendChild(empty);
+    return;
+  }
+  items.forEach((item) => {
+    const card = document.createElement("div");
+    card.className = "memory-card";
+    const title = document.createElement("h4");
+    title.textContent = item.title || "Untitled memory";
+    const content = document.createElement("div");
+    content.className = "memory-content";
+    content.textContent = item.content || "";
+    const tags = document.createElement("div");
+    tags.className = "memory-tags";
+    const tagList = (item.tags || []).join(", ");
+    tags.textContent = tagList ? `Tags: ${tagList}` : "Tags: none";
+    const actions = document.createElement("div");
+    actions.className = "memory-actions";
+    const pinBtn = document.createElement("button");
+    pinBtn.type = "button";
+    pinBtn.className = "pill-btn ghost";
+    pinBtn.textContent = item.pinned ? "Unpin" : "Pin";
+    pinBtn.onclick = async () => {
+      await fetch(resolveEndpoint(`/api/memory/${item.id}`), {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ pinned: !item.pinned }),
+      });
+      loadMemory(el("memorySearch")?.value || "");
+    };
+    const delBtn = document.createElement("button");
+    delBtn.type = "button";
+    delBtn.className = "pill-btn ghost";
+    delBtn.textContent = "Delete";
+    delBtn.onclick = async () => {
+      if (!confirm("Delete this memory item?")) return;
+      await fetch(resolveEndpoint(`/api/memory/${item.id}`), { method: "DELETE" });
+      loadMemory(el("memorySearch")?.value || "");
+    };
+    actions.appendChild(pinBtn);
+    actions.appendChild(delBtn);
+    card.appendChild(title);
+    card.appendChild(content);
+    card.appendChild(tags);
+    card.appendChild(actions);
+    list.appendChild(card);
+  });
+}
+
+async function loadMemory(query = "") {
+  try {
+    const q = query.trim();
+    const endpoint = q ? `/api/memory?q=${encodeURIComponent(q)}` : "/api/memory";
+    const res = await fetch(resolveEndpoint(endpoint));
+    if (!res.ok) return;
+    const data = await res.json();
+    renderMemoryList(data.items || []);
+  } catch (_) {
+    // ignore memory load errors
+  }
 }
 
 async function saveSettings() {
@@ -1017,18 +1749,6 @@ async function saveSettings() {
   const baseUrl = el("cfgBaseUrl").value;
   const snapshot = settingsSnapshot || {};
   const priorBaseUrl = snapshot.lm_studio_base_url || baseUrl;
-  const endpointKeys = [
-    "orch_endpoint",
-    "worker_a_endpoint",
-    "worker_b_endpoint",
-    "worker_c_endpoint",
-    "fast_endpoint",
-    "deep_planner_endpoint",
-    "deep_orchestrator_endpoint",
-    "router_endpoint",
-    "summarizer_endpoint",
-    "verifier_endpoint",
-  ];
   const payload = {
     lm_studio_base_url: baseUrl,
     tavily_api_key: tavKey === "********" ? undefined : tavKey,
@@ -1053,13 +1773,16 @@ async function saveSettings() {
     strict_mode: payload.strict_mode ?? settingsDefaults.strict_mode,
   };
   saveLocalPrefs(localPrefs);
-  endpointKeys.forEach((key) => {
-    const current = snapshot[key];
-    if (!current || !current.model_id) return;
+  MODEL_ENDPOINT_FIELDS.forEach((field) => {
+    const current = snapshot[field.key];
+    if (!current) return;
+    const select = el(field.selectId);
+    const selectedModel = select?.value || current.model_id;
+    if (!selectedModel) return;
     const nextBaseUrl = current.base_url && current.base_url !== priorBaseUrl ? current.base_url : baseUrl;
-    payload[key] = { base_url: nextBaseUrl, model_id: current.model_id };
+    payload[field.key] = { base_url: nextBaseUrl, model_id: selectedModel };
   });
-  const res = await fetch("/settings", {
+  const res = await fetch(resolveEndpoint("/settings"), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
@@ -1070,7 +1793,7 @@ async function saveSettings() {
 
 async function discoverModels() {
   const base_urls = el("cfgDiscovery").value.split(",").map((v) => v.trim()).filter(Boolean);
-  const res = await fetch("/api/discover", {
+  const res = await fetch(resolveEndpoint("/api/discover"), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ base_urls }),
@@ -1081,7 +1804,7 @@ async function discoverModels() {
 
 async function autoDiscoverAndReport(base_urls) {
   try {
-    const res = await fetch("/api/discover", {
+    const res = await fetch(resolveEndpoint("/api/discover"), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ base_urls }),
@@ -1112,8 +1835,22 @@ const REASONING_BY_TIER = {
   ],
 };
 
+const MODEL_ENDPOINT_FIELDS = [
+  { key: "orch_endpoint", role: "orch", selectId: "cfgModelOrch" },
+  { key: "worker_a_endpoint", role: "worker", selectId: "cfgModelWorker" },
+  { key: "worker_b_endpoint", role: "worker_b", selectId: "cfgModelWorkerB" },
+  { key: "worker_c_endpoint", role: "worker_c", selectId: "cfgModelWorkerC" },
+  { key: "fast_endpoint", role: "fast", selectId: "cfgModelFast" },
+  { key: "deep_planner_endpoint", role: "deep_planner", selectId: "cfgModelDeepPlanner" },
+  { key: "deep_orchestrator_endpoint", role: "deep_orch", selectId: "cfgModelDeepOrch" },
+  { key: "router_endpoint", role: "router", selectId: "cfgModelRouter" },
+  { key: "summarizer_endpoint", role: "summarizer", selectId: "cfgModelSummarizer" },
+  { key: "verifier_endpoint", role: "verifier", selectId: "cfgModelVerifier" },
+];
+
 function renderReasoningOptions(tier) {
   const select = el("reasoningLevel");
+  if (!select) return;
   const opts = REASONING_BY_TIER[tier] || REASONING_BY_TIER.pro;
   select.innerHTML = "";
   opts.forEach((o, idx) => {
@@ -1141,7 +1878,7 @@ function tierLabel(tier) {
   return "LocalPro";
 }
 
-function setTier(tier) {
+function setTier(tier, opts = {}) {
   currentTier = tier;
   document.querySelectorAll("#modelTierGroup .seg-btn").forEach((btn) => {
     btn.classList.toggle("active", btn.dataset.tier === tier);
@@ -1155,6 +1892,7 @@ function setTier(tier) {
   }
   renderReasoningOptions(tier);
   updateReasoningBadge();
+  if (opts.persist !== false) scheduleConversationSettingsUpdate();
 }
 
 function updateReasoningBadge() {
@@ -1198,6 +1936,14 @@ function updateProgressUI() {
 
 async function startRun(evt) {
   evt.preventDefault();
+  if (promptLocked) {
+    appendActivity("End the current prompt to start a new one.");
+    return;
+  }
+  if (!activeConversationId) {
+    const convo = await createConversation();
+    if (!convo) return;
+  }
   const question = el("question").value.trim();
   if (!question) return;
   const uploading = pendingUploads.some((u) => u.status === "uploading");
@@ -1206,22 +1952,6 @@ async function startRun(evt) {
     return;
   }
   startNewConversation({ keepQuestion: true, silent: true, keepUploads: true, preserveChat: true });
-  const selected = el("reasoningLevel").value;
-  const deepRoute = (el("deepRoute") && el("deepRoute").value) || "auto";
-  let reasoningMode = "manual";
-  let manualLevel = "LOW";
-  if (currentTier === "fast") {
-    reasoningMode = "manual";
-    manualLevel = "LOW";
-  } else if (currentTier === "auto") {
-    reasoningMode = "auto";
-    manualLevel = "MED";
-  } else {
-    const reasoningAuto = selected === "AUTO";
-    reasoningMode = reasoningAuto ? "auto" : "manual";
-    manualLevel = reasoningAuto ? (currentTier === "deep" ? "HIGH" : "MED") : selected;
-  }
-  const reasoningAuto = reasoningMode === "auto";
   appendChat("user", question);
   setStatus("Queued", "live");
   el("confidence").textContent = "";
@@ -1239,12 +1969,15 @@ async function startRun(evt) {
   queueLiveNote("Queued. Planner warming up...", "orch");
   updateReasoningBadge();
 
+  const settings = getReasoningSettings();
+  const reasoningAuto = settings.reasoningMode === "auto";
   const payload = {
     question,
-    reasoning_mode: reasoningMode,
-    manual_level: manualLevel,
+    conversation_id: activeConversationId,
+    reasoning_mode: settings.reasoningMode,
+    manual_level: settings.manualLevel,
     model_tier: currentTier,
-    deep_mode: currentTier === "deep" ? deepRoute : "auto",
+    deep_mode: currentTier === "deep" ? settings.deepRoute : "auto",
     evidence_dump: settingsDefaults.evidence_dump,
     search_depth_mode: settingsDefaults.search_depth_mode,
     max_results: settingsDefaults.max_results_override || 0,
@@ -1258,7 +1991,7 @@ async function startRun(evt) {
   });
   renderAttachments();
 
-  const res = await fetch("/api/run", {
+  const res = await fetch(resolveEndpoint("/api/run"), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
@@ -1271,12 +2004,15 @@ async function startRun(evt) {
   }
   const data = await res.json();
   await switchToRun(data.run_id, { clearChat: false, force: true, resetState: false });
-  el("question").value = "";
-  updateCharCount();
+  applyPromptState({ prompt_text: question, run_id: data.run_id }, { clear: false });
 }
 
 function handleEvent(type, p) {
   switch (type) {
+    case "work_log":
+      break;
+    case "dev_trace":
+      break;
     case "message_added": {
       const role = p.role === "assistant" ? "assistant" : "user";
       if (role === "assistant") {
@@ -1320,8 +2056,43 @@ function handleEvent(type, p) {
     }
     case "resource_budget":
       renderResourceSnapshot({ resources: p.resources, worker_slots: p.budget || p.worker_slots });
+      {
+        const budget = p.budget || p.worker_slots || p;
+        const desired = Number(p.desired_parallel || budget?.desired_parallel || 0);
+        const maxSlots = Number(budget?.max_parallel || budget?.max || budget?.slots || 0);
+        multiAgentMode = Math.max(desired, maxSlots) > 1;
+      }
       queueLiveEvent("resource_budget", p.budget || p, "orch");
       break;
+    case "team_roster":
+      queueLiveEvent("team_roster", p, "orch");
+      break;
+    case "executor_brief":
+      queueLiveEvent("executor_brief", p, "executor");
+      break;
+    case "allocator_decision":
+      queueLiveEvent("allocator_decision", p, "executor");
+      break;
+    case "tool_request": {
+      const lane = laneFrom("", p.step);
+      queueLiveEvent("tool_request", p, lane);
+      break;
+    }
+    case "tool_result": {
+      const lane = laneFrom("", p.step);
+      queueLiveEvent("tool_result", p, lane);
+      break;
+    }
+    case "planner_verifier":
+      queueLiveEvent("planner_verifier", p, "verifier");
+      break;
+    case "model_selected":
+    case "model_unavailable":
+    case "model_error": {
+      const lane = laneFromProfile(p.profile || "");
+      queueLiveEvent(type, p, lane || "orch");
+      break;
+    }
     case "strict_mode":
       queueLiveEvent("strict_mode", p, "verifier");
       break;
@@ -1344,7 +2115,14 @@ function handleEvent(type, p) {
       queueLiveEvent("upload_failed", p, "orch");
       break;
     case "step_started":
-      queueLiveEvent("step_started", { step_id: p.step_id, name: p.name }, laneFrom(p.name, p.step_id));
+      {
+        const lane = laneFromProfile(p.agent_profile || "") || laneFrom(p.name, p.step_id);
+        queueLiveEvent(
+          "step_started",
+          { step_id: p.step_id, name: p.name, type: p.type, agent_profile: p.agent_profile },
+          lane
+        );
+      }
       break;
     case "tavily_search":
       queueLiveEvent("tavily_search", { query: p.query }, laneFrom("", p.step));
@@ -1355,7 +2133,6 @@ function handleEvent(type, p) {
     case "tavily_error": {
       const lane = laneFrom("", p.step);
       queueLiveEvent("tavily_error", { message: p.message || "Tavily unavailable" }, lane);
-      pushReasoning(`Search helper issue: ${p.message || "Tavily unavailable"}`, "warn", lane);
       break;
     }
     case "step_completed":
@@ -1364,7 +2141,14 @@ function handleEvent(type, p) {
       if (currentRunId) {
         fetchArtifacts(currentRunId, { liveOnly: true, skipChat: true }).catch(() => {});
       }
-      queueLiveEvent("step_completed", { step_id: p.step_id, name: p.name }, laneFrom(p.name, p.step_id));
+      {
+        const lane = laneFromProfile(p.agent_profile || "") || laneFrom(p.name, p.step_id);
+        queueLiveEvent(
+          "step_completed",
+          { step_id: p.step_id, name: p.name, type: p.type, agent_profile: p.agent_profile },
+          lane
+        );
+      }
       break;
     case "control_action":
       queueLiveEvent("control_action", { control: p.control || p.action_type || "" }, "orch");
@@ -1386,7 +2170,18 @@ function handleEvent(type, p) {
       queueLiveEvent("memory_saved", { count: p.count }, "memory");
       break;
     case "archived":
-      setStatus("Done", "done");
+      if (p?.stopped) {
+        if (evtSource) {
+          try {
+            evtSource.close();
+          } catch (_) {}
+          evtSource = null;
+        }
+        setStatus("Stopped", "error");
+        updateLiveTicker("Generation stopped");
+      } else {
+        setStatus("Done", "done");
+      }
       stopTimer();
       completedSteps = totalSteps || completedSteps;
       updateProgressUI();
@@ -1395,11 +2190,14 @@ function handleEvent(type, p) {
       break;
     case "step_error": {
       const safe = p || {};
-      const lane = laneFrom(safe.name || "", safe.step);
+      const lane = laneFromProfile(safe.agent_profile || "") || laneFrom(safe.name || "", safe.step);
       const label = safe.name || (safe.step ? `Step ${safe.step}` : "Step");
       const msg = safe.message || "error encountered";
-      queueLiveEvent("step_error", { step_id: safe.step, name: safe.name, message: msg }, lane);
-      pushReasoning(`${label} hit an error: ${msg} (continuing)`, "warn", lane);
+      queueLiveEvent(
+        "step_error",
+        { step_id: safe.step, name: safe.name, type: safe.type, agent_profile: safe.agent_profile, message: msg },
+        lane
+      );
       completedSteps = Math.min(totalSteps || completedSteps + 1, completedSteps + 1);
       updateProgressUI();
       break;
@@ -1407,16 +2205,17 @@ function handleEvent(type, p) {
     case "error": {
       const safe = p || {};
       const recoverable = safe.fatal === false || typeof safe.step !== "undefined";
-      const lane = laneFrom(safe.name || "", safe.step);
+      const lane = laneFromProfile(safe.agent_profile || "") || laneFrom(safe.name || "", safe.step);
       if (recoverable) {
         queueLiveEvent(
           "step_error",
-          { step_id: safe.step, name: safe.name, message: safe.message || "recoverable error" },
-          lane
-        );
-        pushReasoning(
-          `Recoverable error${safe.step ? ` on step ${safe.step}` : ""}: ${safe.message || "continuing"}`,
-          "warn",
+          {
+            step_id: safe.step,
+            name: safe.name,
+            type: safe.type,
+            agent_profile: safe.agent_profile,
+            message: safe.message || "recoverable error",
+          },
           lane
         );
         completedSteps = Math.min(totalSteps || completedSteps + 1, completedSteps + 1);
@@ -1434,9 +2233,65 @@ function handleEvent(type, p) {
   }
 }
 
+function subscribeGlobalEvents() {
+  if (globalEventSource) globalEventSource.close();
+  globalEventSource = new EventSource(resolveEndpoint("/events"));
+  globalEventSource.onmessage = async (evt) => {
+    let data = null;
+    try {
+      data = JSON.parse(evt.data);
+    } catch (_) {
+      return;
+    }
+    if (!data) return;
+    if (data.event_type === "conversation_created" || data.event_type === "conversation_updated") {
+      scheduleConversationRefresh();
+      return;
+    }
+    if (data.event_type === "conversation_deleted") {
+      const deletedId = data?.payload?.conversation_id;
+      if (deletedId && deletedId === activeConversationId) {
+        activeConversationId = null;
+        storeActiveConversationId(null);
+      }
+      await fetchConversations({ ensureActive: true });
+      return;
+    }
+    if (data.event_type === "conversation_reset") {
+      scheduleConversationRefresh();
+      return;
+    }
+    if (data.event_type === "prompt_updated") {
+      applyPromptState(data.payload || null, { clear: false });
+      return;
+    }
+    if (data.event_type === "prompt_cleared") {
+      applyPromptState(null, { clear: true });
+      return;
+    }
+    const runId = data?.payload?.run_id || data?.run_id || null;
+    const convoId = data?.payload?.conversation_id || null;
+    if (!runId || !convoId) return;
+    if (convoId !== activeConversationId) {
+      if (data.event_type === "message_added" || data.event_type === "run_started") {
+        unreadConversations.add(convoId);
+        renderConversationList();
+        scheduleConversationRefresh();
+      }
+      return;
+    }
+    if (data.event_type === "message_added" || data.event_type === "run_started") {
+      scheduleConversationRefresh();
+    }
+    if (runId !== currentRunId && (data.event_type === "message_added" || data.event_type === "run_started")) {
+      await switchToRun(runId, { clearChat: false, fromPoll: true, resetState: false, skipThinking: true });
+    }
+  };
+}
+
 function subscribeEvents(runId) {
   if (evtSource) evtSource.close();
-  evtSource = new EventSource(`/runs/${runId}/events`);
+  evtSource = new EventSource(resolveEndpoint(`/runs/${runId}/events`));
   evtSource.onmessage = async (evt) => {
     const data = JSON.parse(evt.data);
     handleEvent(data.event_type, data.payload || {});
@@ -1444,22 +2299,17 @@ function subscribeEvents(runId) {
 }
 
 async function followLatestRun(force = false) {
+  if (!activeConversationId) return;
   try {
-    const res = await fetch("/api/run/latest");
+    const res = await fetch(
+      resolveEndpoint(`/api/run/latest?conversation_id=${encodeURIComponent(activeConversationId)}`)
+    );
     if (!res.ok) return;
     const data = await res.json();
-    const incomingReset = data.reset_at || null;
-    if (incomingReset && incomingReset !== conversationResetAt) {
-      conversationResetAt = incomingReset;
-      startNewConversation({ keepQuestion: true, silent: true, keepUploads: false, preserveChat: false });
-      syncConversationHistory();
-    } else if (incomingReset) {
-      conversationResetAt = incomingReset;
-    }
     const latestId = data?.run?.run_id || null;
     if (!latestId) return;
     if (force || latestId !== currentRunId) {
-      await switchToRun(latestId, { clearChat: false, fromPoll: true });
+      await switchToRun(latestId, { clearChat: false, fromPoll: true, resetState: false, skipThinking: true });
     }
   } catch (err) {
     // ignore polling errors
@@ -1469,8 +2319,7 @@ async function followLatestRun(force = false) {
 function renderEvidence(claims) {
   // Evidence is now summarized into the reasoning stream; no separate panel.
   if (!claims || !claims.length) return;
-  const sample = claims.slice(0, 3).map((c) => c.claim || "").join(" | ");
-  pushReasoning(`Claims captured (${claims.length}): ${sample}`, "info", "web");
+  // Keep narration focused on execution steps.
 }
 
 function hostFromUrl(url) {
@@ -1593,7 +2442,7 @@ function addMessageActions(bubble, runId, envelope) {
   const activityBtn = document.createElement("button");
   activityBtn.type = "button";
   activityBtn.className = "bubble-action";
-  activityBtn.textContent = "Activity";
+  activityBtn.textContent = "Narration";
   activityBtn.onclick = () => openDrawer(runId);
   const copyBtn = document.createElement("button");
   copyBtn.type = "button";
@@ -1683,19 +2532,14 @@ function closeDrawer() {
   const panel = el("reasoningPanel");
   const overlay = el("drawerOverlay");
   if (panel) {
-    if (isDesktopDrawer()) {
-      panel.classList.add("open");
-      panel.classList.remove("hidden");
-    } else {
-      panel.classList.remove("open");
-      panel.classList.add("hidden");
-    }
+    panel.classList.remove("open");
+    panel.classList.add("hidden");
   }
   if (overlay) overlay.classList.add("hidden");
 }
 
 async function fetchArtifacts(runId, opts = {}) {
-  const res = await fetch(`/api/run/${runId}/artifacts`);
+  const res = await fetch(resolveEndpoint(`/api/run/${runId}/artifacts`));
   if (!res.ok) return;
   const data = await res.json();
   cachedArtifacts = data;
@@ -1729,8 +2573,7 @@ async function fetchArtifacts(runId, opts = {}) {
     pushReasoning(`Verifier verdict: ${verifier.verdict} (${(verifier.issues || []).length} issues)`, "info", "verifier");
   }
   if (opts.liveOnly) {
-    const summary = summarizeFindings(data);
-    if (summary) pushReasoning(summary.text, "info", "web", summary.urls);
+    // Keep narration focused on execution steps; skip findings summaries here.
   }
   if (selectedRunId === run.run_id && isDrawerOpen()) {
     populateDrawer(run.run_id);
@@ -1742,6 +2585,7 @@ async function switchToRun(runId, opts = {}) {
   const clearChat = opts.clearChat === true;
   const fromPoll = opts.fromPoll || false;
   const resetState = opts.resetState !== false;
+  const skipThinking = opts.skipThinking === true;
   if (currentRunId === runId && !opts.force) return;
   if (evtSource) {
     evtSource.close();
@@ -1752,8 +2596,11 @@ async function switchToRun(runId, opts = {}) {
   }
   currentRunId = runId;
   subscribeEvents(runId);
-  ensureThinkingPlaceholder(runId);
+  if (!skipThinking) ensureThinkingPlaceholder(runId);
   await fetchArtifacts(runId, { clearChat });
+  if (isDesktopDrawer()) {
+    openDrawer(runId);
+  }
   if (fromPoll) {
     setStatus("Syncing", "live");
     updateLiveTicker(`Attached to shared run ${runId}`);
@@ -1762,7 +2609,9 @@ async function switchToRun(runId, opts = {}) {
 
 function updateCharCount() {
   const q = el("question");
-  el("charCount").textContent = `${q.value.length} chars`;
+  const counter = el("charCount");
+  if (!q || !counter) return;
+  counter.textContent = `${q.value.length} chars`;
 }
 
 function setupSTT() {
@@ -1793,8 +2642,7 @@ function setupSTT() {
         interim += res[0].transcript;
       }
     }
-    el("question").value = (sttBuffer + interim).trim();
-    updateCharCount();
+    setQuestionValue((sttBuffer + interim).trim());
   };
   sttRecognition.onerror = (evt) => {
     sttActive = false;
@@ -1809,53 +2657,117 @@ function setupSTT() {
   sttRecognition.start();
 }
 
-document.addEventListener("DOMContentLoaded", () => {
-  loadSettings();
+document.addEventListener("DOMContentLoaded", async () => {
+  updateShareLinks();
   document.querySelectorAll("#modelTierGroup .seg-btn").forEach((btn) => {
     btn.addEventListener("click", () => setTier(btn.dataset.tier));
   });
-  setTier(currentTier);
+  setTier(currentTier, { persist: false });
   closeDrawer();
   syncDrawerLayout();
   hideUploadPanelIfIdle();
   updateEmptyState();
+  const questionInput = el("question");
   document.querySelectorAll(".suggestion-card").forEach((card) => {
     card.addEventListener("click", () => {
       const prompt = card.dataset.prompt || card.textContent || "";
-      el("question").value = prompt;
-      updateCharCount();
-      el("question").focus();
+      if (!questionInput) return;
+      if (setQuestionValue(prompt)) questionInput.focus();
     });
   });
-  el("chatForm").addEventListener("submit", startRun);
+  const chatForm = el("chatForm");
+  if (chatForm) chatForm.addEventListener("submit", startRun);
   const newChat = async () => {
-    await resetConversation();
-    await syncConversationHistory();
+    await createConversation();
   };
-  el("newConversationBtn").addEventListener("click", newChat);
+  const newConversationBtn = el("newConversationBtn");
+  if (newConversationBtn) newConversationBtn.addEventListener("click", newChat);
   const panelNewConversationBtn = el("panelNewConversationBtn");
   if (panelNewConversationBtn) panelNewConversationBtn.addEventListener("click", newChat);
   const mobileNewConversationBtn = el("mobileNewConversationBtn");
   if (mobileNewConversationBtn) mobileNewConversationBtn.addEventListener("click", newChat);
-  el("settingsBtn").addEventListener("click", () => toggleModal(true));
-  el("closeSettings").addEventListener("click", () => toggleModal(false));
-  el("closeSettingsFooter").addEventListener("click", () => toggleModal(false));
-  document.getElementById("settingsModal").addEventListener("click", (e) => {
-    if (e.target.id === "settingsModal") toggleModal(false);
+  const endPromptBtn = el("endPromptBtn");
+  if (endPromptBtn) endPromptBtn.addEventListener("click", endPrompt);
+  const settingsBtn = el("settingsBtn");
+  if (settingsBtn) settingsBtn.addEventListener("click", () => toggleModal(true));
+  const closeSettings = el("closeSettings");
+  if (closeSettings) closeSettings.addEventListener("click", () => toggleModal(false));
+  const closeSettingsFooter = el("closeSettingsFooter");
+  if (closeSettingsFooter) closeSettingsFooter.addEventListener("click", () => toggleModal(false));
+  const settingsModal = el("settingsModal");
+  if (settingsModal) {
+    settingsModal.addEventListener("click", (e) => {
+      if (e.target.id === "settingsModal") toggleModal(false);
+    });
+  }
+  const memoryBtn = el("memoryBtn");
+  if (memoryBtn) memoryBtn.addEventListener("click", () => {
+    toggleMemoryModal(true);
+    loadMemory(el("memorySearch")?.value || "");
   });
+  const closeMemory = el("closeMemory");
+  if (closeMemory) closeMemory.addEventListener("click", () => toggleMemoryModal(false));
+  const memoryModal = el("memoryModal");
+  if (memoryModal) {
+    memoryModal.addEventListener("click", (e) => {
+      if (e.target.id === "memoryModal") toggleMemoryModal(false);
+    });
+  }
+  const refreshMemory = el("refreshMemory");
+  if (refreshMemory) refreshMemory.addEventListener("click", () => loadMemory(el("memorySearch")?.value || ""));
+  const memorySearch = el("memorySearch");
+  if (memorySearch) {
+    memorySearch.addEventListener("input", (e) => {
+      const value = e.target.value || "";
+      if (memorySearchTimer) clearTimeout(memorySearchTimer);
+      memorySearchTimer = setTimeout(() => {
+        loadMemory(value);
+      }, 250);
+    });
+  }
   document.addEventListener("keyup", (e) => {
     if (e.key === "Escape") {
       toggleModal(false);
+      toggleMemoryModal(false);
       closeDrawer();
+      setSidebarOpen(false);
     }
   });
-  el("saveSettings").addEventListener("click", saveSettings);
-  el("discoverBtn").addEventListener("click", discoverModels);
+  const saveSettingsBtn = el("saveSettings");
+  if (saveSettingsBtn) saveSettingsBtn.addEventListener("click", saveSettings);
+  const discoverBtn = el("discoverBtn");
+  if (discoverBtn) discoverBtn.addEventListener("click", discoverModels);
 
-  el("reasoningLevel").addEventListener("change", updateReasoningBadge);
+  const reasoningLevel = el("reasoningLevel");
+  if (reasoningLevel)
+    reasoningLevel.addEventListener("change", () => {
+      updateReasoningBadge();
+      scheduleConversationSettingsUpdate();
+    });
   const deepRouteSelect = el("deepRoute");
   if (deepRouteSelect) {
-    deepRouteSelect.addEventListener("change", updateReasoningBadge);
+    deepRouteSelect.addEventListener("change", () => {
+      updateReasoningBadge();
+      scheduleConversationSettingsUpdate();
+    });
+  }
+  const conversationSearchInput = el("conversationSearch");
+  if (conversationSearchInput) {
+    conversationSearchInput.addEventListener("input", (e) => {
+      conversationSearch = e.target.value || "";
+      renderConversationList();
+    });
+  }
+  const conversationTitle = el("conversationTitle");
+  if (conversationTitle) {
+    conversationTitle.addEventListener("click", async () => {
+      if (!activeConversationId) return;
+      const current = conversationTitle.textContent || "";
+      const next = prompt("Rename this chat:", current);
+      if (next !== null) {
+        await renameConversation(activeConversationId, next);
+      }
+    });
   }
   const liveTicker = el("liveTicker");
   if (liveTicker) liveTicker.addEventListener("click", () => openDrawer(selectedRunId || currentRunId));
@@ -1863,9 +2775,30 @@ document.addEventListener("DOMContentLoaded", () => {
   if (drawerClose) {
     drawerClose.addEventListener("click", () => closeDrawer());
   }
+  const activityToggleBtn = el("activityToggleBtn");
+  if (activityToggleBtn) {
+    activityToggleBtn.addEventListener("click", () => {
+      if (isDrawerOpen()) {
+        closeDrawer();
+      } else {
+        openDrawer(selectedRunId || currentRunId);
+      }
+    });
+  }
   const drawerOverlay = el("drawerOverlay");
   if (drawerOverlay) drawerOverlay.addEventListener("click", closeDrawer);
-  window.addEventListener("resize", () => syncDrawerLayout());
+  const sidebarToggleBtn = el("sidebarToggleBtn");
+  if (sidebarToggleBtn) {
+    sidebarToggleBtn.addEventListener("click", () => setSidebarOpen(true));
+  }
+  const sidebarOverlay = el("sidebarOverlay");
+  if (sidebarOverlay) {
+    sidebarOverlay.addEventListener("click", () => setSidebarOpen(false));
+  }
+  window.addEventListener("resize", () => {
+    syncDrawerLayout();
+    if (isDesktopDrawer()) setSidebarOpen(false);
+  });
   const drop = el("uploadDrop");
   if (drop) {
     drop.addEventListener("dragover", (e) => {
@@ -1905,31 +2838,38 @@ document.addEventListener("DOMContentLoaded", () => {
       showUploadPanel();
     });
   const attachMenu = el("attachMenu");
+  const fileInput = el("fileInput");
   if (attachMenu)
     attachMenu.addEventListener("click", () => {
       uploadPanelVisible = true;
       showUploadPanel();
-      el("fileInput").click();
+      if (fileInput) fileInput.click();
     });
-  el("attachBtn").addEventListener("click", () => {
-    uploadPanelVisible = true;
-    showUploadPanel();
-    el("fileInput").click();
-  });
-  el("fileInput").addEventListener("change", (e) => {
-    uploadPanelVisible = true;
-    showUploadPanel();
-    handleFileInput(e.target.files);
-  });
+  const attachBtn = el("attachBtn");
+  if (attachBtn)
+    attachBtn.addEventListener("click", () => {
+      uploadPanelVisible = true;
+      showUploadPanel();
+      if (fileInput) fileInput.click();
+    });
+  if (fileInput) {
+    fileInput.addEventListener("change", (e) => {
+      uploadPanelVisible = true;
+      showUploadPanel();
+      handleFileInput(e.target.files);
+    });
+  }
 
-  el("micBtn").addEventListener("click", () => {
-    if (sttActive && sttRecognition) {
-      sttRecognition.stop();
-    } else {
-      setupSTT();
-    }
-  });
-  el("question").addEventListener("input", updateCharCount);
+  const micBtn = el("micBtn");
+  if (micBtn)
+    micBtn.addEventListener("click", () => {
+      if (sttActive && sttRecognition) {
+        sttRecognition.stop();
+      } else {
+        setupSTT();
+      }
+    });
+  if (questionInput) questionInput.addEventListener("input", updateCharCount);
   const thread = el("chatThread");
   if (thread) {
     thread.addEventListener("click", (e) => {
@@ -1942,18 +2882,37 @@ document.addEventListener("DOMContentLoaded", () => {
     });
   }
 
-  syncConversationHistory();
-  followLatestRun(true);
-  latestRunPoll = setInterval(() => followLatestRun(false), 5000);
+  const apiOk = await ensureApiBase();
+  if (apiOk) {
+    await loadSettings();
+    await fetchConversations();
+    const saved = loadActiveConversationId();
+    if (saved && getConversationById(saved)) {
+      await selectConversation(saved, { force: true });
+    } else if (conversations.length) {
+      await selectConversation(conversations[0].id, { force: true });
+    } else {
+      await createConversation();
+    }
+    await syncPromptState({ clear: false });
+    subscribeGlobalEvents();
+    followLatestRun(true);
+    latestRunPoll = setInterval(() => followLatestRun(false), 7000);
+  } else {
+    const settingsStatus = el("settingsStatus");
+    if (settingsStatus) settingsStatus.textContent = "API offline. Check the server URL.";
+    setStatus("API offline", "error");
+    updateLiveTicker("API offline. Check the server URL.");
+  }
 
   document.addEventListener("keydown", (e) => {
     if (e.ctrlKey && e.key.toLowerCase() === "k") {
       e.preventDefault();
       toggleModal(true);
     }
-    if (e.key === "Enter" && !e.shiftKey && document.activeElement === el("question")) {
+    if (questionInput && e.key === "Enter" && !e.shiftKey && document.activeElement === questionInput) {
       e.preventDefault();
-      el("chatForm").dispatchEvent(new Event("submit"));
+      if (chatForm) chatForm.dispatchEvent(new Event("submit"));
     }
   });
 

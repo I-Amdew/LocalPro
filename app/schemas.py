@@ -116,6 +116,7 @@ class EventPayload(BaseModel):
 
 class StartRunRequest(BaseModel):
     question: str
+    conversation_id: Optional[str] = None
     reasoning_mode: Literal["auto", "manual"] = "auto"
     manual_level: ReasoningLevel = "MED"
     evidence_dump: bool = False

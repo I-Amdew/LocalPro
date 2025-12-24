@@ -118,6 +118,47 @@ def _load_from_env() -> dict:
     return cleaned
 
 
+def _apply_legacy_endpoint_overrides(
+    merged: Dict[str, Any], file_data: Dict[str, Any], env_data: Dict[str, Any]
+) -> None:
+    """Backfill/override endpoint configs from legacy env vars when config.json still has defaults."""
+    defaults = AppSettings()
+    base_url_override = env_data.get("lm_studio_base_url")
+    legacy_base_url = file_data.get("lm_studio_base_url", defaults.lm_studio_base_url)
+    legacy_orch = file_data.get("model_orch", defaults.model_orch)
+    legacy_qwen8 = file_data.get("model_qwen8", defaults.model_qwen8)
+    legacy_qwen4 = file_data.get("model_qwen4", defaults.model_qwen4)
+
+    def override_endpoint(key: str, env_model: Optional[str], legacy_model: str) -> None:
+        endpoint = merged.get(key)
+        if not isinstance(endpoint, dict):
+            endpoint = {}
+        updated = False
+        if env_model and (not endpoint.get("model_id") or endpoint.get("model_id") == legacy_model):
+            endpoint["model_id"] = env_model
+            updated = True
+        if base_url_override and (
+            not endpoint.get("base_url") or endpoint.get("base_url") == legacy_base_url
+        ):
+            endpoint["base_url"] = base_url_override
+            updated = True
+        if updated:
+            merged[key] = endpoint
+
+    override_endpoint("orch_endpoint", env_data.get("model_orch"), legacy_orch)
+    for key in (
+        "worker_a_endpoint",
+        "worker_b_endpoint",
+        "worker_c_endpoint",
+        "fast_endpoint",
+        "deep_planner_endpoint",
+        "verifier_endpoint",
+    ):
+        override_endpoint(key, env_data.get("model_qwen8"), legacy_qwen8)
+    for key in ("router_endpoint", "summarizer_endpoint", "deep_orchestrator_endpoint"):
+        override_endpoint(key, env_data.get("model_qwen4"), legacy_qwen4)
+
+
 def load_settings() -> AppSettings:
     env_data = _load_from_env()
     file_data: Dict[str, Any] = {}
@@ -128,6 +169,7 @@ def load_settings() -> AppSettings:
             file_data = {}
     # File values are defaults; environment variables should win at runtime
     merged = {**file_data, **env_data}
+    _apply_legacy_endpoint_overrides(merged, file_data, env_data)
     # Backfill endpoint fields from legacy
     if "orch_endpoint" not in merged and "lm_studio_base_url" in merged and "model_orch" in merged:
         merged["orch_endpoint"] = {"base_url": merged["lm_studio_base_url"], "model_id": merged["model_orch"]}

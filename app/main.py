@@ -1,10 +1,11 @@
 import asyncio
 import json
+import re
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Request, UploadFile, File, Form
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Request, UploadFile, File, Form, Body
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -22,6 +23,8 @@ db = Database(settings.database_path)
 lm_client = LMStudioClient(settings.lm_studio_base_url, max_output_tokens=settings.oss_max_tokens)
 tavily_client = TavilyClient(settings.tavily_api_key)
 bus = EventBus(db)
+RUN_TASKS: Dict[str, asyncio.Task] = {}
+RUN_STOP_EVENTS: Dict[str, asyncio.Event] = {}
 
 app = FastAPI(title="LocalPro Chat Orchestrator")
 static_dir = Path(__file__).parent / "web" / "static"
@@ -31,6 +34,36 @@ MAX_UPLOAD_BYTES = settings.upload_max_mb * 1024 * 1024
 app.mount("/static", StaticFiles(directory=static_dir), name="static")
 
 model_check: Dict[str, Any] = {}
+
+_MODEL_SIZE_RE = re.compile(r"(\\d+(?:\\.\\d+)?b)", re.IGNORECASE)
+
+
+def _normalize_model_id(value: str) -> str:
+    base = value.split(":")[0].strip()
+    if "/" in base:
+        base = base.rsplit("/", 1)[-1]
+    return base.lower()
+
+
+def _resolve_model_id(configured_id: Optional[str], available: List[str]) -> Optional[str]:
+    if not configured_id or not available:
+        return None
+    if configured_id in available:
+        return configured_id
+    base = configured_id.split(":")[0]
+    if base in available:
+        return base
+    target = _normalize_model_id(configured_id)
+    for mid in available:
+        if _normalize_model_id(mid) == target:
+            return mid
+    size_match = _MODEL_SIZE_RE.search(configured_id)
+    if size_match:
+        size_hint = size_match.group(1).lower()
+        for mid in available:
+            if size_hint in mid.lower():
+                return mid
+    return available[0] if available else None
 
 
 def build_model_map(settings_obj: AppSettings, availability: Optional[Dict[str, Any]] = None) -> Dict[str, Dict[str, str]]:
@@ -47,15 +80,18 @@ def build_model_map(settings_obj: AppSettings, availability: Optional[Dict[str, 
         "verifier": {"base_url": settings_obj.verifier_endpoint.base_url, "model": settings_obj.verifier_endpoint.model_id},
     }
     if availability:
-        available_ids = set()
-        for info in availability.values():
-            for mid in info.get("available", []):
-                if mid:
-                    available_ids.add(mid)
+        for role, cfg in model_map.items():
+            info = availability.get(role) if isinstance(availability, dict) else None
+            if not isinstance(info, dict):
+                continue
+            available = info.get("available") or []
+            resolved = _resolve_model_id(cfg.get("model"), available)
+            if resolved and resolved != cfg.get("model"):
+                model_map[role] = {**cfg, "model": resolved}
 
         def fallback(role: str, target: str, allow_unloaded: bool = False) -> None:
             info = availability.get(role)
-            if info is None:
+            if not isinstance(info, dict):
                 return
             cfg = model_map.get(role)
             target_cfg = model_map.get(target)
@@ -66,14 +102,15 @@ def build_model_map(settings_obj: AppSettings, availability: Optional[Dict[str, 
             if not configured_id or not configured_url:
                 model_map[role] = target_cfg
                 return
-            missing = info.get("ok") is False or (configured_id and configured_id not in available_ids)
+            available = info.get("available") or []
+            missing = info.get("ok") is False or (configured_id and configured_id not in available)
             if missing:
                 if allow_unloaded and not info.get("error"):
                     return
                 model_map[role] = target_cfg
 
-        fallback("worker_b", "worker", allow_unloaded=True)
-        fallback("worker_c", "worker", allow_unloaded=True)
+        fallback("worker_b", "worker")
+        fallback("worker_c", "worker")
         fallback("fast", "worker")
         fallback("deep_planner", "worker")
         fallback("deep_orch", "orch")
@@ -88,14 +125,26 @@ async def refresh_model_check(settings_obj: AppSettings) -> Dict[str, Any]:
     global model_check
     checks: Dict[str, Any] = {}
     raw_map = build_model_map(settings_obj)
+    base_cache: Dict[str, Dict[str, Any]] = {}
     for role, cfg in raw_map.items():
-        try:
-            resp = await lm_client.list_models(cfg["base_url"])
-            ids = [m.get("id") for m in resp.get("data", [])]
-            ok = cfg["model"] in ids
-            checks[role] = {"ok": ok, "missing": [] if ok else [cfg["model"]], "available": ids}
-        except Exception as exc:
-            checks[role] = {"ok": False, "error": str(exc)}
+        base_url = cfg.get("base_url") or ""
+        if not base_url:
+            checks[role] = {"ok": False, "error": "missing_base_url"}
+            continue
+        if base_url not in base_cache:
+            try:
+                resp = await lm_client.list_models(base_url)
+                ids = [m.get("id") for m in resp.get("data", []) if m.get("id")]
+                base_cache[base_url] = {"ok": True, "available": ids}
+            except Exception as exc:
+                base_cache[base_url] = {"ok": False, "error": str(exc), "available": []}
+        base_info = base_cache[base_url]
+        if not base_info.get("ok"):
+            checks[role] = {"ok": False, "error": base_info.get("error") or "unreachable"}
+            continue
+        ids = base_info.get("available") or []
+        ok = cfg.get("model") in ids
+        checks[role] = {"ok": ok, "missing": [] if ok else [cfg.get("model")], "available": ids}
     resources = get_resource_snapshot()
     checks["resources"] = resources
     try:
@@ -206,36 +255,78 @@ async def discover_models(payload: Dict[str, Any]):
 
 @app.post("/api/run")
 async def start_run(payload: StartRunRequest):
-    if not payload.question.strip():
+    question = payload.question.strip()
+    if not question:
         raise HTTPException(status_code=400, detail="Question is required.")
+    conversation_id = payload.conversation_id or await db.get_default_conversation_id()
+    conversation = None
+    if conversation_id:
+        conversation = await db.get_conversation(conversation_id)
+    if payload.conversation_id and not conversation:
+        raise HTTPException(status_code=404, detail="Conversation not found.")
+    if not conversation:
+        title_seed = question if len(question) <= 80 else question[:77].rstrip() + "..."
+        conversation = await db.create_conversation(
+            title=title_seed,
+            model_tier=payload.model_tier,
+            reasoning_mode=payload.reasoning_mode,
+            manual_level=payload.manual_level,
+            deep_mode=payload.deep_mode,
+        )
+        conversation_id = conversation["id"]
+    else:
+        await db.update_conversation(
+            conversation_id,
+            model_tier=payload.model_tier,
+            reasoning_mode=payload.reasoning_mode,
+            manual_level=payload.manual_level,
+            deep_mode=payload.deep_mode,
+        )
+        title_seed = question if len(question) <= 80 else question[:77].rstrip() + "..."
+        await db.ensure_conversation_title(conversation_id, title_seed)
     run_id = new_run_id()
+    bus.register_run(run_id, conversation_id)
+    prompt_state = await db.set_prompt_state(question, run_id)
+    await bus.emit("conversation", "prompt_updated", prompt_state)
     models = build_model_map(settings, model_check)
     upload_ids = payload.upload_ids or []
     for uid in upload_ids:
         await db.assign_upload_to_run(uid, run_id)
         await db.update_upload_status(uid, "queued")
-    asyncio.create_task(
-        run_question(
-        run_id=run_id,
-        question=payload.question,
-            decision_mode=payload.reasoning_mode,
-            manual_level=payload.manual_level,
-            model_tier=payload.model_tier,
-            deep_mode=payload.deep_mode,
-            search_depth_mode=payload.search_depth_mode,
-            max_results_override=payload.max_results or 0,
-            strict_mode=payload.strict_mode,
-            auto_memory=payload.auto_memory,
-            db=db,
-            bus=bus,
-        lm_client=lm_client,
-        tavily=tavily_client,
-        settings_models=models,
-        model_availability=model_check,
-        upload_ids=upload_ids,
-    )
-    )
-    return {"run_id": run_id}
+    stop_event = asyncio.Event()
+    RUN_STOP_EVENTS[run_id] = stop_event
+
+    async def run_and_cleanup() -> None:
+        try:
+            await run_question(
+                run_id=run_id,
+                conversation_id=conversation_id,
+                question=payload.question,
+                decision_mode=payload.reasoning_mode,
+                manual_level=payload.manual_level,
+                model_tier=payload.model_tier,
+                deep_mode=payload.deep_mode,
+                search_depth_mode=payload.search_depth_mode,
+                max_results_override=payload.max_results or 0,
+                strict_mode=payload.strict_mode,
+                auto_memory=payload.auto_memory,
+                db=db,
+                bus=bus,
+                lm_client=lm_client,
+                tavily=tavily_client,
+                settings_models=models,
+                model_availability=model_check,
+                upload_ids=upload_ids,
+                upload_dir=upload_dir,
+                stop_event=stop_event,
+            )
+        finally:
+            RUN_TASKS.pop(run_id, None)
+            RUN_STOP_EVENTS.pop(run_id, None)
+
+    task = asyncio.create_task(run_and_cleanup())
+    RUN_TASKS[run_id] = task
+    return {"run_id": run_id, "conversation_id": conversation_id}
 
 
 @app.get("/api/run/{run_id}")
@@ -247,10 +338,29 @@ async def get_run(run_id: str):
 
 
 @app.get("/api/run/latest")
-async def get_latest_run():
+async def get_latest_run(conversation_id: Optional[str] = None):
     reset_at = await db.get_conversation_reset()
-    run = await db.get_latest_run(after=reset_at)
-    return {"run": run, "reset_at": reset_at}
+    convo_id = conversation_id or await db.get_default_conversation_id()
+    run = await db.get_latest_run(after=reset_at, conversation_id=convo_id)
+    return {"run": run, "reset_at": reset_at, "conversation_id": convo_id}
+
+
+@app.post("/api/run/{run_id}/stop")
+async def stop_run(run_id: str):
+    run = await db.get_run_summary(run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found")
+    stop_event = RUN_STOP_EVENTS.get(run_id)
+    if stop_event and not stop_event.is_set():
+        stop_event.set()
+        return {"ok": True, "status": "stopping"}
+    if run.get("status") and run["status"].startswith("error"):
+        return {"ok": True, "status": run["status"]}
+    if run.get("status") in ("completed", "stopped"):
+        return {"ok": True, "status": run["status"]}
+    await db.update_run_status(run_id, "stopped")
+    await bus.emit(run_id, "archived", {"run_id": run_id, "confidence": "LOW", "stopped": True})
+    return {"ok": True, "status": "stopped"}
 
 
 @app.get("/api/run/{run_id}/artifacts")
@@ -310,18 +420,111 @@ async def delete_memory(item_id: int):
     await db.delete_memory_item(item_id)
     return {"ok": True}
 
+@app.get("/api/conversations")
+async def list_conversations():
+    conversations = await db.list_conversations()
+    return {"conversations": conversations}
+
+
+@app.post("/api/conversations")
+async def create_conversation(payload: Dict[str, Any] = Body(default={})):
+    convo = await db.create_conversation(
+        title=payload.get("title"),
+        model_tier=payload.get("model_tier", "pro"),
+        reasoning_mode=payload.get("reasoning_mode", "auto"),
+        manual_level=payload.get("manual_level", "MED"),
+        deep_mode=payload.get("deep_mode", "auto"),
+    )
+    await bus.emit("conversation", "conversation_created", {"conversation_id": convo["id"], "conversation": convo})
+    return {"conversation": convo}
+
+
+@app.get("/api/conversations/{conversation_id}")
+async def get_conversation(conversation_id: str):
+    convo = await db.get_conversation(conversation_id)
+    if not convo:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    return {"conversation": convo}
+
+
+@app.get("/api/conversations/{conversation_id}/messages")
+async def get_conversation_messages(conversation_id: str, limit: int = 200):
+    convo = await db.get_conversation(conversation_id)
+    if not convo:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    messages = await db.list_messages(conversation_id=conversation_id, limit=limit)
+    return {"messages": messages}
+
+
+@app.patch("/api/conversations/{conversation_id}")
+async def update_conversation(conversation_id: str, payload: Dict[str, Any] = Body(default={})):
+    convo = await db.update_conversation(
+        conversation_id,
+        title=payload.get("title"),
+        model_tier=payload.get("model_tier"),
+        reasoning_mode=payload.get("reasoning_mode"),
+        manual_level=payload.get("manual_level"),
+        deep_mode=payload.get("deep_mode"),
+    )
+    if not convo:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    await bus.emit("conversation", "conversation_updated", {"conversation_id": convo["id"], "conversation": convo})
+    return {"conversation": convo}
+
+
+@app.delete("/api/conversations/{conversation_id}")
+async def delete_conversation(conversation_id: str):
+    convo = await db.get_conversation(conversation_id)
+    if not convo:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    await db.delete_conversation(conversation_id)
+    await db.execute("UPDATE conversation_state SET default_conversation_id=NULL WHERE id=1")
+    await db.get_default_conversation_id()
+    await bus.emit("conversation", "conversation_deleted", {"conversation_id": conversation_id})
+    return {"ok": True}
+
 
 @app.get("/api/conversation")
-async def conversation_history(limit: int = 200):
-    messages = await db.list_messages(limit=limit)
+async def conversation_history(limit: int = 200, conversation_id: Optional[str] = None):
+    convo_id = conversation_id or await db.get_default_conversation_id()
+    messages = await db.list_messages(conversation_id=convo_id, limit=limit)
     reset_at = await db.get_conversation_reset()
-    return {"messages": messages, "reset_at": reset_at}
+    return {"messages": messages, "reset_at": reset_at, "conversation_id": convo_id}
 
 
 @app.delete("/api/conversation")
-async def reset_conversation():
-    reset_at = await db.reset_conversation()
-    return {"ok": True, "reset_at": reset_at}
+async def reset_conversation(conversation_id: Optional[str] = None):
+    reset_at = await db.reset_conversation(conversation_id=conversation_id)
+    convo_id = conversation_id or await db.get_default_conversation_id()
+    await bus.emit("conversation", "conversation_reset", {"reset_at": reset_at, "conversation_id": convo_id})
+    return {"ok": True, "reset_at": reset_at, "conversation_id": convo_id}
+
+
+@app.get("/api/prompt")
+async def get_prompt():
+    prompt = await db.get_prompt_state()
+    return {"prompt": prompt}
+
+
+@app.delete("/api/prompt")
+async def clear_prompt():
+    updated_at = await db.clear_prompt_state()
+    await bus.emit("conversation", "prompt_cleared", {"updated_at": updated_at})
+    return {"ok": True, "updated_at": updated_at}
+
+
+@app.get("/events")
+async def stream_global_events():
+    async def event_generator():
+        queue = await bus.subscribe_global()
+        try:
+            while True:
+                ev = await queue.get()
+                yield sse_format(ev)
+        finally:
+            await bus.unsubscribe_global(queue)
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
 
 
 @app.get("/runs/{run_id}/events")
@@ -343,6 +546,13 @@ async def stream_events(run_id: str):
 
 
 if __name__ == "__main__":
+    import os
     import uvicorn
 
-    uvicorn.run("app.main:app", host=getattr(settings, "host", "0.0.0.0"), port=settings.port, reload=True)
+    reload_enabled = os.getenv("LOCALPRO_RELOAD", "").lower() in ("1", "true", "yes", "on")
+    uvicorn.run(
+        "app.main:app",
+        host=getattr(settings, "host", "0.0.0.0"),
+        port=settings.port,
+        reload=reload_enabled,
+    )

@@ -27,6 +27,10 @@ class TavilyClient:
     ) -> Dict[str, Any]:
         if not self.enabled:
             return {"error": "missing_api_key"}
+        allowed_topics = {"general", "news", "finance"}
+        if topic:
+            cleaned = str(topic).strip().lower()
+            topic = cleaned if cleaned in allowed_topics else None
         payload: Dict[str, Any] = {
             "query": query,
             "search_depth": search_depth,
