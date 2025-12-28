@@ -1,12 +1,12 @@
 {
   "lm_studio_base_url": "http://localhost:1234/v1",
-  "model_orch": "openai/gpt-oss-20b",
+  "model_orch": "qwen/qwen3-vl-4b",
   "oss_max_tokens": 131072,
   "model_qwen8": "qwen/qwen3-vl-8b",
   "model_qwen4": "qwen/qwen3-vl-4b",
   "orch_endpoint": {
     "base_url": "http://127.0.0.1:1234/v1",
-    "model_id": "openai/gpt-oss-20b"
+    "model_id": "qwen/qwen3-vl-4b"
   },
   "worker_a_endpoint": {
     "base_url": "http://127.0.0.1:1234/v1",
@@ -20,6 +20,18 @@
     "base_url": "http://127.0.0.1:1234/v1",
     "model_id": "qwen/qwen3-vl-8b:3"
   },
+  "fast_endpoint": {
+    "base_url": "http://127.0.0.1:1234/v1",
+    "model_id": "qwen/qwen3-vl-4b"
+  },
+  "deep_planner_endpoint": {
+    "base_url": "http://127.0.0.1:1234/v1",
+    "model_id": "qwen/qwen3-vl-4b"
+  },
+  "deep_orchestrator_endpoint": {
+    "base_url": "http://127.0.0.1:1234/v1",
+    "model_id": "qwen/qwen3-vl-4b"
+  },
   "router_endpoint": {
     "base_url": "http://127.0.0.1:1234/v1",
     "model_id": "qwen/qwen3-vl-4b"
@@ -30,9 +42,9 @@
   },
   "verifier_endpoint": {
     "base_url": "http://127.0.0.1:1234/v1",
-    "model_id": "qwen/qwen3-vl-8b"
+    "model_id": "openai/gpt-oss-20b"
   },
-  "tavily_api_key": "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",
+  "tavily_api_key": "",
   "search_depth_mode": "auto",
   "max_results_base": 6,
   "max_results_high": 10,

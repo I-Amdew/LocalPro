@@ -36,7 +36,12 @@ let currentTier = "pro";
 let runDetails = {};
 let runEvents = {};
 let selectedRunId = null;
+let eventPollTimer = null;
+let pollingEvents = false;
+let lastEventSeq = 0;
 let thinkingPlaceholders = {};
+let latestLiveLine = "Thinking...";
+let activeAgentSteps = new Map();
 let uploadPanelVisible = false;
 let draggingUploads = false;
 let settingsDefaults = {
@@ -48,6 +53,7 @@ let settingsDefaults = {
   stt_lang: "en-US",
 };
 let settingsSnapshot = null;
+let bootInProgress = false;
 const LOCAL_PREFS_KEY = "localpro_prefs_v1";
 const API_BASE_STORAGE_KEY = "localpro_api_base_v1";
 const ACTIVE_CONVERSATION_KEY = "localpro_active_conversation_v1";
@@ -59,7 +65,9 @@ const APP_BASE_URL = (() => {
   if (normalized) return new URL(normalized);
   return new URL("/", window.location.origin);
 })();
-const NARRATION_PREFIX = "4B";
+const NARRATION_PREFIX = "";
+const EXECUTOR_AGENT_KEY = "__executor__";
+const EXECUTOR_AGENT_LABEL = "Executor";
 function getInitialApiBase() {
   const params = new URLSearchParams(window.location.search);
   const fromQuery = params.get("api") || params.get("api_base");
@@ -128,6 +136,7 @@ function setApiBaseUrl(value, persist = true) {
     } catch (_) {}
   }
   updateShareLinks();
+  syncApiBaseInput();
   return true;
 }
 
@@ -149,6 +158,11 @@ function updateShareLinks() {
     mobile.textContent = origin;
     mobile.href = origin;
   }
+}
+
+function syncApiBaseInput() {
+  const input = el("cfgApiBase");
+  if (input) input.value = apiBaseUrl || "";
 }
 
 async function checkApiBase(baseUrl) {
@@ -180,6 +194,39 @@ async function ensureApiBase() {
   }
   apiReady = false;
   return false;
+}
+
+async function bootApp() {
+  if (bootInProgress) return apiReady;
+  bootInProgress = true;
+  try {
+    const apiOk = await ensureApiBase();
+    if (apiOk) {
+      await loadSettings();
+      await fetchConversations();
+      const saved = loadActiveConversationId();
+      if (saved && getConversationById(saved)) {
+        await selectConversation(saved, { force: true });
+      } else if (conversations.length) {
+        await selectConversation(conversations[0].id, { force: true });
+      } else {
+        await createConversation();
+      }
+      await syncPromptState({ clear: false });
+      subscribeGlobalEvents();
+      followLatestRun(true);
+      if (latestRunPoll) clearInterval(latestRunPoll);
+      latestRunPoll = setInterval(() => followLatestRun(false), 7000);
+    } else {
+      const settingsStatus = el("settingsStatus");
+      if (settingsStatus) settingsStatus.textContent = "API offline. Check the server URL.";
+      setStatus("API offline", "error");
+      updateLiveTicker("API offline. Check the server URL.");
+    }
+    return apiOk;
+  } finally {
+    bootInProgress = false;
+  }
 }
 
 function loadLocalPrefs() {
@@ -389,6 +436,8 @@ function startNewConversation(opts = {}) {
     evtSource.close();
     evtSource = null;
   }
+  stopEventPolling();
+  lastEventSeq = 0;
   currentRunId = null;
   cachedArtifacts = null;
   lastAssistantRunId = null;
@@ -398,6 +447,10 @@ function startNewConversation(opts = {}) {
   selectedRunId = null;
   thinkingPlaceholders = {};
   renderHistory();
+  {
+    const activity = el("activityFeed");
+    if (activity) activity.innerHTML = "";
+  }
   resetLiveStreamState("");
   updateLiveTicker("Idle");
   setStatus("Idle");
@@ -749,8 +802,41 @@ function escapeAndBreak(text) {
   return div.innerHTML.replace(/\n/g, "<br>");
 }
 
+function escapeHtml(text) {
+  const div = document.createElement("div");
+  div.textContent = text || "";
+  return div.innerHTML;
+}
+
+async function copyToClipboard(text) {
+  const value = String(text || "");
+  if (!value) return false;
+  if (navigator.clipboard && window.isSecureContext) {
+    try {
+      await navigator.clipboard.writeText(value);
+      return true;
+    } catch (_) {}
+  }
+  const area = document.createElement("textarea");
+  area.value = value;
+  area.setAttribute("readonly", "");
+  area.style.position = "fixed";
+  area.style.top = "-1000px";
+  area.style.left = "-1000px";
+  area.style.opacity = "0";
+  document.body.appendChild(area);
+  area.select();
+  area.setSelectionRange(0, area.value.length);
+  let ok = false;
+  try {
+    ok = document.execCommand("copy");
+  } catch (_) {}
+  document.body.removeChild(area);
+  return ok;
+}
+
 function withNarrationPrefix(text, lane) {
-  if (!text || lane !== "executor") return text;
+  if (!text || lane !== "executor" || !NARRATION_PREFIX) return text;
   const prefix = `${NARRATION_PREFIX}: `;
   return text.startsWith(prefix) ? text : `${prefix}${text}`;
 }
@@ -819,15 +905,18 @@ function getAssistantBubble(runId) {
 }
 
 function buildThinkingHTML() {
-  const hints = ["Parsing your request", "Planning the path", "Looking up context", "Drafting a reply"];
-  const steps = hints.map((h) => `<li><span>•</span><span>${h}</span></li>`).join("");
+  const line = latestLiveLine && latestLiveLine.trim() ? latestLiveLine.trim() : "Thinking...";
   return `
     <div class="thinking-block">
-      <div>
-        <div class="thinking-title">Thinking... <span class="thinking-dots"><span></span><span></span><span></span></span></div>
-        <ul class="thinking-steps">${steps}</ul>
+      <div class="thinking-head">
+        <div class="thinking-status">
+          <span class="thinking-orb" aria-hidden="true"></span>
+          <span class="thinking-title">Thinking</span>
+        </div>
+        <span class="thinking-divider" aria-hidden="true"></span>
+        <span class="thinking-line" aria-live="polite">${escapeHtml(line)}</span>
+        <button type="button" class="stop-btn" data-action="stop" title="Stop generating">Stop</button>
       </div>
-      <button type="button" class="stop-btn" data-action="stop">Stop generating</button>
     </div>
   `;
 }
@@ -867,6 +956,7 @@ function stopStreaming(runId) {
   stopTimer();
   setStatus("Stopped", "error");
   updateLiveTicker("Generation stopped");
+  resetLiveAgentState();
   if (targetRun) {
     void requestRunStop(targetRun);
   }
@@ -882,28 +972,33 @@ function stopStreaming(runId) {
 }
 
 function appendActivity(entry) {
-  // Streamlined: activity echoes into the reasoning feed; keep list only if element exists.
+  // Activity entries now flow through the merged live log.
   const payload = typeof entry === "string" ? { text: entry } : entry || {};
+  const runId = payload.runId || payload.run_id || null;
+  const updateTicker = (text, urls, lane) => {
+    if (!text) return;
+    updateLiveTicker(withNarrationPrefix(text, lane), urls || []);
+  };
+  const pushLine = (line) => {
+    if (!line || !line.text) return null;
+    const lane = line.lane || payload.lane || "executor";
+    const tone = line.tone || payload.tone || "info";
+    const urls = line.urls || payload.urls || [];
+    addHistory(line.text, lane, urls, tone, runId);
+    return { text: line.text, lane, urls };
+  };
   if (Array.isArray(payload.lines)) {
+    let lastLine = null;
     payload.lines.forEach((line) => {
-      if (!line || !line.text) return;
-      const lane = line.lane || payload.lane || "executor";
-      const text = withNarrationPrefix(line.text, lane);
-      pushReasoning(
-        text,
-        line.tone || payload.tone || "info",
-        lane,
-        line.urls || payload.urls || []
-      );
+      const pushed = pushLine(line);
+      if (pushed) lastLine = pushed;
     });
+    if (lastLine) updateTicker(lastLine.text, lastLine.urls, lastLine.lane);
     return;
   }
   if (!payload.text) return;
-  {
-    const lane = payload.lane || "executor";
-    const text = withNarrationPrefix(payload.text, lane);
-    pushReasoning(text, payload.tone || "info", lane, payload.urls || []);
-  }
+  const pushed = pushLine(payload);
+  if (pushed) updateTicker(pushed.text, pushed.urls, pushed.lane);
 }
 
 function renderAttachments() {
@@ -1090,6 +1185,78 @@ function resetLiveStreamState(question = "") {
   pendingQuestion = question;
   questionShownInLive = false;
   multiAgentMode = false;
+  resetLiveAgentState();
+}
+
+function stepKeyFrom(detail = {}) {
+  const key = detail?.step_id ?? detail?.step;
+  if (key === null || key === undefined) return null;
+  return String(key);
+}
+
+function agentLabelFrom(detail = {}) {
+  const name = String(detail?.name || "").trim();
+  if (name) return name;
+  const profile = String(detail?.agent_profile || "").trim();
+  if (profile) return profile.replace(/([a-z0-9])([A-Z])/g, "$1 $2");
+  const type = String(detail?.type || "").trim();
+  if (type) return type;
+  const key = stepKeyFrom(detail);
+  return key ? `Step ${key}` : "Agent";
+}
+
+function resetLiveAgentState() {
+  activeAgentSteps.clear();
+  updateLiveAgentIndicator();
+}
+
+function setExecutorActive(active) {
+  const hasExecutor = activeAgentSteps.has(EXECUTOR_AGENT_KEY);
+  if (active && !hasExecutor) {
+    activeAgentSteps.set(EXECUTOR_AGENT_KEY, { label: EXECUTOR_AGENT_LABEL });
+  } else if (!active && hasExecutor) {
+    activeAgentSteps.delete(EXECUTOR_AGENT_KEY);
+  } else {
+    return;
+  }
+  updateLiveAgentIndicator();
+}
+
+function syncExecutorFromRun(run = {}) {
+  const status = String(run.status || "").toLowerCase();
+  setExecutorActive(status === "running");
+}
+
+function updateLiveAgentIndicator() {
+  const chip = el("liveAgentCount");
+  if (!chip) return;
+  const entries = Array.from(activeAgentSteps.entries()).filter(([key]) => key !== EXECUTOR_AGENT_KEY);
+  const count = entries.length;
+  const hasExecutor = activeAgentSteps.has(EXECUTOR_AGENT_KEY);
+  chip.textContent = `Live agents: ${count}`;
+  if (count === 0) {
+    chip.title = hasExecutor ? "Executor active" : "No active agents";
+    return;
+  }
+  const labels = entries
+    .map(([, entry]) => entry.label)
+    .filter(Boolean);
+  const condensed = condenseList(labels, 3);
+  chip.title = condensed ? `Active: ${condensed}` : "Agents active";
+}
+
+function noteAgentStepStarted(detail = {}) {
+  const key = stepKeyFrom(detail);
+  if (!key) return;
+  activeAgentSteps.set(key, { label: agentLabelFrom(detail) });
+  updateLiveAgentIndicator();
+}
+
+function noteAgentStepFinished(detail = {}) {
+  const key = stepKeyFrom(detail);
+  if (!key) return;
+  activeAgentSteps.delete(key);
+  updateLiveAgentIndicator();
 }
 
 function eventSeverity(type) {
@@ -1100,6 +1267,7 @@ function eventSeverity(type) {
       "router_decision",
       "resource_budget",
       "plan_created",
+      "plan_updated",
       "work_log",
       "step_completed",
       "control_action",
@@ -1115,6 +1283,9 @@ function eventSeverity(type) {
       "planner_verifier",
       "model_unavailable",
       "model_error",
+      "source_found",
+      "claim_found",
+      "search_skipped",
     ].includes(type)
   ) {
     return "medium";
@@ -1216,22 +1387,37 @@ function inferStepType(detail) {
   if (name.includes("extract")) return "extract";
   if (name.includes("merge")) return "merge";
   if (name.includes("draft") || name.includes("write")) return "draft";
+  if (name.includes("finalize") || name.includes("final")) return "finalize";
   if (name.includes("verify") || name.includes("check")) return "verify";
   if (name.includes("analysis") || name.includes("analy")) return "analysis";
   return "";
 }
 
-function stepAction(type, phase) {
+function stepAction(type, phase, detail = {}) {
+  const topic = narrationTopic(detail);
   const actions = {
-    analysis: { start: "Sizing up the request", done: "Analysis done" },
-    research: { start: "Gathering sources", done: "Sources gathered" },
-    search: { start: "Searching for sources", done: "Search pass complete" },
-    tavily_search: { start: "Searching for sources", done: "Search pass complete" },
+    analysis: {
+      start: topic ? `Analyzing ${topic}` : "Analyzing the details",
+      done: "Analysis complete",
+    },
+    research: {
+      start: topic ? `Gathering sources on ${topic}` : "Gathering sources",
+      done: "Sources gathered",
+    },
+    search: {
+      start: topic ? `Searching for ${topic}` : "Searching for sources",
+      done: "Search pass complete",
+    },
+    tavily_search: {
+      start: topic ? `Searching for ${topic}` : "Searching for sources",
+      done: "Search pass complete",
+    },
     extract: { start: "Reading sources", done: "Source notes captured" },
     tavily_extract: { start: "Reading sources", done: "Source notes captured" },
     merge: { start: "Combining notes", done: "Notes combined" },
     draft: { start: "Drafting the response", done: "Draft ready" },
-    verify: { start: "Checking the draft", done: "Verification done" },
+    finalize: { start: "Finalizing the response", done: "Response finalized" },
+    verify: { start: "Double-checking the draft", done: "Checks complete" },
   };
   const entry = actions[type];
   if (!entry) return "";
@@ -1251,7 +1437,7 @@ function shouldIncludeStepName(type, name) {
 function describeStep(detail, phase) {
   const name = String(detail?.name || "").trim();
   const type = inferStepType(detail);
-  const action = stepAction(type, phase);
+  const action = stepAction(type, phase, detail);
   if (action) {
     const suffix = shouldIncludeStepName(type, name) ? ` (${name})` : "";
     return `${action}${suffix}.`;
@@ -1262,8 +1448,12 @@ function describeStep(detail, phase) {
 
 function narrationStepAction(detail, phase) {
   const type = inferStepType(detail);
-  const action = stepAction(type, phase);
+  const action = stepAction(type, phase, detail);
   if (action) return action;
+  const name = String(detail?.name || "").trim();
+  if (name) {
+    return phase === "done" ? `Finished ${name}` : `Working on ${name}`;
+  }
   return phase === "done" ? "Finished a step" : "Working on the next step";
 }
 
@@ -1271,47 +1461,451 @@ function normalizeAction(text) {
   return String(text || "").trim().replace(/\.$/, "");
 }
 
+const NARRATION_PREFIXES = [
+  "how do i ",
+  "how can i ",
+  "how to ",
+  "what is ",
+  "what are ",
+  "why is ",
+  "why are ",
+  "can you ",
+  "could you ",
+  "please ",
+  "tell me ",
+  "give me ",
+  "show me ",
+  "find ",
+  "search for ",
+  "search ",
+  "look up ",
+  "lookup ",
+];
+const IDLE_NARRATION_CHOICES = [
+  (topic) => (topic ? `Still working on ${topic}` : "Still working on it"),
+  (topic) => (topic ? `Making progress on ${topic}` : "Making steady progress"),
+  (topic) => (topic ? `Thinking through ${topic}` : "Thinking through the details"),
+  (topic) => (topic ? `Double-checking ${topic}` : "Double-checking the details"),
+];
+let idleNarrationIndex = 0;
+
+function shortenWords(text, maxWords) {
+  const words = String(text || "")
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean);
+  if (!words.length) return "";
+  if (words.length <= maxWords) return words.join(" ");
+  return words.slice(0, maxWords).join(" ");
+}
+
+function cleanNarrationTopic(text) {
+  if (!text) return "";
+  let cleaned = String(text).replace(/\s+/g, " ").trim();
+  cleaned = cleaned.replace(/^[\"'`]+|[\"'`]+$/g, "");
+  cleaned = cleaned.replace(/[?.!]+$/, "");
+  let lower = cleaned.toLowerCase();
+  for (const prefix of NARRATION_PREFIXES) {
+    if (lower.startsWith(prefix)) {
+      cleaned = cleaned.slice(prefix.length).trim();
+      break;
+    }
+  }
+  cleaned = shortenWords(cleaned, 8);
+  return cleaned;
+}
+
+function narrationTopic(detail = {}) {
+  const candidates = [detail?.query, detail?.question, pendingQuestion, detail?.name];
+  for (const candidate of candidates) {
+    const cleaned = cleanNarrationTopic(candidate);
+    if (cleaned) return cleaned;
+  }
+  return "";
+}
+
+function nextIdleNarration() {
+  const topic = narrationTopic();
+  const line = IDLE_NARRATION_CHOICES[idleNarrationIndex % IDLE_NARRATION_CHOICES.length](topic);
+  idleNarrationIndex += 1;
+  return line;
+}
+
+function formatSearchNarration(detail = {}) {
+  const query = cleanNarrationTopic(detail.query);
+  const topic = narrationTopic(detail);
+  const base = query ? `Searching for ${query}` : topic ? `Looking up ${topic}` : "Searching the web";
+  const resultCount = Number(detail.result_count || 0);
+  const newCount = Number(detail.new_sources || 0);
+  const dupes = Number(detail.duplicate_sources || 0);
+  if (resultCount) {
+    const parts = [];
+    if (newCount) parts.push(`${newCount} new`);
+    if (dupes) parts.push(`${dupes} already seen`);
+    if (!parts.length) parts.push(`${resultCount} results`);
+    return `${base} (${parts.join(", ")})`;
+  }
+  return base;
+}
+
+function formatExtractNarration(detail = {}) {
+  const urls = Array.isArray(detail.urls) ? detail.urls : [];
+  const hosts = condenseList(
+    urls
+      .map((url) => hostFromUrl(url))
+      .filter(Boolean),
+    2
+  );
+  if (hosts) return `Reading sources from ${hosts}`;
+  return "Reading sources";
+}
+
+function formatToolRequest(detail = {}) {
+  const requests = Array.isArray(detail.requests) ? detail.requests : [];
+  if (!requests.length) return "Running a quick tool";
+  const req = requests[0] || {};
+  const tool = String(req.tool || req.type || req.name || "").toLowerCase();
+  if (["calculator", "calc", "math"].includes(tool)) {
+    const expr = String(req.expr || req.expression || req.input || "").trim();
+    const cleanExpr = expr.replace(/\s+/g, " ");
+    return cleanExpr ? `Computing ${cleanExpr}` : "Running a quick calculation";
+  }
+  if (["live_date", "time_now", "now", "date"].includes(tool)) {
+    return "Checking the current time";
+  }
+  if (["code_eval", "code", "python", "execute_code", "exec_code", "code_exec", "execute", "python_exec", "local_code"].includes(tool)) {
+    return "Running the code tool";
+  }
+  if (["read_text", "read_file", "file_read", "text_read", "read_bytes", "file_bytes", "read_file_bytes"].includes(tool)) {
+    const path = String(req.path || req.file || req.filename || "").trim();
+    const name = path ? path.split(/[\\/]/).pop() : "";
+    return name ? `Reading ${name}` : "Reading a file";
+  }
+  if (["list_files", "list_dir", "list_directory", "ls"].includes(tool)) {
+    return "Listing files";
+  }
+  if (["plot_chart", "plot_graph", "chart", "graph"].includes(tool)) {
+    return "Drawing a quick chart";
+  }
+  if (["image_info", "image_metadata", "image_load", "image_open", "image_zoom", "image_crop", "image_eval"].includes(tool)) {
+    return "Inspecting an image";
+  }
+  return "Running a quick tool";
+}
+
+function formatToolResult(detail = {}) {
+  const results = Array.isArray(detail.results) ? detail.results : [];
+  if (!results.length) return "Tool results ready";
+  const res = results[0] || {};
+  const tool = String(res.tool || res.type || res.name || "").toLowerCase();
+  if (["calculator", "calc", "math"].includes(tool)) return "Calculation complete";
+  if (["live_date", "time_now", "now", "date"].includes(tool)) return "Time check done";
+  if (["code_eval", "code", "python", "execute_code", "exec_code", "code_exec", "execute", "python_exec", "local_code"].includes(tool)) {
+    return "Code tool finished";
+  }
+  if (["read_text", "read_file", "file_read", "text_read", "read_bytes", "file_bytes", "read_file_bytes"].includes(tool)) {
+    return "File read complete";
+  }
+  if (["list_files", "list_dir", "list_directory", "ls"].includes(tool)) {
+    return "File list ready";
+  }
+  if (["plot_chart", "plot_graph", "chart", "graph"].includes(tool)) {
+    return "Chart ready";
+  }
+  if (["image_info", "image_metadata", "image_load", "image_open", "image_zoom", "image_crop", "image_eval"].includes(tool)) {
+    return "Image check done";
+  }
+  return "Tool results ready";
+}
+
+function extractToolMedia(detail = {}) {
+  const results = Array.isArray(detail.results) ? detail.results : [];
+  for (const res of results) {
+    if (!res || typeof res !== "object") continue;
+    const tool = String(res.tool || res.type || res.name || "").toLowerCase();
+    if (!["plot_chart", "plot_graph", "chart", "graph"].includes(tool)) continue;
+    const result = res.result && typeof res.result === "object" ? res.result : {};
+    const src = result.data_url || res.data_url || "";
+    if (!src) continue;
+    const title = String(result.title || res.title || "Chart").trim();
+    return [{ type: "image", src, title }];
+  }
+  return null;
+}
+
+function formatTraceDetail(detail, maxLen = 240) {
+  if (detail === null || detail === undefined) return "";
+  let text = "";
+  if (typeof detail === "string") {
+    text = detail;
+  } else {
+    try {
+      text = JSON.stringify(detail);
+    } catch (_) {
+      text = String(detail);
+    }
+  }
+  text = String(text || "").replace(/\s+/g, " ").trim();
+  if (!text) return "";
+  if (text.length > maxLen) return `${text.slice(0, maxLen - 3)}...`;
+  return text;
+}
+
+function traceUrls(detail = {}) {
+  const urls = [];
+  if (!detail || typeof detail !== "object") return urls;
+  if (detail.url) urls.push(detail.url);
+  if (Array.isArray(detail.urls)) urls.push(...detail.urls);
+  return urls;
+}
+
+function traceLineForEvent(type, detail = {}) {
+  const safe = detail || {};
+  switch (type) {
+    case "work_log": {
+      const text = String(safe.text || "").trim();
+      if (!text) return null;
+      return { text, tone: safe.tone || "info", lane: "worklog", urls: traceUrls(safe) };
+    }
+    case "narration": {
+      const text = String(safe.text || "").trim();
+      if (!text) return null;
+      return { text, tone: safe.tone || "info", lane: "executor", urls: traceUrls(safe) };
+    }
+    case "dev_trace": {
+      return null;
+    }
+    case "run_started": {
+      const question = shortenWords(String(safe.question || ""), 18);
+      return {
+        text: question ? `Run started: ${question}` : "Run started",
+        tone: "info",
+        lane: "orch",
+        urls: traceUrls(safe),
+      };
+    }
+    case "router_decision": {
+      const tier = safe.model_tier || safe.requested_tier || "";
+      const level = safe.reasoning_level || "";
+      let text = "Router decision";
+      if (tier) text += `: ${tierLabel(tier)}`;
+      if (safe.deep_route) {
+        text += ` (${deepRouteLabel(safe.deep_route)})`;
+      } else if (level) {
+        text += ` (${level})`;
+      }
+      return { text, tone: "info", lane: "router", urls: traceUrls(safe) };
+    }
+    case "plan_created": {
+      const steps = Number(safe.expected_total_steps || safe.steps || 0);
+      const passes = Number(safe.expected_passes || 0);
+      let text = steps ? `Plan created: ${steps} steps` : "Plan created";
+      if (passes) text += `, ${passes} pass${passes === 1 ? "" : "es"}`;
+      return { text, tone: "info", lane: "orch", urls: traceUrls(safe) };
+    }
+    case "plan_updated": {
+      const steps = Number(safe.expected_total_steps || safe.steps || 0);
+      const passes = Number(safe.expected_passes || 0);
+      let text = steps ? `Plan updated: ${steps} steps` : "Plan updated";
+      if (passes) text += `, ${passes} pass${passes === 1 ? "" : "es"}`;
+      return { text, tone: "info", lane: "orch", urls: traceUrls(safe) };
+    }
+    case "step_started": {
+      const base = describeStep(safe, "start");
+      const clean = base.replace(/\.$/, "");
+      const suffix = safe.step_id ? ` (step ${safe.step_id})` : "";
+      const lane = laneFromProfile(safe.agent_profile || "") || laneFrom(safe.name || "", safe.step_id);
+      return { text: `${clean}${suffix}.`, tone: "info", lane, urls: traceUrls(safe) };
+    }
+    case "step_completed": {
+      const base = describeStep(safe, "done");
+      const clean = base.replace(/\.$/, "");
+      const suffix = safe.step_id ? ` (step ${safe.step_id})` : "";
+      const lane = laneFromProfile(safe.agent_profile || "") || laneFrom(safe.name || "", safe.step_id);
+      return { text: `${clean}${suffix}.`, tone: "info", lane, urls: traceUrls(safe) };
+    }
+    case "step_error": {
+      const label = safe.name || (safe.step ? `Step ${safe.step}` : "Step");
+      const msg = safe.message || "error encountered";
+      const lane = laneFromProfile(safe.agent_profile || "") || laneFrom(safe.name || "", safe.step);
+      const detail = String(safe.detail || "").trim();
+      const suffix = detail ? ` (${shortenWords(detail, 16)})` : "";
+      return { text: `${label} error: ${msg}${suffix}`, tone: "warn", lane, urls: traceUrls(safe) };
+    }
+    case "tool_request": {
+      const action = formatToolRequest(safe);
+      const lane = laneFrom("", safe.step);
+      return { text: `Tool request: ${action}`, tone: "info", lane, urls: traceUrls(safe) };
+    }
+    case "tool_result": {
+      const action = formatToolResult(safe);
+      const lane = laneFrom("", safe.step);
+      const media = extractToolMedia(safe);
+      const text = action.startsWith("Chart") ? action : `Tool result: ${action}`;
+      return { text, tone: "info", lane, urls: traceUrls(safe), media };
+    }
+    case "tavily_search": {
+      const query = String(safe.query || "").trim();
+      const resultCount = Number(safe.result_count || 0);
+      const newCount = Number(safe.new_sources || 0);
+      const dupes = Number(safe.duplicate_sources || 0);
+      let line = query ? `Search: ${shortenWords(query, 14)}` : "Search pass complete";
+      if (resultCount) {
+        const parts = [];
+        if (newCount) parts.push(`${newCount} new`);
+        if (dupes) parts.push(`${dupes} already seen`);
+        if (!parts.length) parts.push(`${resultCount} results`);
+        line += ` (${parts.join(", ")})`;
+      }
+      return { text: line, tone: "info", lane: laneFrom("", safe.step), urls: traceUrls(safe) };
+    }
+    case "tavily_extract": {
+      const action = formatExtractNarration(safe);
+      return { text: `Extract: ${action}`, tone: "info", lane: laneFrom("", safe.step), urls: traceUrls(safe) };
+    }
+    case "tavily_error": {
+      const msg = safe.message || "Tavily unavailable";
+      return { text: `Search error: ${msg}`, tone: "warn", lane: laneFrom("", safe.step), urls: traceUrls(safe) };
+    }
+    case "search_skipped": {
+      const query = String(safe.query || "").trim();
+      const line = query ? `Skipped duplicate search: ${shortenWords(query, 12)}` : "Skipped a duplicate search";
+      return { text: line, tone: "info", lane: laneFrom("", safe.step), urls: traceUrls(safe) };
+    }
+    case "source_found": {
+      const title = String(safe.title || "").trim();
+      const publisher = String(safe.publisher || "").trim();
+      const url = String(safe.url || "").trim();
+      let label = title || publisher || hostFromUrl(url);
+      if (title && publisher && publisher !== title) {
+        label = `${title} (${publisher})`;
+      }
+      const text = label ? `Source found: ${shortenWords(label, 16)}` : "Source found";
+      const lane = laneFromProfile(safe.lane || safe.agent_profile || "");
+      return { text, tone: "info", lane, urls: traceUrls(safe) };
+    }
+    case "claim_found": {
+      const claim = String(safe.claim || "").trim();
+      const text = claim ? `Finding: ${shortenWords(claim, 18)}` : "Finding noted";
+      const lane = laneFromProfile(safe.lane || safe.agent_profile || "");
+      return { text, tone: "info", lane, urls: traceUrls(safe) };
+    }
+    case "upload_processed": {
+      const name = safe.name ? `: ${safe.name}` : "";
+      return { text: `Upload processed${name}`, tone: "info", lane: "orch", urls: traceUrls(safe) };
+    }
+    case "upload_failed": {
+      const name = safe.name ? `: ${safe.name}` : "";
+      const err = safe.error ? ` (${safe.error})` : "";
+      return { text: `Upload failed${name}${err}`, tone: "warn", lane: "orch", urls: traceUrls(safe) };
+    }
+    case "memory_retrieved": {
+      const count = Number(safe.count || 0);
+      return {
+        text: count ? `Memory retrieved (${count})` : "Memory retrieved",
+        tone: "info",
+        lane: "memory",
+        urls: traceUrls(safe),
+      };
+    }
+    case "memory_saved": {
+      const count = Number(safe.count || 0);
+      return {
+        text: count ? `Memory saved (${count})` : "Memory saved",
+        tone: "info",
+        lane: "memory",
+        urls: traceUrls(safe),
+      };
+    }
+    case "loop_iteration": {
+      const iteration = Number(safe.iteration || 0);
+      const text = iteration ? `Verifier requested another pass (loop ${iteration})` : "Verifier requested another pass";
+      return { text, tone: "warn", lane: "verifier", urls: traceUrls(safe) };
+    }
+    case "control_action": {
+      const origin = String(safe.origin || "").toLowerCase();
+      const control = String(safe.control || safe.action_type || "").toUpperCase();
+      let text = origin === "user" ? "Live plan update applied" : "Quality check applied";
+      if (control && control !== "CONTINUE") text += ` (${control})`;
+      return { text, tone: "info", lane: "orch", urls: traceUrls(safe) };
+    }
+    case "model_unavailable": {
+      const model = safe.model || safe.profile || "model";
+      return { text: `Model unavailable: ${model}`, tone: "warn", lane: "orch", urls: traceUrls(safe) };
+    }
+    case "model_error": {
+      const model = safe.model || safe.profile || "model";
+      return { text: `Model error: ${model}`, tone: "warn", lane: "orch", urls: traceUrls(safe) };
+    }
+    case "archived": {
+      const base = safe.stopped ? "Run stopped" : "Run complete";
+      const conf = safe.confidence ? ` (${safe.confidence})` : "";
+      return { text: `${base}${conf}`, tone: "info", lane: "orch", urls: traceUrls(safe) };
+    }
+    case "error": {
+      const msg = safe.message || "Run error";
+      return { text: `Run error: ${msg}`, tone: "error", lane: "orch", urls: traceUrls(safe) };
+    }
+    default:
+      return null;
+  }
+}
+
 function narrationForEvent(ev) {
   const d = ev.detail || {};
   switch (ev.type) {
     case "run_started":
-      return "Starting the run";
+      if (d.question) pendingQuestion = d.question;
+      {
+        const topic = cleanNarrationTopic(d.question);
+        return topic ? `Starting on ${topic}` : "Starting the run";
+      }
     case "router_decision":
-      return "Choosing an approach";
+      return "Choosing a route";
     case "plan_created":
-      return "Mapping the plan";
+      return "Sketching the plan";
     case "allocator_decision":
-      return "Dispatching tasks";
+      return "Handing out tasks";
     case "memory_retrieved":
+      if (Number.isFinite(Number(d.count)) && Number(d.count) > 0) {
+        return `Checking memory (${Number(d.count)})`;
+      }
       return "Checking memory";
     case "memory_saved":
+      if (Number.isFinite(Number(d.count)) && Number(d.count) > 0) {
+        return `Saving notes (${Number(d.count)})`;
+      }
       return "Saving notes";
     case "upload_processed":
-      return "Reviewing uploads";
+      return "Reviewing the upload";
     case "upload_failed":
-      return "Handling a failed upload";
+      return "Upload hit a snag";
     case "step_started":
       return narrationStepAction(d, "start");
     case "step_completed":
       return narrationStepAction(d, "done");
     case "tavily_search":
-      return "Searching the web";
+      return formatSearchNarration(d);
     case "tavily_extract":
-      return "Reading sources";
+      return formatExtractNarration(d);
     case "tool_request":
-      return "Running local tools";
+      return formatToolRequest(d);
     case "tool_result":
-      return "Local tools returned";
+      return formatToolResult(d);
     case "control_action":
-      return "Quality checking";
+      return "Quick quality check";
     case "loop_iteration":
-      return "Verifying the draft";
+      return "Not sure about results yet";
     case "tavily_error":
-      return "Web search failed, continuing without it";
+      return "Web search hiccup, moving on";
     case "step_error":
       return "Hit a snag, continuing";
     case "archived":
       return "Wrapping up";
+    case "model_unavailable":
+      return "Model unavailable, switching gears";
+    case "model_error":
+      return "Model had trouble, continuing";
     case "error":
       return "Hit an error";
     default:
@@ -1320,31 +1914,95 @@ function narrationForEvent(ev) {
 }
 
 function summarizeLiveEvents(events) {
-  const actions = [];
-  const seen = new Set();
+  const summary = { lines: [], usedQuestion: false };
+  if (!events || !events.length) return summary;
+  const multiLane = hasMultipleLanes(events);
+  const lines = [];
   let usedQuestion = false;
-  let tone = "info";
+  const pushLine = (text, ev, tone = "", urls = null, laneOverride = "", media = null) => {
+    const clean = String(text || "").trim();
+    if (!clean) return;
+    const lane = laneOverride || ev?.lane || "orch";
+    const severity = ev?.severity || "";
+    let pickedTone = tone;
+    if (!pickedTone) {
+      if (severity === "high") {
+        pickedTone = ev?.type === "error" ? "error" : "warn";
+      } else if (severity === "medium") {
+        pickedTone = "info";
+      } else {
+        pickedTone = "info";
+      }
+    }
+    const line = {
+      text: withLane(clean, lane, multiLane),
+      tone: pickedTone,
+      lane,
+      urls: (Array.isArray(urls) && urls.length ? urls : ev?.urls) || [],
+      media: media || null,
+    };
+    if (lines.length && lines[lines.length - 1].text === line.text) return;
+    lines.push(line);
+  };
+
   (events || []).forEach((ev) => {
+    if (!ev) return;
+    const d = ev.detail || {};
     if (ev.type === "run_started") {
-      usedQuestion = true;
+      const question = String(d.question || pendingQuestion || "").trim();
+      if (question && !questionShownInLive) {
+        usedQuestion = true;
+        pushLine(`Plan: ${shortenWords(question, 18)}`, ev);
+        return;
+      }
     }
-    if (ev.type === "error") {
-      tone = "error";
-    } else if (
-      ["tavily_error", "step_error", "upload_failed", "model_error", "model_unavailable"].includes(ev.type)
-    ) {
-      if (tone !== "error") tone = "warn";
+    if (ev.type === "client_note") {
+      const note = normalizeNote(d.note || d.text || "");
+      if (note) pushLine(note, ev);
+      return;
     }
-    const action = narrationForEvent(ev);
-    const normalized = normalizeAction(action);
-    if (!normalized || seen.has(normalized)) return;
-    seen.add(normalized);
-    actions.push(normalized);
+    if (ev.type === "executor_brief" || ev.type === "allocator_decision") {
+      const note = String(d.note || "").trim();
+      if (note) pushLine(note, ev);
+      return;
+    }
+    if (ev.type === "tavily_search") {
+      pushLine(`Tool request: ${formatSearchNarration(d)}`, ev, "info", ev.urls);
+      return;
+    }
+    if (ev.type === "tavily_extract") {
+      pushLine(`Tool result: ${formatExtractNarration(d)}`, ev, "info", ev.urls);
+      return;
+    }
+    if (ev.type === "tool_request") {
+      pushLine(`Tool request: ${formatToolRequest(d)}`, ev);
+      return;
+    }
+    if (ev.type === "tool_result") {
+      const action = formatToolResult(d);
+      const text = action.startsWith("Chart") ? action : `Tool result: ${action}`;
+      pushLine(text, ev, "info", ev.urls, "", extractToolMedia(d));
+      return;
+    }
+    const trace = traceLineForEvent(ev.type, d);
+    if (trace && trace.text) {
+      pushLine(
+        trace.text,
+        ev,
+        trace.tone || "",
+        trace.urls || ev.urls || [],
+        trace.lane || ev.lane || "",
+        trace.media || null
+      );
+      return;
+    }
+    const narration = narrationForEvent(ev);
+    if (narration) pushLine(narration, ev);
   });
-  const limited = actions.length > 5 ? actions.slice(-5) : actions;
-  const chain = limited.join(" -> ");
-  const text = chain ? `${NARRATION_PREFIX}: ${chain}.` : `${NARRATION_PREFIX}: Keeping the run moving.`;
-  return { lines: [{ text, tone, lane: "executor" }], usedQuestion };
+
+  summary.lines = lines;
+  summary.usedQuestion = usedQuestion;
+  return summary;
 }
 
 function flushLiveEvents() {
@@ -1387,14 +2045,28 @@ function laneFromProfile(profile = "") {
   return "orch";
 }
 
+function updateThinkingLine(text, runId = currentRunId) {
+  if (!text) return;
+  const targetRun = runId || currentRunId;
+  if (!targetRun) return;
+  const bubble = getAssistantBubble(targetRun);
+  if (!bubble || !bubble.classList.contains("thinking")) return;
+  const line = bubble.querySelector(".thinking-line");
+  if (line) line.textContent = text;
+}
+
 function updateLiveTicker(text, urls = []) {
+  const safeText = (text || "").trim();
+  if (safeText) latestLiveLine = safeText;
   const ticker = el("liveTicker");
-  if (!ticker) return;
-  const links = urls && urls.length ? " | " + urls.slice(0, 3).map((u) => `<a href="${u}" target="_blank">${u}</a>`).join(", ") : "";
-  ticker.innerHTML = escapeAndBreak(text) + links;
-  ticker.classList.remove("pulse");
-  void ticker.offsetWidth;
-  ticker.classList.add("pulse");
+  if (ticker) {
+    const links = urls && urls.length ? " | " + urls.slice(0, 3).map((u) => `<a href="${u}" target="_blank">${u}</a>`).join(", ") : "";
+    ticker.innerHTML = escapeAndBreak(text) + links;
+    ticker.classList.remove("pulse");
+    void ticker.offsetWidth;
+    ticker.classList.add("pulse");
+  }
+  if (safeText) updateThinkingLine(safeText);
 }
 
 function registerCitation(url, map) {
@@ -1405,13 +2077,82 @@ function registerCitation(url, map) {
   return map.get(url);
 }
 
+function citationLabel(url, meta = {}) {
+  const host = hostFromUrl(url);
+  if (host) return host;
+  const title = String(meta.title || "").trim();
+  const publisher = String(meta.publisher || "").trim();
+  return title || publisher || String(url || "");
+}
+
+function citationTitle(url, meta = {}) {
+  const title = String(meta.title || "").trim();
+  if (title && title !== url && !/^https?:\/\//i.test(title)) return title;
+  const publisher = String(meta.publisher || "").trim();
+  const host = hostFromUrl(url);
+  if (publisher && publisher !== host) return publisher;
+  return "";
+}
+
+function citationTooltip(url, meta = {}) {
+  const title = String(meta.title || "").trim();
+  if (title) return title;
+  return String(url || "");
+}
+
+function buildCitationState({ log = [], sources = [], visited = [], claims = [] } = {}) {
+  const sourceMeta = {};
+  const logUrls = [];
+  const logSet = new Set();
+  const claimUrls = [];
+  const claimSet = new Set();
+  const addMeta = (entry) => {
+    if (entry && entry.url && !sourceMeta[entry.url]) sourceMeta[entry.url] = entry;
+  };
+  const addLogUrl = (url) => {
+    if (!url || logSet.has(url)) return;
+    logSet.add(url);
+    logUrls.push(url);
+  };
+  const addClaimUrl = (url) => {
+    if (!url || claimSet.has(url)) return;
+    claimSet.add(url);
+    claimUrls.push(url);
+  };
+  (sources || []).forEach(addMeta);
+  (visited || []).forEach(addMeta);
+  (log || []).forEach((entry) => {
+    if (!entry || entry.text === "Sources cited") return;
+    (entry.urls || []).forEach(addLogUrl);
+  });
+  (claims || []).forEach((claim) => {
+    const urls = Array.isArray(claim.support_urls)
+      ? claim.support_urls
+      : Array.isArray(claim.urls)
+      ? claim.urls
+      : [];
+    (urls || []).forEach(addClaimUrl);
+  });
+  const usedUrls = claimUrls.length ? claimUrls : logUrls;
+  const usedSet = new Set(usedUrls);
+  const citationMap = new Map();
+  const register = (url) => {
+    if (!url || citationMap.has(url)) return;
+    citationMap.set(url, citationMap.size + 1);
+  };
+  usedUrls.forEach(register);
+  (sources || []).forEach((entry) => register(entry && entry.url));
+  (visited || []).forEach((entry) => register(entry && entry.url));
+  return { citationMap, sourceMeta, usedSet };
+}
+
 function formatDuration(log = []) {
   const times = (log || []).map((h) => h.ts).filter(Boolean);
   if (times.length < 2) return null;
   return formatTime(Math.max(...times) - Math.min(...times));
 }
 
-function renderInlineCitations(urls = [], citationMap, sourceMeta) {
+function renderInlineCitations(urls = [], citationMap, sourceMeta, usedSet) {
   const uniq = Array.from(new Set((urls || []).filter(Boolean)));
   if (!uniq.length) return "";
   const bits = uniq.map((url) => {
@@ -1419,12 +2160,19 @@ function renderInlineCitations(urls = [], citationMap, sourceMeta) {
     if (url && !sourceMeta[url]) {
       sourceMeta[url] = { url, title: hostFromUrl(url) };
     }
-    return `<sup class="cite">[${idx}]</sup>`;
+    const meta = sourceMeta[url] || {};
+    const labelText = citationLabel(url, meta);
+    const titleText = citationTooltip(url, meta);
+    const safeLabel = escapeHtml(labelText);
+    const safeTitle = escapeHtml(titleText || labelText);
+    const safeUrl = escapeHtml(url);
+    const ariaLabel = escapeHtml(idx ? `Source ${idx}: ${labelText}` : `Source: ${labelText}`);
+    return `<a class="cite-pill" href="${safeUrl}" target="_blank" rel="noopener noreferrer" aria-label="${ariaLabel}" title="${safeTitle}">${safeLabel}</a>`;
   });
-  return bits.length ? " " + bits.join("") : "";
+  return bits.length ? " " + bits.join(" ") : "";
 }
 
-function renderCitationList(container, citationMap, sourceMeta) {
+function renderCitationList(container, citationMap, sourceMeta, usedSet = new Set()) {
   if (!container || !citationMap.size) return;
   const block = document.createElement("div");
   block.className = "citations-block";
@@ -1432,31 +2180,93 @@ function renderCitationList(container, citationMap, sourceMeta) {
   title.className = "label";
   title.textContent = "Citations";
   block.appendChild(title);
-  const list = document.createElement("ol");
-  list.className = "citation-list";
-  Array.from(citationMap.entries())
-    .sort((a, b) => a[1] - b[1])
-    .forEach(([url, idx]) => {
+  const hasUsageSignal = usedSet && usedSet.size > 0;
+  const entries = Array.from(citationMap.entries())
+    .map(([url, idx]) => ({ url, idx, used: hasUsageSignal ? usedSet.has(url) : true }))
+    .sort((a, b) => {
+      if (a.used === b.used) return a.idx - b.idx;
+      return a.used ? -1 : 1;
+    });
+  const used = entries.filter((entry) => entry.used);
+  const unused = entries.filter((entry) => !entry.used);
+  const renderSection = (label, items) => {
+    const section = document.createElement("div");
+    section.className = "citation-section";
+    if (label) {
+      const subtitle = document.createElement("div");
+      subtitle.className = "citation-subtitle";
+      subtitle.textContent = label;
+      section.appendChild(subtitle);
+    }
+    const list = document.createElement("ol");
+    list.className = "citation-list";
+    items.forEach((entry) => {
       const li = document.createElement("li");
-      const badge = document.createElement("span");
-      badge.className = "cite-index";
-      badge.textContent = `[${idx}]`;
       const link = document.createElement("a");
-      link.href = url;
+      link.className = `citation-card${entry.used ? "" : " unused"}`;
+      link.href = entry.url;
       link.target = "_blank";
       link.rel = "noopener noreferrer";
-      const meta = sourceMeta[url] || {};
-      link.textContent = meta.title || hostFromUrl(url);
-      li.appendChild(badge);
+      const badge = document.createElement("span");
+      badge.className = "cite-index";
+      badge.textContent = `[${entry.idx}]`;
+      const meta = sourceMeta[entry.url] || {};
+      const hostText = citationLabel(entry.url, meta);
+      const titleText = citationTitle(entry.url, meta);
+      const tooltipText = citationTooltip(entry.url, meta);
+      const metaWrap = document.createElement("span");
+      metaWrap.className = "citation-meta";
+      const host = document.createElement("span");
+      host.className = "citation-host";
+      host.textContent = hostText;
+      metaWrap.appendChild(host);
+      if (titleText && titleText !== hostText) {
+        const sub = document.createElement("span");
+        sub.className = "citation-title";
+        sub.textContent = titleText;
+        metaWrap.appendChild(sub);
+      }
+      link.title = tooltipText || entry.url;
+      link.appendChild(badge);
+      link.appendChild(metaWrap);
       li.appendChild(link);
       list.appendChild(li);
     });
-  block.appendChild(list);
+    section.appendChild(list);
+    return section;
+  };
+  if (used.length && unused.length) {
+    block.appendChild(renderSection("Used in response", used));
+    block.appendChild(renderSection("Other sources", unused));
+  } else {
+    block.appendChild(renderSection("", entries));
+  }
   container.appendChild(block);
 }
 
+function renderSourceChips(urls = [], sourceMeta = {}) {
+  if (!urls.length) return "";
+  return urls
+    .map((url) => {
+      const meta = sourceMeta[url] || {};
+      const labelText = citationLabel(url, meta);
+      const titleText = citationTooltip(url, meta);
+      const safeLabel = escapeHtml(labelText);
+      const safeTitle = escapeHtml(titleText || labelText);
+      const safeUrl = escapeHtml(url);
+      return `<a class="source-pill" href="${safeUrl}" target="_blank" rel="noopener noreferrer" title="${safeTitle}">${safeLabel}</a>`;
+    })
+    .join("");
+}
+
+function renderSourcesRow(urls = [], sourceMeta = {}) {
+  if (!urls.length) return "";
+  const chips = renderSourceChips(urls, sourceMeta);
+  return `<div class="sources-row"><span class="label">Sources</span><div class="sources-list">${chips}</div></div>`;
+}
+
 function renderHistory(runId = selectedRunId || currentRunId, logOverride = null) {
-  const feed = el("reasoningFeed");
+  const feed = el("activityFeed") || el("reasoningFeed");
   if (!feed) return;
   const envelope = (runId && runDetails[runId]) || {};
   const log =
@@ -1466,50 +2276,71 @@ function renderHistory(runId = selectedRunId || currentRunId, logOverride = null
       : historyLog);
   const sources = envelope.sources || [];
   const visited = envelope.visited_sources || [];
-  const citationMap = new Map();
-  const sourceMeta = {};
-  sources.forEach((s) => {
-    if (s && s.url) {
-      if (!sourceMeta[s.url]) sourceMeta[s.url] = s;
-      registerCitation(s.url, citationMap);
-    }
-  });
-  visited.forEach((s) => {
-    if (s && s.url && !sourceMeta[s.url]) sourceMeta[s.url] = s;
-  });
+  const claims = envelope.claims || [];
+  const { citationMap, sourceMeta, usedSet } = buildCitationState({ log, sources, visited, claims });
   feed.innerHTML = "";
-  const header = document.createElement("div");
-  header.className = "thinking-header";
-  header.textContent = "4B narration";
-  feed.appendChild(header);
+  if (feed.id === "reasoningFeed") {
+    const header = document.createElement("div");
+    header.className = "thinking-header";
+    header.textContent = "Thinking";
+    feed.appendChild(header);
+  }
   (log || []).forEach((h) => {
     const row = document.createElement("div");
     row.className = `thought ${h.tone || "info"}`;
     const body = document.createElement("div");
-    const inlineCites = renderInlineCitations(h.urls || [], citationMap, sourceMeta);
-    body.innerHTML = escapeAndBreak(h.text) + inlineCites;
+    const inlineCites = renderInlineCitations(h.urls || [], citationMap, sourceMeta, usedSet);
+    const lineText = withNarrationPrefix(h.text, h.lane);
+    body.innerHTML = escapeAndBreak(lineText) + inlineCites;
     row.appendChild(body);
+    const mediaItems = Array.isArray(h.media) ? h.media : h.media ? [h.media] : [];
+    if (mediaItems.length) {
+      const mediaWrap = document.createElement("div");
+      mediaWrap.className = "thought-media";
+      mediaItems.forEach((item) => {
+        if (!item || typeof item !== "object") return;
+        if (item.type === "image" && item.src) {
+          const fig = document.createElement("figure");
+          fig.className = "media-card";
+          const img = document.createElement("img");
+          img.src = item.src;
+          img.alt = item.title || "Chart";
+          img.loading = "lazy";
+          fig.appendChild(img);
+          if (item.title) {
+            const cap = document.createElement("figcaption");
+            cap.textContent = item.title;
+            fig.appendChild(cap);
+          }
+          mediaWrap.appendChild(fig);
+        }
+      });
+      if (mediaWrap.childNodes.length) {
+        row.appendChild(mediaWrap);
+      }
+    }
     feed.appendChild(row);
   });
-  renderCitationList(feed, citationMap, sourceMeta);
+  renderCitationList(feed, citationMap, sourceMeta, usedSet);
   feed.scrollTop = feed.scrollHeight;
 }
-function addHistory(text, lane = "orch", urls = [], tone = "info") {
-  if (lane !== "executor") return;
-  const entry = { text, lane, urls, tone, ts: Date.now() };
+function addHistory(text, lane = "orch", urls = [], tone = "info", runId = null, media = null) {
+  const trimmed = String(text || "").trim();
+  if (!trimmed) return;
+  const entry = { text: trimmed, lane, urls, tone, ts: Date.now(), media };
   historyLog.push(entry);
   if (historyLog.length > 150) historyLog.shift();
-  if (currentRunId) {
-    if (!runEvents[currentRunId]) runEvents[currentRunId] = [];
-    runEvents[currentRunId].push(entry);
-    if (runEvents[currentRunId].length > 200) runEvents[currentRunId].shift();
+  const targetRunId = runId || currentRunId;
+  if (targetRunId) {
+    if (!runEvents[targetRunId]) runEvents[targetRunId] = [];
+    runEvents[targetRunId].push(entry);
+    if (runEvents[targetRunId].length > 200) runEvents[targetRunId].shift();
   }
-  updateLiveTicker(text, urls);
   renderHistory();
 }
 
-function pushReasoning(text, tone = "info", lane = "orch", urls = []) {
-  addHistory(text, lane, urls, tone);
+function pushReasoning(text, tone = "info", lane = "orch", urls = [], runId = null, media = null) {
+  addHistory(text, lane, urls, tone, runId, media);
 }
 
 function renderResourceSnapshot(modelCheck = {}) {
@@ -1534,7 +2365,16 @@ function renderResourceSnapshot(modelCheck = {}) {
   const budget = modelCheck.worker_slots || modelCheck.budget || {};
   if (budget.max_parallel) {
     const desired = budget.desired_parallel ? `, target ${budget.desired_parallel}` : "";
-    budgetEl.textContent = `Agent slots: ${budget.max_parallel}${desired} (config ${budget.configured || "?"}, variants ${budget.variants || "?"}, RAM cap ${budget.ram_slots || "-"}, VRAM cap ${budget.vram_slots || "-"})`;
+    const readyWorkers = Number(budget.ready_workers || 0);
+    const readyVariants = Number(budget.ready_variants || 0);
+    const readyPart = readyWorkers
+      ? `, ready ${readyWorkers}${readyVariants ? ` (${readyVariants} models)` : ""}`
+      : "";
+    budgetEl.textContent = `Agent slots: ${budget.max_parallel}${desired} (config ${
+      budget.configured || "?"
+    }, variants ${budget.variants || "?"}${readyPart}, RAM cap ${budget.ram_slots || "-"}, VRAM cap ${
+      budget.vram_slots || "-"
+    })`;
   } else {
     budgetEl.textContent = "Agent slots: estimating...";
   }
@@ -1554,6 +2394,7 @@ async function requestRunStop(runId) {
 
 async function loadSettings() {
   let data = null;
+  syncApiBaseInput();
   try {
     const res = await fetch(resolveEndpoint("/settings"));
     if (!res.ok) throw new Error(`Settings ${res.status}`);
@@ -1745,6 +2586,30 @@ async function loadMemory(query = "") {
 }
 
 async function saveSettings() {
+  const apiBaseInput = el("cfgApiBase");
+  const rawApiBase = apiBaseInput ? apiBaseInput.value.trim() : "";
+  const wantsBaseUpdate = !!rawApiBase;
+  if (apiBaseInput) {
+    const nextApiBase = rawApiBase || apiBaseUrl || APP_BASE_URL.href;
+    if (!setApiBaseUrl(nextApiBase)) {
+      el("settingsStatus").textContent = "Invalid API base URL.";
+      return;
+    }
+  }
+  if (!settingsSnapshot) {
+    const apiOk = await bootApp();
+    const status = el("settingsStatus");
+    if (status) {
+      status.textContent = apiOk
+        ? wantsBaseUpdate
+          ? "API base updated."
+          : "API connected."
+        : wantsBaseUpdate
+          ? "API base saved. Server still offline."
+          : "API offline. Check the server URL.";
+    }
+    return;
+  }
   const tavKey = el("cfgTavily").value;
   const baseUrl = el("cfgBaseUrl").value;
   const snapshot = settingsSnapshot || {};
@@ -2008,8 +2873,27 @@ async function startRun(evt) {
 }
 
 function handleEvent(type, p) {
+  const trace = traceLineForEvent(type, p);
+  if (trace) {
+    pushReasoning(
+      trace.text,
+      trace.tone || "info",
+      trace.lane || "orch",
+      trace.urls || [],
+      p.run_id,
+      trace.media || null
+    );
+  }
   switch (type) {
+    case "narration":
+      if (p && p.text) {
+        updateLiveTicker(withNarrationPrefix(p.text, "executor"), p.urls || []);
+      }
+      break;
     case "work_log":
+      if (p && p.text) {
+        updateLiveTicker(p.text, p.urls || []);
+      }
       break;
     case "dev_trace":
       break;
@@ -2031,6 +2915,8 @@ function handleEvent(type, p) {
       break;
     }
     case "run_started":
+      resetLiveAgentState();
+      setExecutorActive(true);
       setStatus("Thinking", "live");
       startTimer();
       totalSteps = 0;
@@ -2102,6 +2988,18 @@ function handleEvent(type, p) {
       updateProgressUI();
       queueLiveEvent("plan_created", p, "orch");
       break;
+    case "plan_updated":
+      if (typeof p.expected_total_steps !== "undefined") {
+        totalSteps = Number(p.expected_total_steps || totalSteps);
+      } else if (typeof p.steps !== "undefined") {
+        totalSteps = Number(p.steps || totalSteps);
+      }
+      if (typeof p.completed_reset_to === "number") {
+        completedSteps = Number(p.completed_reset_to);
+      }
+      updateProgressUI();
+      queueLiveEvent("plan_updated", p, "orch");
+      break;
     case "upload_received":
       setUploadStatus(p.upload_id, "ready");
       queueLiveEvent("upload_received", p, "orch");
@@ -2116,6 +3014,7 @@ function handleEvent(type, p) {
       break;
     case "step_started":
       {
+        noteAgentStepStarted(p);
         const lane = laneFromProfile(p.agent_profile || "") || laneFrom(p.name, p.step_id);
         queueLiveEvent(
           "step_started",
@@ -2125,7 +3024,17 @@ function handleEvent(type, p) {
       }
       break;
     case "tavily_search":
-      queueLiveEvent("tavily_search", { query: p.query }, laneFrom("", p.step));
+      queueLiveEvent(
+        "tavily_search",
+        {
+          query: p.query,
+          urls: p.urls || [],
+          result_count: p.result_count,
+          new_sources: p.new_sources,
+          duplicate_sources: p.duplicate_sources,
+        },
+        laneFrom("", p.step)
+      );
       break;
     case "tavily_extract":
       queueLiveEvent("tavily_extract", { urls: p.urls || [] }, laneFrom("", p.step));
@@ -2135,7 +3044,23 @@ function handleEvent(type, p) {
       queueLiveEvent("tavily_error", { message: p.message || "Tavily unavailable" }, lane);
       break;
     }
+    case "search_skipped": {
+      const lane = laneFrom("", p.step);
+      queueLiveEvent("search_skipped", { query: p.query, reason: p.reason || "" }, lane);
+      break;
+    }
+    case "source_found": {
+      const lane = laneFromProfile(p.lane || p.agent_profile || "");
+      queueLiveEvent("source_found", p, lane || "orch");
+      break;
+    }
+    case "claim_found": {
+      const lane = laneFromProfile(p.lane || p.agent_profile || "");
+      queueLiveEvent("claim_found", p, lane || "orch");
+      break;
+    }
     case "step_completed":
+      noteAgentStepFinished(p);
       completedSteps = Math.min(totalSteps || completedSteps + 1, completedSteps + 1);
       updateProgressUI();
       if (currentRunId) {
@@ -2151,7 +3076,11 @@ function handleEvent(type, p) {
       }
       break;
     case "control_action":
-      queueLiveEvent("control_action", { control: p.control || p.action_type || "" }, "orch");
+      queueLiveEvent(
+        "control_action",
+        { control: p.control || p.action_type || "", origin: p.origin || "" },
+        "orch"
+      );
       break;
     case "loop_iteration":
       if (typeof p.expected_total_steps === "number") {
@@ -2170,6 +3099,8 @@ function handleEvent(type, p) {
       queueLiveEvent("memory_saved", { count: p.count }, "memory");
       break;
     case "archived":
+      resetLiveAgentState();
+      stopEventPolling();
       if (p?.stopped) {
         if (evtSource) {
           try {
@@ -2190,6 +3121,7 @@ function handleEvent(type, p) {
       break;
     case "step_error": {
       const safe = p || {};
+      noteAgentStepFinished(safe);
       const lane = laneFromProfile(safe.agent_profile || "") || laneFrom(safe.name || "", safe.step);
       const label = safe.name || (safe.step ? `Step ${safe.step}` : "Step");
       const msg = safe.message || "error encountered";
@@ -2207,6 +3139,7 @@ function handleEvent(type, p) {
       const recoverable = safe.fatal === false || typeof safe.step !== "undefined";
       const lane = laneFromProfile(safe.agent_profile || "") || laneFrom(safe.name || "", safe.step);
       if (recoverable) {
+        noteAgentStepFinished(safe);
         queueLiveEvent(
           "step_error",
           {
@@ -2222,6 +3155,7 @@ function handleEvent(type, p) {
         updateProgressUI();
         break;
       }
+      resetLiveAgentState();
       setStatus("Error", "error");
       stopTimer("error");
       updateProgressUI();
@@ -2231,6 +3165,48 @@ function handleEvent(type, p) {
     default:
       queueLiveEvent(type, p, "orch");
   }
+}
+
+function ingestRunEvent(data) {
+  if (!data || !data.event_type) return;
+  const seq = Number(data.seq);
+  if (Number.isFinite(seq) && seq > 0) {
+    if (seq <= lastEventSeq) return;
+    lastEventSeq = seq;
+  }
+  handleEvent(data.event_type, data.payload || {});
+}
+
+function stopEventPolling() {
+  pollingEvents = false;
+  if (eventPollTimer) {
+    clearTimeout(eventPollTimer);
+    eventPollTimer = null;
+  }
+}
+
+async function pollRunEvents(runId) {
+  if (!pollingEvents || !runId) return;
+  try {
+    const url = resolveEndpoint(`/api/run/${runId}/events?after_seq=${encodeURIComponent(lastEventSeq)}`);
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`Events ${res.status}`);
+    const data = await res.json();
+    const events = Array.isArray(data.events) ? data.events : [];
+    events.forEach((ev) => ingestRunEvent(ev));
+  } catch (_) {
+    // Ignore polling errors and try again.
+  } finally {
+    if (pollingEvents) {
+      eventPollTimer = setTimeout(() => pollRunEvents(runId), 2000);
+    }
+  }
+}
+
+function startEventPolling(runId) {
+  if (!runId || pollingEvents) return;
+  pollingEvents = true;
+  pollRunEvents(runId);
 }
 
 function subscribeGlobalEvents() {
@@ -2290,11 +3266,34 @@ function subscribeGlobalEvents() {
 }
 
 function subscribeEvents(runId) {
+  stopEventPolling();
+  lastEventSeq = 0;
   if (evtSource) evtSource.close();
-  evtSource = new EventSource(resolveEndpoint(`/runs/${runId}/events`));
+  try {
+    evtSource = new EventSource(resolveEndpoint(`/runs/${runId}/events`));
+  } catch (_) {
+    evtSource = null;
+    startEventPolling(runId);
+    return;
+  }
   evtSource.onmessage = async (evt) => {
-    const data = JSON.parse(evt.data);
-    handleEvent(data.event_type, data.payload || {});
+    let data = null;
+    try {
+      data = JSON.parse(evt.data);
+    } catch (_) {
+      return;
+    }
+    ingestRunEvent(data);
+  };
+  evtSource.onerror = () => {
+    if (pollingEvents) return;
+    if (evtSource) {
+      try {
+        evtSource.close();
+      } catch (_) {}
+    }
+    evtSource = null;
+    startEventPolling(runId);
   };
 }
 
@@ -2326,7 +3325,11 @@ function hostFromUrl(url) {
   try {
     return new URL(url).hostname.replace(/^www\./, "");
   } catch {
-    return url;
+    const raw = String(url || "").trim();
+    if (!raw) return "";
+    const cleaned = raw.replace(/^[a-z]+:\/\//i, "");
+    const host = cleaned.split("/")[0];
+    return host.split("?")[0].split("#")[0].replace(/^www\./, "");
   }
 }
 
@@ -2415,7 +3418,7 @@ function buildAnswerEnvelope(data = {}) {
   const sources = data.sources || [];
   const claims = data.claims || [];
   const routerDecision = run.router_decision || {};
-  const finalText = extractFinalText(run.final_answer) || extractFinalText(data.draft) || "";
+  const finalText = extractFinalText(run.final_answer) || "";
   return {
     run_id: run.run_id,
     final_text: finalText,
@@ -2429,6 +3432,7 @@ function buildAnswerEnvelope(data = {}) {
     reasoning_summary: buildReasoningSummary(run, sources, claims, routerDecision),
     activity_events: runEvents[run.run_id] || [],
     sources,
+    claims,
     visited_sources: data.visited_sources || [],
   };
 }
@@ -2442,16 +3446,23 @@ function addMessageActions(bubble, runId, envelope) {
   const activityBtn = document.createElement("button");
   activityBtn.type = "button";
   activityBtn.className = "bubble-action";
-  activityBtn.textContent = "Narration";
+  activityBtn.textContent = "Thinking";
   activityBtn.onclick = () => openDrawer(runId);
   const copyBtn = document.createElement("button");
   copyBtn.type = "button";
   copyBtn.className = "bubble-action";
   copyBtn.textContent = "Copy";
   copyBtn.onclick = async () => {
-    try {
-      await navigator.clipboard.writeText(envelope?.final_text || "");
-    } catch (_) {}
+    const fallbackText = bubble?.querySelector(".bubble-body")?.textContent || "";
+    const text = (envelope?.final_text || fallbackText || "").trim();
+    if (!text) return;
+    const ok = await copyToClipboard(text);
+    if (ok) {
+      copyBtn.textContent = "Copied";
+      setTimeout(() => {
+        copyBtn.textContent = "Copy";
+      }, 1200);
+    }
   };
   actions.appendChild(activityBtn);
   actions.appendChild(copyBtn);
@@ -2505,7 +3516,7 @@ function populateDrawer(runId = selectedRunId, logOverride = null) {
   const envelope = runDetails[runId] || {};
   const sub = el("drawerSubline");
   const idx = getResponseIndex(runId);
-  if (sub) sub.textContent = idx ? `For response #${idx}` : "";
+  if (sub) sub.textContent = "";
   const log =
     logOverride ||
     (runEvents[runId] && runEvents[runId].length ? runEvents[runId] : envelope.activity_events || []);
@@ -2549,19 +3560,22 @@ async function fetchArtifacts(runId, opts = {}) {
     lastAssistantRunId = null;
   }
   const run = data.run;
+  syncExecutorFromRun(run || {});
   const sources = data.sources || [];
   const claims = data.claims || [];
   const verifier = data.verifier || {};
   const envelope = buildAnswerEnvelope(data);
   runDetails[run.run_id] = envelope;
-  if (!opts.skipChat) {
+  const hasFinalText = Boolean((envelope.final_text || "").trim());
+  if (!opts.skipChat && hasFinalText) {
     renderAssistantAnswer(run.run_id, envelope);
   }
   lastAssistantRunId = run.run_id;
   el("confidence").textContent = run.confidence ? `Confidence: ${run.confidence}` : "";
   if (sources.length) {
-    el("sources").innerHTML =
-      "<strong>Sources</strong>: " + sources.map((s) => `<a href="${s.url}" target="_blank">${s.url}</a>`).join(" | ");
+    const citationState = buildCitationState({ log: runEvents[run.run_id] || [], sources, claims });
+    const sourceOrder = Array.from(citationState.citationMap.keys());
+    el("sources").innerHTML = renderSourcesRow(sourceOrder, citationState.sourceMeta);
     if (!opts.liveOnly) {
       addHistory("Sources cited", "web", sources.map((s) => s.url));
     }
@@ -2593,6 +3607,12 @@ async function switchToRun(runId, opts = {}) {
   }
   if (resetState) {
     startNewConversation({ keepQuestion: true, silent: true, keepUploads: true, preserveChat: !clearChat });
+  } else {
+    resetLiveAgentState();
+  }
+  {
+    const activity = el("activityFeed");
+    if (activity) activity.innerHTML = "";
   }
   currentRunId = runId;
   subscribeEvents(runId);
@@ -2659,6 +3679,7 @@ function setupSTT() {
 
 document.addEventListener("DOMContentLoaded", async () => {
   updateShareLinks();
+  syncApiBaseInput();
   document.querySelectorAll("#modelTierGroup .seg-btn").forEach((btn) => {
     btn.addEventListener("click", () => setTier(btn.dataset.tier));
   });
@@ -2882,28 +3903,7 @@ document.addEventListener("DOMContentLoaded", async () => {
     });
   }
 
-  const apiOk = await ensureApiBase();
-  if (apiOk) {
-    await loadSettings();
-    await fetchConversations();
-    const saved = loadActiveConversationId();
-    if (saved && getConversationById(saved)) {
-      await selectConversation(saved, { force: true });
-    } else if (conversations.length) {
-      await selectConversation(conversations[0].id, { force: true });
-    } else {
-      await createConversation();
-    }
-    await syncPromptState({ clear: false });
-    subscribeGlobalEvents();
-    followLatestRun(true);
-    latestRunPoll = setInterval(() => followLatestRun(false), 7000);
-  } else {
-    const settingsStatus = el("settingsStatus");
-    if (settingsStatus) settingsStatus.textContent = "API offline. Check the server URL.";
-    setStatus("API offline", "error");
-    updateLiveTicker("API offline. Check the server URL.");
-  }
+  await bootApp();
 
   document.addEventListener("keydown", (e) => {
     if (e.ctrlKey && e.key.toLowerCase() === "k") {

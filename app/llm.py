@@ -30,6 +30,14 @@ def _normalize_model_id(value: str) -> str:
     return base.lower()
 
 
+def _model_family(value: str) -> str:
+    base = value.split(":")[0].strip()
+    if "/" in base:
+        base = base.rsplit("/", 1)[-1]
+    base = _MODEL_SIZE_RE.sub("", base).strip("-_ ")
+    return base.lower()
+
+
 def resolve_model_id(preferred: Optional[str], available: List[str]) -> Optional[str]:
     if not preferred or not available:
         return None
@@ -48,7 +56,7 @@ def resolve_model_id(preferred: Optional[str], available: List[str]) -> Optional
         for mid in available:
             if size_hint in mid.lower():
                 return mid
-    return available[0] if available else None
+    return None
 
 
 def _run_state_can_chat(run_state: Optional[Any]) -> bool:
@@ -83,6 +91,8 @@ class LMStudioClient:
         self.client = httpx.AsyncClient(timeout=60)
         self.model_cache: Dict[str, Dict[str, Any]] = {}
         self.model_cache_ttl = 60.0
+        self.unavailable_models: Dict[Tuple[str, str], float] = {}
+        self.unavailable_ttl = self.model_cache_ttl
 
     async def list_models(self, base_url: Optional[str] = None) -> Dict[str, Any]:
         url = f"{(base_url or self.base_url).rstrip('/')}/models"
@@ -100,6 +110,104 @@ class LMStudioClient:
         ids = [m.get("id") for m in resp.get("data", []) if m.get("id")]
         self.model_cache[url] = {"ts": now, "ids": ids}
         return ids
+
+    def mark_model_unavailable(self, base_url: str, model: str) -> None:
+        if not base_url or not model:
+            return
+        key = (base_url.rstrip("/"), model)
+        self.unavailable_models[key] = time.monotonic()
+
+    def _prune_unavailable(self) -> None:
+        if not self.unavailable_models:
+            return
+        now = time.monotonic()
+        ttl = self.unavailable_ttl
+        if ttl <= 0:
+            self.unavailable_models.clear()
+            return
+        expired = [key for key, ts in self.unavailable_models.items() if now - ts > ttl]
+        for key in expired:
+            self.unavailable_models.pop(key, None)
+
+    def _is_model_unavailable(self, base_url: str, model: str) -> bool:
+        if not base_url or not model:
+            return False
+        self._prune_unavailable()
+        return (base_url.rstrip("/"), model) in self.unavailable_models
+
+    def _normalize_error_text(self, detail: str) -> str:
+        text = detail or ""
+        for _ in range(2):
+            try:
+                parsed = json.loads(text)
+            except Exception:
+                break
+            if isinstance(parsed, dict):
+                found = False
+                for key in ("error", "detail", "message"):
+                    val = parsed.get(key)
+                    if isinstance(val, str) and val.strip():
+                        text = val
+                        found = True
+                        break
+                if not found:
+                    break
+            elif isinstance(parsed, str):
+                text = parsed
+            else:
+                break
+        return text
+
+    def _is_model_unavailable_error(self, detail: str) -> bool:
+        text = self._normalize_error_text(detail).lower()
+        return any(
+            token in text
+            for token in (
+                "failed to load model",
+                "operation canceled",
+                "out of memory",
+                "insufficient memory",
+                "model is unloaded",
+                "model is not loaded",
+                "model unloaded",
+                "model not found",
+                "invalid model identifier",
+                "valid downloaded model",
+                "no such model",
+            )
+        )
+
+    def _select_fallback_model(self, base_url: str, preferred: str, available: List[str]) -> Optional[str]:
+        base = base_url.rstrip("/")
+        self._prune_unavailable()
+        candidates = [
+            mid
+            for mid in available
+            if mid and "embed" not in mid.lower() and (base, mid) not in self.unavailable_models
+        ]
+        if not candidates:
+            return None
+        if preferred and preferred in candidates:
+            return preferred
+        family = _model_family(preferred) if preferred else ""
+        if family:
+            for mid in candidates:
+                if family and family in _model_family(mid):
+                    return mid
+        return candidates[0]
+
+    def _resolve_available_model(
+        self,
+        base_url: str,
+        preferred: str,
+        available: List[str],
+    ) -> str:
+        if not self._is_model_unavailable(base_url, preferred):
+            return preferred
+        fallback = self._select_fallback_model(base_url, preferred, available)
+        if fallback and fallback != preferred:
+            return fallback
+        return preferred
 
     async def resolve_model_id(self, preferred: str, base_url: Optional[str] = None) -> Optional[str]:
         available = await self.list_models_cached(base_url)
@@ -178,11 +286,12 @@ class LMStudioClient:
         except Exception as exc:
             _run_state_add_trace(run_state, "Model list lookup failed", {"error": str(exc)})
             raise
+        available = [m for m in available if m and "embed" not in m.lower()]
         resolved = resolve_model_id(model, available)
         if not resolved:
             _run_state_add_trace(run_state, "Model not found in /v1/models.", {"model": model})
             raise ValueError("model not found in /v1/models")
-        cleaned["model"] = resolved
+        cleaned["model"] = self._resolve_available_model(base_url, resolved, available)
         return cleaned
 
     async def _minimal_chat_check(
@@ -195,6 +304,7 @@ class LMStudioClient:
             available = await self.list_models_cached(base_url)
         except Exception as exc:
             return False, str(exc)
+        available = [m for m in available if m and "embed" not in m.lower()]
         ping_model = resolve_model_id(preferred_model, available) or (available[0] if available else "")
         if not ping_model:
             return False, "no models available"
@@ -217,16 +327,19 @@ class LMStudioClient:
             "model": ping_model,
             "messages": [{"role": "user", "content": "ping"}],
             "temperature": 0.2,
+            "max_tokens": 1,
             "stream": False,
         }
         payload = self._sanitize_payload(payload)
         try:
-            resp = await self.client.post(url, json=payload)
+            resp = await self.client.post(url, json=payload, timeout=10.0)
             resp.raise_for_status()
             return True, ""
         except httpx.HTTPStatusError as exc:
             detail = self._extract_error_detail(exc.response)
             _run_state_add_trace(run_state, "Minimal payload failed", {"detail": detail})
+            if self._is_model_unavailable_error(detail):
+                self.mark_model_unavailable(target_base, ping_model)
             return False, detail
         except httpx.RequestError as exc:
             return False, str(exc)
@@ -263,20 +376,41 @@ class LMStudioClient:
             payload = await self._prepare_payload(payload, target_base, run_state)
         except Exception:
             raise
-        try:
-            resp = await self.client.post(url, json=payload)
-            resp.raise_for_status()
-        except httpx.HTTPStatusError as exc:
-            if exc.response is not None and exc.response.status_code == 400 and allow_minimal_retry:
-                detail = self._extract_error_detail(exc.response)
-                _run_state_add_trace(run_state, "LM Studio rejected request (400).", {"detail": detail})
-                ok, min_detail = await self._minimal_chat_check(target_base, payload.get("model", ""), run_state=run_state)
-                if not ok:
-                    _run_state_mark_unavailable(run_state, min_detail or "minimal payload failed")
-            raise
+        attempts = 0
+        max_fallbacks = 10
+        fallback_note: Optional[Dict[str, str]] = None
+        while True:
+            try:
+                resp = await self.client.post(url, json=payload)
+                resp.raise_for_status()
+                break
+            except httpx.HTTPStatusError as exc:
+                status = exc.response.status_code if exc.response is not None else None
+                detail = self._extract_error_detail(exc.response) if exc.response is not None else ""
+                if status in (400, 404) and self._is_model_unavailable_error(detail):
+                    self.mark_model_unavailable(target_base, str(payload.get("model") or "").strip())
+                    if allow_minimal_retry and attempts < max_fallbacks:
+                        retry_payload = await self._prepare_payload(payload, target_base, run_state)
+                        if retry_payload.get("model") and retry_payload.get("model") != payload.get("model"):
+                            fallback_note = {"from": str(payload.get("model")), "to": str(retry_payload.get("model"))}
+                            payload = retry_payload
+                            attempts += 1
+                            continue
+                if status == 400 and allow_minimal_retry:
+                    _run_state_add_trace(run_state, "LM Studio rejected request (400).", {"detail": detail})
+                    ok, min_detail = await self._minimal_chat_check(
+                        target_base, payload.get("model", ""), run_state=run_state
+                    )
+                    if not ok:
+                        _run_state_mark_unavailable(run_state, min_detail or "minimal payload failed")
+                raise
+        if fallback_note:
+            _run_state_add_trace(run_state, "Model unavailable; using fallback.", fallback_note)
         if stream:
             return resp
         data = resp.json()
+        if isinstance(data, dict) and payload.get("model"):
+            data["_model_used"] = payload.get("model")
         try:
             choices = data.get("choices") or []
             if choices:

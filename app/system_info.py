@@ -1,7 +1,13 @@
+import re
 import shutil
 import subprocess
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, Optional, Set
+
+
+# No fixed minimum; parallelism adapts to live resource headroom.
+MIN_PARALLEL_SLOTS = 1
+_MODEL_SIZE_RE = re.compile(r"(\\d+(?:\\.\\d+)?)b", re.IGNORECASE)
 
 
 def _bytes_to_gb(val: float) -> float:
@@ -18,9 +24,22 @@ def _mb_to_gb(val: float) -> float:
         return 0.0
 
 
+def _model_size_hint(model_id: str) -> Optional[float]:
+    if not model_id:
+        return None
+    match = _MODEL_SIZE_RE.search(model_id)
+    if not match:
+        return None
+    try:
+        return float(match.group(1))
+    except ValueError:
+        return None
+
+
 def get_resource_snapshot() -> Dict[str, Any]:
     """Return a lightweight snapshot of system RAM and GPU VRAM (if available)."""
     ram: Dict[str, Any] = {}
+    process_snapshot: Dict[str, Any] = {}
     try:
         import psutil  # type: ignore
 
@@ -31,8 +50,35 @@ def get_resource_snapshot() -> Dict[str, Any]:
             "used_gb": _bytes_to_gb(mem.total - mem.available),
             "percent": round(float(mem.percent), 2),
         }
+        try:
+            processes = []
+            total_rss = 0
+            for proc in psutil.process_iter(["pid", "name", "memory_info"]):
+                try:
+                    info = proc.info
+                    mem_info = info.get("memory_info")
+                    rss = getattr(mem_info, "rss", 0) if mem_info else 0
+                except Exception:
+                    continue
+                total_rss += rss or 0
+                processes.append(
+                    {
+                        "pid": info.get("pid"),
+                        "name": info.get("name"),
+                        "rss_gb": _bytes_to_gb(rss or 0),
+                    }
+                )
+            processes.sort(key=lambda item: item.get("rss_gb") or 0, reverse=True)
+            process_snapshot = {
+                "count": len(processes),
+                "rss_total_gb": _bytes_to_gb(total_rss),
+                "top": processes[:5],
+            }
+        except Exception:
+            process_snapshot = {}
     except Exception:
         ram = {}
+        process_snapshot = {}
 
     gpus = []
     smi_path = shutil.which("nvidia-smi")
@@ -62,7 +108,12 @@ def get_resource_snapshot() -> Dict[str, Any]:
         except Exception as exc:
             gpus.append({"error": str(exc)})
 
-    return {"ram": ram, "gpus": gpus, "captured_at": datetime.utcnow().isoformat() + "Z"}
+    return {
+        "ram": ram,
+        "gpus": gpus,
+        "processes": process_snapshot,
+        "captured_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+    }
 
 
 def _worker_variants(model_map: Dict[str, Dict[str, str]], availability: Optional[Dict[str, Any]]) -> int:
@@ -99,10 +150,10 @@ def compute_worker_slots(
     resources: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
-    Estimate how many concurrent worker agents we should schedule, factoring in:
-    - Configured worker endpoints (worker/worker_b/worker_c)
-    - Detected variants from LM Studio availability data
+    Estimate how many concurrent worker agents we should schedule, primarily from:
     - RAM/VRAM headroom by tier
+    - Configured worker endpoints (worker/worker_b/worker_c) as a fallback when resources are unknown
+    - Detected variants from LM Studio availability data
     """
     variants = _worker_variants(model_map, availability)
     worker_roles = ("worker", "worker_b", "worker_c")
@@ -121,6 +172,20 @@ def compute_worker_slots(
     vram_pressure = False
     ram_headroom = 2.0 if model_tier == "fast" else 2.5 if model_tier == "deep" else 3.5
     vram_headroom = 2.0 if model_tier == "fast" else 3.0 if model_tier == "deep" else 4.5
+    size_hints = [
+        hint
+        for role in worker_roles
+        for hint in (_model_size_hint((model_map.get(role) or {}).get("model") or ""),)
+        if hint
+    ]
+    if size_hints:
+        max_size = max(size_hints)
+        if max_size <= 4:
+            ram_headroom = min(ram_headroom, 2.5)
+            vram_headroom = min(vram_headroom, 3.0)
+        elif max_size <= 8:
+            ram_headroom = min(ram_headroom, 3.0)
+            vram_headroom = min(vram_headroom, 3.5)
 
     if resources:
         ram_info = resources.get("ram") or {}
@@ -142,18 +207,25 @@ def compute_worker_slots(
             if float(free_gpu) < vram_headroom:
                 vram_pressure = True
 
-    if ram_slots is None:
+    if ram_slots is None and vram_slots is None:
         ram_slots = base_slots
-    if vram_slots is None:
-        # If GPU info is missing, don't cap concurrency below RAM-derived capacity.
-        vram_slots = ram_slots
-
-    safe_cap = max(1, min(ram_slots, vram_slots))
-    # Prefer configured worker slots unless memory pressure is high.
-    if ram_pressure or vram_pressure:
-        max_parallel = safe_cap
+        vram_slots = base_slots
+        max_parallel = base_slots
     else:
-        max_parallel = max(base_slots, safe_cap)
+        if ram_slots is None:
+            ram_slots = base_slots
+        if vram_slots is None:
+            # If GPU info is missing, don't cap concurrency below RAM-derived capacity.
+            vram_slots = ram_slots
+        safe_cap = max(1, min(ram_slots, vram_slots))
+        max_parallel = safe_cap
+    resource_capped = bool(resources and (resources.get("ram") or resources.get("gpus")))
+    if MIN_PARALLEL_SLOTS > 1 and max_parallel < MIN_PARALLEL_SLOTS and not resource_capped:
+        max_parallel = MIN_PARALLEL_SLOTS
+        ram_slots = max(ram_slots or 0, MIN_PARALLEL_SLOTS)
+        vram_slots = max(vram_slots or 0, MIN_PARALLEL_SLOTS)
+        ram_pressure = True
+        vram_pressure = True
     return {
         "max_parallel": max_parallel,
         "configured": configured_slots,

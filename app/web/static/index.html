@@ -10,17 +10,19 @@
   <div class="app-shell">
     <aside class="sidebar">
       <div class="sidebar-brand">
-        <div class="brand-dot"></div>
+        <div class="brand-mark">LP</div>
         <div class="brand-text">
           <h1>LocalPro</h1>
           <p class="sub">Local chat, shared runs</p>
         </div>
       </div>
 
-      <button id="newConversationBtn" class="sidebar-btn primary">+ New chat</button>
+      <button id="newConversationBtn" class="sidebar-btn primary">New chat</button>
 
       <div class="sidebar-section conversations">
-        <p class="label">Chats</p>
+        <div class="section-head">
+          <p class="label">Chats</p>
+        </div>
         <input id="conversationSearch" type="search" placeholder="Search chats">
         <div id="conversationList" class="conversation-list"></div>
       </div>
@@ -36,9 +38,11 @@
       </div>
 
       <div class="sidebar-section" id="reasoningControl">
-        <label class="label" for="reasoningLevel">Reasoning</label>
+        <div class="section-row">
+          <label class="label" for="reasoningLevel">Reasoning</label>
+          <div class="pill inline-pill">Tier: <span id="reasoningBadge">Auto</span></div>
+        </div>
         <select id="reasoningLevel"></select>
-        <div class="pill inline-pill">Tier: <span id="reasoningBadge">Auto</span></div>
       </div>
 
       <div class="sidebar-section hidden" id="deepRouteWrap">
@@ -52,21 +56,17 @@
 
       <div class="sidebar-section">
         <p class="label">Status</p>
-        <p class="sub">Live narration preview is above the chat.</p>
+        <p class="sub">Thinking preview and activity live in the main column.</p>
       </div>
 
       <button id="settingsBtn" class="sidebar-btn ghost">Settings</button>
 
-      <div class="sidebar-foot">
-        <p class="label">Mobile</p>
-        <p class="sub">Open: <a id="shareLink" href="#" rel="noopener">Loading...</a></p>
-      </div>
     </aside>
 
     <main class="chat-pane">
       <header class="chat-header">
         <div class="header-left">
-          <button id="sidebarToggleBtn" class="icon-btn ghost mobile-only" title="Menu">Menu</button>
+          <button id="sidebarToggleBtn" class="icon-btn ghost mobile-only" title="Chats">Chats</button>
           <div class="header-title">
             <button id="conversationTitle" class="title-btn" type="button" title="Rename chat">LocalPro Chat</button>
             <span id="conversationMeta" class="header-meta"></span>
@@ -74,7 +74,7 @@
           <span id="modelWarning" class="warning-pill hidden" aria-live="polite"></span>
         </div>
         <div class="header-actions">
-          <button id="activityToggleBtn" class="pill-btn ghost">Narration</button>
+          <button id="activityToggleBtn" class="pill-btn ghost">Thinking</button>
           <button id="memoryBtn" class="pill-btn ghost">Memory</button>
           <button id="mobileNewConversationBtn" class="pill-btn ghost mobile-only">New chat</button>
           <button id="mobileOpenSettingsHint" class="pill-btn ghost mobile-only" disabled>Settings on desktop</button>
@@ -87,41 +87,40 @@
           <span class="timer mono" id="runTimer">00:00</span>
           <span class="meta-chip" id="progressText">Progress: 0%</span>
           <span class="meta-chip" id="etaText">ETA: --</span>
+          <span class="meta-chip" id="liveAgentCount" title="Live agents">Live agents: 0</span>
         </div>
-        <div id="runProgress" class="progress-bar"><div id="runProgressFill"></div></div>
-        <div id="liveTicker" class="ticker-text" title="Click to toggle narration">Idle</div>
-      </section>
-
-      <section class="mobile-banner mobile-only">
-        <div class="banner-copy">
-          <p class="label">Mobile mode</p>
-          <h3>Follow this run on your phone</h3>
-          <p class="sub">Stays in sync on desktop and phone; one query at a time.</p>
-          <p class="sub">Open: <a id="shareLinkMobile" href="#" rel="noopener">Loading...</a></p>
+        <div class="runbar-progress">
+          <div id="runProgress" class="progress-bar"><div id="runProgressFill"></div></div>
+          <div class="live-preview">
+            <p class="label">Live thinking preview</p>
+            <div id="liveTicker" class="ticker-text" title="Click to toggle thinking">Idle</div>
+          </div>
         </div>
       </section>
 
-      <div id="emptyState" class="empty-state hidden">
-        <p class="label">Start a conversation</p>
-        <h2>What can I help with?</h2>
-        <p class="sub">Upload files, search the web, or ask anything. We'll show narrated progress, sources, and activity per reply.</p>
-        <div class="suggestion-grid">
-          <button class="suggestion-card" type="button" data-prompt="Summarize this PDF and list three action items.">Summarize this PDF and list three action items.</button>
-          <button class="suggestion-card" type="button" data-prompt="Compare the latest AI chips from NVIDIA and AMD.">Compare the latest AI chips from NVIDIA and AMD.</button>
-          <button class="suggestion-card" type="button" data-prompt="Draft a project kickoff email with timeline and owners.">Draft a project kickoff email with timeline and owners.</button>
-          <button class="suggestion-card" type="button" data-prompt="Find 3 recent articles on EU AI policy and cite them.">Find 3 recent articles on EU AI policy and cite them.</button>
+      <section class="chat-stage">
+        <div id="emptyState" class="empty-state hidden">
+          <p class="label">Start a conversation</p>
+          <h2>How can I help today?</h2>
+          <p class="sub">Upload files, search the web, or ask anything. We'll show narrated progress, sources, and activity per reply.</p>
+          <div class="suggestion-grid">
+            <button class="suggestion-card" type="button" data-prompt="Summarize this PDF and list three action items.">Summarize this PDF and list three action items.</button>
+            <button class="suggestion-card" type="button" data-prompt="Compare the latest AI chips from NVIDIA and AMD.">Compare the latest AI chips from NVIDIA and AMD.</button>
+            <button class="suggestion-card" type="button" data-prompt="Draft a project kickoff email with timeline and owners.">Draft a project kickoff email with timeline and owners.</button>
+            <button class="suggestion-card" type="button" data-prompt="Find 3 recent articles on EU AI policy.">Find 3 recent articles on EU AI policy.</button>
+          </div>
+          <div class="capabilities-pill">Supports uploads, web search, and on-device models.</div>
         </div>
-        <div class="capabilities-pill">Supports uploads, web search, and on-device models.</div>
-      </div>
 
-      <div id="chatThread" class="chat-thread"></div>
+        <div id="chatThread" class="chat-thread"></div>
+      </section>
 
       <div class="attachment-strip hidden" id="attachmentStrip">
         <div id="uploadDrop" class="dropzone">
           <button type="button" id="dismissUploadDrop" class="icon-btn ghost close-upload" title="Hide uploads">x</button>
           <div>
             <p class="label">Uploads</p>
-            <p class="sub">Drop files or tap attach. Images/PDFs go to vision + secretary.</p>
+            <p class="sub">Drop files or tap attach. Images and PDFs go to vision + secretary.</p>
           </div>
           <div class="drop-actions">
             <button type="button" id="attachBtn" class="pill-btn ghost">Attach</button>
@@ -138,7 +137,7 @@
             <div class="composer-left">
               <button type="button" id="attachMenu" class="icon-btn ghost" title="Tools">Attach</button>
             </div>
-            <textarea id="question" rows="3" placeholder="Message"></textarea>
+            <textarea id="question" rows="3" placeholder="Message LocalPro"></textarea>
             <div class="composer-right">
               <button type="button" id="micBtn" class="icon-btn" title="Speak">Mic</button>
               <button type="submit" class="send-btn" title="Send">Send</button>
@@ -161,11 +160,11 @@
       </div>
     </main>
 
-    <aside class="activity-pane drawer hidden" id="reasoningPanel" aria-label="Narration drawer">
+    <aside class="activity-pane drawer hidden" id="reasoningPanel" aria-label="Thinking drawer">
       <div class="drawer-head">
         <div>
-          <p class="label">Narration</p>
-          <h3>4B narration</h3>
+          <p class="label">Thinking</p>
+          <h3>Run activity</h3>
           <p class="sub" id="drawerSubline"></p>
         </div>
         <div class="drawer-actions">
@@ -176,8 +175,8 @@
       </div>
       <div class="drawer-body">
         <div class="panel-section">
-          <p class="label">4B narration</p>
-          <div id="reasoningFeed" class="feed thinking-feed"></div>
+          <p class="label">Live log</p>
+          <div id="activityFeed" class="feed activity-feed thinking-feed"></div>
         </div>
       </div>
     </aside>
@@ -196,6 +195,12 @@
         </div>
 
         <div class="settings-grid">
+          <div class="settings-group">
+            <p class="label">LocalPro</p>
+            <label>API Base URL <input id="cfgApiBase" placeholder="http://127.0.0.1:8000"></label>
+            <p class="sub">Use this when the UI is hosted separately from the API.</p>
+          </div>
+
           <div class="settings-group">
             <p class="label">LM Studio</p>
             <label>Server Base URL <input id="cfgBaseUrl"></label>

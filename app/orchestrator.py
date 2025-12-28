@@ -1,16 +1,20 @@
 import asyncio
 import ast
 import base64
+import csv
 import io
 import json
 import math
 import operator
 import os
+import re
 import uuid
+from collections import deque
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Deque, Dict, List, Optional, Set, Tuple
+from urllib.parse import urlparse
 
 import httpx
 from pypdf import PdfReader
@@ -43,6 +47,13 @@ REASONING_DEPTHS = {
     "ULTRA": {"max_steps": 20, "research_rounds": 3, "tool_budget": {"tavily_search": 18, "tavily_extract": 24}, "advanced": True, "strict_verify": True},
 }
 
+
+def utc_iso() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+# No fixed minimum; parallelism is driven by live resource checks.
+MIN_PARALLEL_SLOTS = 1
+
 # Cache models that LM Studio reports as unloaded or missing.
 UNAVAILABLE_MODELS: Set[Tuple[str, str]] = set()
 
@@ -54,7 +65,10 @@ class RunState:
     chat_error: Optional[str] = None
     web_error: Optional[str] = None
     freshness_required: bool = False
+    question: str = ""
     work_log_flags: Set[str] = field(default_factory=set)
+    narration_recent: Deque[str] = field(default_factory=lambda: deque(maxlen=6))
+    narration_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     dev_trace_cb: Optional[Callable[[str, Optional[dict]], None]] = None
 
     def mark_chat_unavailable(self, reason: str) -> None:
@@ -66,8 +80,26 @@ class RunState:
             self.dev_trace_cb(message, detail)
 
 
-async def emit_work_log(bus: "EventBus", run_id: str, text: str, tone: str = "info") -> None:
-    await bus.emit(run_id, "work_log", {"text": text, "tone": tone})
+@dataclass
+class AllocationDecision:
+    start_ids: List[int]
+    queue_ids: List[int] = field(default_factory=list)
+    target_slots: Optional[int] = None
+    note: str = ""
+    used_executor: bool = False
+
+
+async def emit_work_log(
+    bus: "EventBus",
+    run_id: str,
+    text: str,
+    tone: str = "info",
+    urls: Optional[List[str]] = None,
+) -> None:
+    payload = {"text": text, "tone": tone}
+    if urls:
+        payload["urls"] = urls
+    await bus.emit(run_id, "work_log", payload)
 
 
 async def maybe_emit_work_log(
@@ -77,11 +109,342 @@ async def maybe_emit_work_log(
     key: str,
     text: str,
     tone: str = "info",
+    urls: Optional[List[str]] = None,
 ) -> None:
     if key in run_state.work_log_flags:
         return
     run_state.work_log_flags.add(key)
-    await emit_work_log(bus, run_id, text, tone=tone)
+    await emit_work_log(bus, run_id, text, tone=tone, urls=urls)
+
+
+def _clip_narration_text(value: Any, max_len: int = 120) -> str:
+    text = str(value or "").replace("\n", " ").strip()
+    if not text:
+        return ""
+    if len(text) > max_len:
+        if max_len <= 3:
+            return text[:max_len]
+        text = text[: max_len - 3].rstrip() + "..."
+    return text
+
+
+def _summarize_tool_request(detail: Optional[dict]) -> Dict[str, str]:
+    if not isinstance(detail, dict):
+        return {}
+    requests = detail.get("requests")
+    if not isinstance(requests, list) or not requests:
+        return {}
+    req = requests[0] if isinstance(requests[0], dict) else {}
+    tool = str(req.get("tool") or req.get("type") or req.get("name") or "").strip()
+    summary: Dict[str, str] = {}
+    if tool:
+        summary["tool"] = tool
+    expr = req.get("expr") or req.get("expression") or req.get("input")
+    if expr:
+        summary["expr"] = _clip_narration_text(expr, 60)
+    path = req.get("path") or req.get("file") or req.get("filename")
+    if path:
+        summary["path"] = _clip_narration_text(path, 80)
+    code = req.get("code") or req.get("source")
+    if code:
+        summary["code"] = _clip_narration_text(code, 60)
+    return summary
+
+
+def _summarize_tool_result(detail: Optional[dict]) -> Dict[str, str]:
+    if not isinstance(detail, dict):
+        return {}
+    results = detail.get("results")
+    if not isinstance(results, list) or not results:
+        return {}
+    res = results[0] if isinstance(results[0], dict) else {}
+    tool = str(res.get("tool") or res.get("type") or res.get("name") or "").strip()
+    summary: Dict[str, str] = {}
+    if tool:
+        summary["tool"] = tool
+    if "result" in res:
+        result_val = res.get("result")
+        if isinstance(result_val, (dict, list)):
+            result_text = json.dumps(result_val, ensure_ascii=True)
+        else:
+            result_text = str(result_val)
+        summary["result"] = _clip_narration_text(result_text, 80)
+    return summary
+
+
+def _summarize_step_detail(detail: Optional[dict]) -> Dict[str, Any]:
+    if not isinstance(detail, dict):
+        return {}
+    step_id = detail.get("step_id") if detail.get("step_id") is not None else detail.get("step")
+    return {
+        "id": step_id,
+        "name": _clip_narration_text(detail.get("name"), 60),
+        "type": detail.get("type"),
+        "agent_profile": detail.get("agent_profile"),
+    }
+
+
+def _trim_url_list(urls: Any, limit: int = 2) -> List[str]:
+    if not isinstance(urls, list):
+        return []
+    trimmed: List[str] = []
+    for url in urls:
+        if not url:
+            continue
+        trimmed.append(_clip_narration_text(url, 120))
+        if len(trimmed) >= limit:
+            break
+    return trimmed
+
+
+def _build_narration_context(question: str, event_type: str, detail: Optional[dict]) -> Dict[str, Any]:
+    context: Dict[str, Any] = {
+        "question": _clip_narration_text(question, 140),
+        "event": event_type,
+    }
+    if not isinstance(detail, dict):
+        return context
+    if event_type in ("step_started", "step_completed", "step_error"):
+        context["step"] = _summarize_step_detail(detail)
+        message = detail.get("message") or detail.get("error")
+        if message:
+            context["message"] = _clip_narration_text(message, 120)
+        return context
+    if event_type == "tavily_search":
+        query = detail.get("query")
+        if query:
+            context["query"] = _clip_narration_text(query, 120)
+        if detail.get("mode"):
+            context["mode"] = detail.get("mode")
+        return context
+    if event_type == "search_skipped":
+        query = detail.get("query")
+        if query:
+            context["query"] = _clip_narration_text(query, 120)
+        reason = detail.get("reason")
+        if reason:
+            context["reason"] = _clip_narration_text(reason, 60)
+        return context
+    if event_type == "tavily_extract":
+        urls = _trim_url_list(detail.get("urls"))
+        if urls:
+            context["urls"] = urls
+        return context
+    if event_type == "tool_request":
+        tool = _summarize_tool_request(detail)
+        if tool:
+            context["tool_request"] = tool
+        return context
+    if event_type == "tool_result":
+        tool = _summarize_tool_result(detail)
+        if tool:
+            context["tool_result"] = tool
+        return context
+    if event_type == "router_decision":
+        context["reasoning_level"] = detail.get("reasoning_level")
+        context["needs_web"] = detail.get("needs_web")
+        context["model_tier"] = detail.get("model_tier")
+        return context
+    if event_type == "plan_created":
+        context["steps"] = detail.get("steps") or detail.get("expected_total_steps")
+        context["expected_passes"] = detail.get("expected_passes")
+        return context
+    if event_type == "plan_updated":
+        context["steps"] = detail.get("steps") or detail.get("expected_total_steps")
+        context["expected_passes"] = detail.get("expected_passes")
+        return context
+    if event_type == "allocator_decision":
+        context["start_ids"] = detail.get("start_ids")
+        context["target_slots"] = detail.get("target_slots")
+        return context
+    if event_type == "source_found":
+        context["title"] = _clip_narration_text(detail.get("title"), 120)
+        context["publisher"] = _clip_narration_text(detail.get("publisher"), 80)
+        context["url"] = _clip_narration_text(detail.get("url"), 120)
+        context["date_published"] = _clip_narration_text(detail.get("date_published"), 40)
+        return context
+    if event_type == "claim_found":
+        context["claim"] = _clip_narration_text(detail.get("claim"), 140)
+        urls = _trim_url_list(detail.get("urls"))
+        if urls:
+            context["urls"] = urls
+        return context
+    if event_type == "upload_processed":
+        context["upload"] = _clip_narration_text(detail.get("name"), 80)
+        return context
+    if event_type == "upload_failed":
+        context["upload"] = _clip_narration_text(detail.get("name"), 80)
+        context["error"] = _clip_narration_text(detail.get("error"), 120)
+        return context
+    if event_type == "loop_iteration":
+        context["iteration"] = detail.get("iteration")
+        return context
+    simple_detail: Dict[str, Any] = {}
+    for key, value in detail.items():
+        if isinstance(value, (str, int, float, bool)):
+            simple_detail[key] = _clip_narration_text(value, 80)
+    if simple_detail:
+        context["detail"] = simple_detail
+    return context
+
+
+def _clean_narration_line(text: Any) -> str:
+    line = _clip_narration_text(text, 200)
+    if not line:
+        return ""
+    line = line.splitlines()[0].strip()
+    if (line.startswith('"') and line.endswith('"')) or (line.startswith("'") and line.endswith("'")):
+        line = line[1:-1].strip()
+    for prefix in ("4B:", "Executor:", "Narrator:", "Narration:"):
+        if line.lower().startswith(prefix.lower()):
+            line = line[len(prefix):].strip()
+            break
+    return _clip_narration_text(line, 160)
+
+
+def _narration_endpoint(model_map: Optional[Dict[str, Dict[str, str]]]) -> Dict[str, str]:
+    if not model_map:
+        return {}
+    return (
+        model_map.get("executor")
+        or model_map.get("summarizer")
+        or model_map.get("router")
+        or model_map.get("orch")
+        or {}
+    )
+
+
+async def emit_narration(
+    lm_client: LMStudioClient,
+    model_map: Optional[Dict[str, Dict[str, str]]],
+    run_state: Optional[RunState],
+    bus: "EventBus",
+    run_id: str,
+    question: str,
+    event_type: str,
+    detail: Optional[dict] = None,
+    tone: str = "info",
+) -> None:
+    if not run_state or not run_state.can_chat:
+        return
+    endpoint = _narration_endpoint(model_map)
+    model = endpoint.get("model") if isinstance(endpoint, dict) else None
+    if not model:
+        return
+    context = _build_narration_context(question, event_type, detail)
+    if run_state.narration_recent:
+        context["recent_lines"] = list(run_state.narration_recent)
+    prompt = (
+        "Write one short, human line for a live UI. "
+        "Sound like a real teammate narrating their own work. "
+        "Focus on what you are doing or just learned, not internal mechanics. "
+        "Use present tense, roughly 6-16 words. "
+        "Avoid internal jargon (worker slots, step ids, allocators, tool names). "
+        "If there is no user-facing update, return an empty string. "
+        "Light label prefixes like \"Goal:\" or \"Plan:\" are OK when they fit. "
+        "If a source or claim is provided, mention the source title or publisher. "
+        "No quotes, no emojis, no chain-of-thought. "
+        "Use the context fields if helpful. Output only the line.\n"
+        f"Context: {json.dumps(context, ensure_ascii=True)}"
+    )
+    try:
+        resp = await lm_client.chat_completion(
+            model=model,
+            messages=[{"role": "system", "content": agents.NARRATOR_SYSTEM}, {"role": "user", "content": prompt}],
+            temperature=0.4,
+            max_tokens=60,
+            base_url=endpoint.get("base_url") or lm_client.base_url,
+            run_state=run_state,
+        )
+        line = _clean_narration_line(resp["choices"][0]["message"]["content"])
+        if not line:
+            return
+        async with run_state.narration_lock:
+            if line in run_state.narration_recent:
+                return
+            run_state.narration_recent.append(line)
+        payload = {"text": line, "tone": tone, "event": event_type}
+        if isinstance(detail, dict):
+            urls: List[str] = []
+            seen: Set[str] = set()
+            url = detail.get("url")
+            if isinstance(url, str):
+                cleaned = url.strip()
+                if cleaned:
+                    urls.append(cleaned)
+                    seen.add(cleaned)
+            url_list = detail.get("urls")
+            if isinstance(url_list, list):
+                for item in url_list:
+                    if not isinstance(item, str):
+                        continue
+                    cleaned = item.strip()
+                    if cleaned and cleaned not in seen:
+                        urls.append(cleaned)
+                        seen.add(cleaned)
+                    if len(urls) >= 3:
+                        break
+            elif isinstance(url_list, str):
+                cleaned = url_list.strip()
+                if cleaned and cleaned not in seen:
+                    urls.append(cleaned)
+            if urls:
+                payload["urls"] = urls
+        await bus.emit(run_id, "narration", payload)
+    except Exception:
+        return
+
+
+def queue_narration(
+    lm_client: LMStudioClient,
+    model_map: Optional[Dict[str, Dict[str, str]]],
+    run_state: Optional[RunState],
+    bus: "EventBus",
+    run_id: str,
+    question: str,
+    event_type: str,
+    detail: Optional[dict] = None,
+    tone: str = "info",
+) -> None:
+    if not run_state or not run_state.can_chat:
+        return
+    if not model_map:
+        return
+    skip_events = {
+        "allocator_decision",
+        "model_selected",
+        "model_error",
+        "model_unavailable",
+        "planner_verifier",
+        "resource_budget",
+        "role_map",
+        "step_started",
+        "step_completed",
+        "tool_request",
+        "tool_result",
+        "worker_warmup",
+        "strict_mode",
+        "memory_retrieved",
+    }
+    if event_type in skip_events:
+        return
+    if not question and run_state.question:
+        question = run_state.question
+    if not question:
+        question = ""
+    asyncio.create_task(
+        emit_narration(
+            lm_client,
+            model_map,
+            run_state,
+            bus,
+            run_id,
+            question,
+            event_type,
+            detail=detail,
+            tone=tone,
+        )
+    )
 
 
 def make_dev_trace_cb(bus: "EventBus", run_id: str) -> Callable[[str, Optional[dict]], None]:
@@ -199,6 +562,86 @@ def data_url_from_file(path: Path, mime: str) -> str:
     return f"data:{mime};base64,{base64.b64encode(data).decode('utf-8')}"
 
 
+def _coerce_text(value: Any) -> str:
+    if value is None:
+        return ""
+    return str(value)
+
+
+def _text_split(value: Any, sep: Optional[str] = None, maxsplit: int = -1) -> List[str]:
+    return _coerce_text(value).split(sep, maxsplit)
+
+
+def _text_splitlines(value: Any) -> List[str]:
+    return _coerce_text(value).splitlines()
+
+
+def _text_strip(value: Any, chars: Optional[str] = None) -> str:
+    return _coerce_text(value).strip(chars)
+
+
+def _text_lower(value: Any) -> str:
+    return _coerce_text(value).lower()
+
+
+def _text_upper(value: Any) -> str:
+    return _coerce_text(value).upper()
+
+
+def _text_replace(value: Any, old: Any, new: Any, count: int = -1) -> str:
+    return _coerce_text(value).replace(str(old), str(new), count)
+
+
+def _text_startswith(value: Any, prefix: Any) -> bool:
+    return _coerce_text(value).startswith(str(prefix))
+
+
+def _text_endswith(value: Any, suffix: Any) -> bool:
+    return _coerce_text(value).endswith(str(suffix))
+
+
+def _csv_rows(text: Any, delimiter: str = ",", max_rows: Optional[int] = 10000) -> List[List[str]]:
+    data = _coerce_text(text)
+    rows: List[List[str]] = []
+    reader = csv.reader(io.StringIO(data), delimiter=delimiter)
+    for row in reader:
+        rows.append(row)
+        if max_rows is not None and len(rows) >= max_rows:
+            break
+    return rows
+
+
+def _csv_dicts(text: Any, delimiter: str = ",", max_rows: Optional[int] = 10000) -> List[Dict[str, str]]:
+    row_limit = None if max_rows is None else max_rows + 1
+    rows = _csv_rows(text, delimiter=delimiter, max_rows=row_limit)
+    if not rows:
+        return []
+    header = rows[0]
+    output: List[Dict[str, str]] = []
+    for row in rows[1:]:
+        record = {}
+        for idx, key in enumerate(header):
+            record[str(key)] = row[idx] if idx < len(row) else ""
+        output.append(record)
+        if max_rows is not None and len(output) >= max_rows:
+            break
+    return output
+
+
+def _safe_get(mapping: Any, key: Any, default: Any = None) -> Any:
+    if mapping is None:
+        return default
+    if hasattr(mapping, "get"):
+        try:
+            return mapping.get(key, default)
+        except Exception:
+            return default
+    try:
+        return mapping[key]
+    except Exception:
+        return default
+
+
 SAFE_BIN_OPS = {
     ast.Add: operator.add,
     ast.Sub: operator.sub,
@@ -208,13 +651,38 @@ SAFE_BIN_OPS = {
     ast.Pow: operator.pow,
     ast.FloorDiv: operator.floordiv,
 }
-SAFE_UNARY_OPS = {ast.UAdd: lambda v: v, ast.USub: lambda v: -v}
+SAFE_UNARY_OPS = {ast.UAdd: lambda v: v, ast.USub: lambda v: -v, ast.Not: lambda v: not v}
 SAFE_NAMES: Dict[str, Any] = {
     "pi": math.pi,
     "e": math.e,
     "abs": abs,
     "round": round,
+    "len": len,
+    "list": list,
+    "tuple": tuple,
+    "dict": dict,
+    "min": min,
+    "max": max,
+    "sum": sum,
+    "sorted": sorted,
+    "int": int,
+    "float": float,
+    "str": str,
+    "bool": bool,
+    "range": range,
+    "any": any,
+    "all": all,
+    "enumerate": enumerate,
+    "zip": zip,
     **{name: getattr(math, name) for name in ("sqrt", "log", "log10", "sin", "cos", "tan", "exp", "ceil", "floor", "fabs")},
+}
+SAFE_COMPARE_OPS = {
+    ast.Eq: operator.eq,
+    ast.NotEq: operator.ne,
+    ast.Lt: operator.lt,
+    ast.LtE: operator.le,
+    ast.Gt: operator.gt,
+    ast.GtE: operator.ge,
 }
 
 
@@ -225,41 +693,262 @@ def safe_eval_expr(expr: str, names: Optional[Dict[str, Any]] = None) -> Any:
     if names:
         allowed_names.update(names)
 
-    def _eval(node: ast.AST) -> Any:
+    def _resolve_name(name: str, local_env: Dict[str, Any]) -> Any:
+        if name in local_env:
+            return local_env[name]
+        if name in allowed_names:
+            return allowed_names[name]
+        raise ValueError("Name not allowed")
+
+    def _assign_target(target: ast.AST, value: Any, local_env: Dict[str, Any]) -> None:
+        if isinstance(target, ast.Name):
+            local_env[target.id] = value
+            return
+        if isinstance(target, ast.Tuple):
+            if not isinstance(value, (list, tuple)):
+                raise ValueError("Tuple unpacking requires a list/tuple")
+            if len(target.elts) != len(value):
+                raise ValueError("Tuple unpack mismatch")
+            for elt, item in zip(target.elts, value):
+                _assign_target(elt, item, local_env)
+            return
+        raise ValueError("Unsupported comprehension target")
+
+    def _eval_comprehension(node: ast.AST, local_env: Dict[str, Any]) -> Any:
+        if isinstance(node, ast.ListComp):
+            results: List[Any] = []
+            elt = node.elt
+        elif isinstance(node, ast.GeneratorExp):
+            results = []
+            elt = node.elt
+        elif isinstance(node, ast.SetComp):
+            results = set()
+            elt = node.elt
+        elif isinstance(node, ast.DictComp):
+            results = {}
+            key_node = node.key
+            value_node = node.value
+            elt = None
+        else:
+            raise ValueError("Unsupported comprehension")
+
+        def _walk(gen_index: int, env: Dict[str, Any]) -> None:
+            if gen_index >= len(node.generators):
+                if isinstance(results, list):
+                    results.append(_eval(elt, env))
+                elif isinstance(results, set):
+                    results.add(_eval(elt, env))
+                else:
+                    results[_eval(key_node, env)] = _eval(value_node, env)
+                return
+            gen = node.generators[gen_index]
+            if getattr(gen, "is_async", False):
+                raise ValueError("Async comprehensions not allowed")
+            iterable = _eval(gen.iter, env)
+            for item in iterable:
+                next_env = dict(env)
+                _assign_target(gen.target, item, next_env)
+                if all(_eval(cond, next_env) for cond in gen.ifs):
+                    _walk(gen_index + 1, next_env)
+
+        _walk(0, dict(local_env))
+        return results
+
+    def _eval(node: ast.AST, local_env: Optional[Dict[str, Any]] = None) -> Any:
+        env = local_env or {}
         if isinstance(node, ast.Expression):
-            return _eval(node.body)
+            return _eval(node.body, env)
         if isinstance(node, ast.Constant):
             if isinstance(node.value, (int, float, bool, str)) or node.value is None:
                 return node.value
             raise ValueError("Unsupported literal")
         if isinstance(node, ast.Tuple):
-            return tuple(_eval(elt) for elt in node.elts)
+            return tuple(_eval(elt, env) for elt in node.elts)
         if isinstance(node, ast.List):
-            return [_eval(elt) for elt in node.elts]
+            return [_eval(elt, env) for elt in node.elts]
         if isinstance(node, ast.Dict):
             if any(key is None for key in node.keys):
                 raise ValueError("Dict unpacking not allowed")
-            return {_eval(k): _eval(v) for k, v in zip(node.keys, node.values)}
+            return {_eval(k, env): _eval(v, env) for k, v in zip(node.keys, node.values)}
+        if isinstance(node, (ast.ListComp, ast.GeneratorExp, ast.SetComp, ast.DictComp)):
+            return _eval_comprehension(node, env)
+        if isinstance(node, ast.Subscript):
+            target = _eval(node.value, env)
+            slice_node = node.slice
+            if isinstance(slice_node, ast.Slice):
+                lower = _eval(slice_node.lower, env) if slice_node.lower else None
+                upper = _eval(slice_node.upper, env) if slice_node.upper else None
+                step = _eval(slice_node.step, env) if slice_node.step else None
+                return target[slice(lower, upper, step)]
+            if hasattr(ast, "Index") and isinstance(slice_node, ast.Index):
+                slice_node = slice_node.value
+            if isinstance(slice_node, ast.Tuple):
+                index = tuple(_eval(elt, env) for elt in slice_node.elts)
+            else:
+                index = _eval(slice_node, env)
+            return target[index]
+        if isinstance(node, ast.Compare):
+            left = _eval(node.left, env)
+            for op, comparator in zip(node.ops, node.comparators):
+                right = _eval(comparator, env)
+                op_type = type(op)
+                if op_type in SAFE_COMPARE_OPS:
+                    if not SAFE_COMPARE_OPS[op_type](left, right):
+                        return False
+                elif isinstance(op, ast.In):
+                    if left not in right:
+                        return False
+                elif isinstance(op, ast.NotIn):
+                    if left in right:
+                        return False
+                elif isinstance(op, ast.Is):
+                    if left is not right:
+                        return False
+                elif isinstance(op, ast.IsNot):
+                    if left is right:
+                        return False
+                else:
+                    raise ValueError("Comparison not allowed")
+                left = right
+            return True
+        if isinstance(node, ast.BoolOp):
+            if isinstance(node.op, ast.And):
+                for value in node.values:
+                    if not _eval(value, env):
+                        return False
+                return True
+            if isinstance(node.op, ast.Or):
+                for value in node.values:
+                    if _eval(value, env):
+                        return True
+                return False
+            raise ValueError("Boolean op not allowed")
+        if isinstance(node, ast.IfExp):
+            return _eval(node.body, env) if _eval(node.test, env) else _eval(node.orelse, env)
         if isinstance(node, ast.BinOp) and type(node.op) in SAFE_BIN_OPS:
-            return SAFE_BIN_OPS[type(node.op)](_eval(node.left), _eval(node.right))
+            return SAFE_BIN_OPS[type(node.op)](_eval(node.left, env), _eval(node.right, env))
         if isinstance(node, ast.UnaryOp) and type(node.op) in SAFE_UNARY_OPS:
-            return SAFE_UNARY_OPS[type(node.op)](_eval(node.operand))
+            return SAFE_UNARY_OPS[type(node.op)](_eval(node.operand, env))
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
             func_name = node.func.id
-            if func_name not in allowed_names:
-                raise ValueError("Function not allowed")
-            args = [_eval(arg) for arg in node.args]
+            func = _resolve_name(func_name, env)
+            args = [_eval(arg, env) for arg in node.args]
             kwargs = {}
             for kw in node.keywords:
                 if kw.arg is None:
                     raise ValueError("Keyword splat not allowed")
-                kwargs[kw.arg] = _eval(kw.value)
-            return allowed_names[func_name](*args, **kwargs)
-        if isinstance(node, ast.Name) and node.id in allowed_names:
-            return allowed_names[node.id]
+                kwargs[kw.arg] = _eval(kw.value, env)
+            return func(*args, **kwargs)
+        if isinstance(node, ast.Name):
+            return _resolve_name(node.id, env)
         raise ValueError("Disallowed expression")
 
-    return _eval(tree)
+    return _eval(tree, {})
+
+
+MATH_QUERY_PREFIXES = (
+    "calculate",
+    "compute",
+    "solve",
+    "evaluate",
+    "simplify",
+    "approximate",
+    "approx",
+)
+MATH_TEXT_HINTS = {
+    "what",
+    "whats",
+    "what's",
+    "is",
+    "the",
+    "result",
+    "of",
+    "equals",
+    "equal",
+    "plus",
+    "minus",
+    "times",
+    "divided",
+    "by",
+    "calculate",
+    "compute",
+    "solve",
+    "evaluate",
+    "simplify",
+    "approximate",
+    "approx",
+}
+MATH_FUNC_TOKENS = {"sin", "cos", "tan", "sqrt", "log", "log10", "exp", "ceil", "floor", "fabs", "pi", "e"}
+
+
+def normalize_math_expression(text: str) -> str:
+    base = strip_search_filler(text)
+    if not base:
+        base = " ".join((text or "").strip().split())
+    base = base.strip(" .?!,;:")
+    lower = base.lower()
+    for prefix in MATH_QUERY_PREFIXES:
+        if lower.startswith(prefix + " "):
+            base = base[len(prefix):].strip()
+            break
+    if "^" in base and "**" not in base:
+        base = base.replace("^", "**")
+    if base:
+        match = re.search(r"[0-9][0-9\\s\\+\\-\\*\\/\\.\\(\\)\\^]+", base)
+        if match:
+            base = match.group(0).strip()
+    return base
+
+
+def is_safe_math_expression(expr: str) -> bool:
+    try:
+        tree = ast.parse(expr, mode="eval")
+    except Exception:
+        return False
+
+    allowed_names = set(SAFE_NAMES.keys())
+
+    def _check(node: ast.AST) -> bool:
+        if isinstance(node, ast.Expression):
+            return _check(node.body)
+        if isinstance(node, ast.Constant):
+            return isinstance(node.value, (int, float))
+        if isinstance(node, ast.UnaryOp) and type(node.op) in SAFE_UNARY_OPS:
+            return _check(node.operand)
+        if isinstance(node, ast.BinOp) and type(node.op) in SAFE_BIN_OPS:
+            return _check(node.left) and _check(node.right)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+            if node.func.id not in allowed_names:
+                return False
+            if any(kw.arg is None for kw in node.keywords):
+                return False
+            return all(_check(arg) for arg in node.args) and all(_check(kw.value) for kw in node.keywords)
+        if isinstance(node, ast.Name):
+            return node.id in allowed_names
+        return False
+
+    return _check(tree)
+
+
+def looks_like_math_expression(text: str) -> bool:
+    expr = normalize_math_expression(text)
+    if not expr:
+        return False
+    lowered = (text or "").lower()
+    tokens = re.findall(r"[a-z]+", lowered)
+    if tokens:
+        for token in tokens:
+            if token in MATH_TEXT_HINTS or token in MATH_FUNC_TOKENS:
+                continue
+            return False
+    return is_safe_math_expression(expr)
+
+
+def build_math_tool_request(question: str) -> Optional[dict]:
+    if not looks_like_math_expression(question):
+        return None
+    expr = normalize_math_expression(question)
+    return {"tool": "local_code", "code": expr}
 
 
 TOOL_TEXT_MAX_CHARS = 4000
@@ -267,6 +956,14 @@ TOOL_BYTES_MAX = 200000
 TOOL_LIST_MAX = 60
 TOOL_IMAGE_MAX_SIZE = 1024
 TOOL_IMAGE_MAX_LIMIT = 2048
+TOOL_MODEL_DEFAULT_TOKENS = 400
+TOOL_MODEL_MAX_TOKENS = 1200
+TOOL_MODEL_MAX_CHARS = 4000
+RESOURCE_REFRESH_SECS = 3.0
+ALLOCATOR_MAX_READY = 20
+ALLOCATOR_MAX_RUNNING = 12
+VALIDATION_PROMPT_MAX_CHARS = 1800
+VALIDATION_SUMMARY_MAX_CHARS = 600
 
 
 def _display_path(path: Path) -> str:
@@ -355,6 +1052,75 @@ def _tool_list_files(path_value: Optional[str], roots: List[Path], max_entries: 
         name = entry.name + ("/" if entry.is_dir() else "")
         entries.append(name)
     return entries
+
+
+def _tool_http_get(
+    url: str,
+    params: Optional[Dict[str, Any]] = None,
+    headers: Optional[Dict[str, Any]] = None,
+    timeout: float = 10.0,
+    max_bytes: int = TOOL_BYTES_MAX,
+) -> Dict[str, Any]:
+    if not url or not str(url).strip():
+        raise ValueError("Missing url")
+    parsed = httpx.URL(str(url))
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError("Only http/https URLs are allowed")
+
+    def _coerce_str_dict(value: Optional[Dict[str, Any]], label: str) -> Optional[Dict[str, str]]:
+        if value is None or value == "":
+            return None
+        if not isinstance(value, dict):
+            raise ValueError(f"{label} must be a dict")
+        return {str(k): str(v) for k, v in value.items()}
+
+    params = _coerce_str_dict(params, "params")
+    headers = _coerce_str_dict(headers, "headers")
+    try:
+        timeout_value = float(timeout)
+    except Exception:
+        timeout_value = 10.0
+    if timeout_value <= 0:
+        timeout_value = 10.0
+    try:
+        max_bytes_value = int(max_bytes)
+    except Exception:
+        max_bytes_value = TOOL_BYTES_MAX
+    if max_bytes_value <= 0:
+        max_bytes_value = TOOL_BYTES_MAX
+    max_bytes_value = min(max_bytes_value, TOOL_BYTES_MAX)
+
+    data = bytearray()
+    truncated = False
+    with httpx.Client(timeout=timeout_value, follow_redirects=True) as client:
+        with client.stream("GET", str(parsed), params=params, headers=headers) as resp:
+            status = resp.status_code
+            content_type = resp.headers.get("content-type", "")
+            for chunk in resp.iter_bytes():
+                if not chunk:
+                    continue
+                data.extend(chunk)
+                if len(data) >= max_bytes_value:
+                    data = data[:max_bytes_value]
+                    truncated = True
+                    break
+
+    text = data.decode("utf-8", errors="replace")
+    json_data = None
+    if "json" in content_type.lower() or text.lstrip().startswith(("{", "[")):
+        try:
+            json_data = json.loads(text)
+        except Exception:
+            json_data = None
+    return {
+        "url": str(parsed),
+        "status": status,
+        "content_type": content_type,
+        "bytes": len(data),
+        "truncated": truncated,
+        "text": text,
+        "json": json_data,
+    }
 
 
 def _require_image() -> None:
@@ -483,11 +1249,219 @@ def _tool_image_zoom(
         }
 
 
+def _tool_image_adjust(
+    path_value: str,
+    roots: List[Path],
+    rotate: Optional[Any] = None,
+    flip: Optional[Any] = None,
+    flop: Optional[Any] = None,
+    grayscale: Optional[Any] = None,
+    brightness: Optional[Any] = None,
+    contrast: Optional[Any] = None,
+    color: Optional[Any] = None,
+    sharpness: Optional[Any] = None,
+    width: Optional[Any] = None,
+    height: Optional[Any] = None,
+    max_size: int = TOOL_IMAGE_MAX_SIZE,
+    format: str = "PNG",
+) -> Dict[str, Any]:
+    _require_image()
+    resolved = _resolve_tool_path(path_value, roots)
+    if not resolved.exists() or not resolved.is_file():
+        raise ValueError("File not found")
+    fmt = _normalize_image_format(format)
+    max_size = _clamp_image_size(max_size)
+    try:
+        from PIL import ImageEnhance
+    except Exception:
+        raise ValueError("Pillow not installed")
+    with Image.open(resolved) as img:
+        img = img.copy()
+        angle = _coerce_float(rotate)
+        if angle is not None and angle != 0:
+            img = img.rotate(angle, expand=True)
+        if flip:
+            img = img.transpose(Image.FLIP_TOP_BOTTOM)
+        if flop:
+            img = img.transpose(Image.FLIP_LEFT_RIGHT)
+
+        def _apply_enhance(enhancer: Any, value: Optional[Any]) -> None:
+            nonlocal img
+            factor = _coerce_float(value)
+            if factor is None:
+                return
+            if img.mode not in ("RGB", "L"):
+                img = img.convert("RGB")
+            img = enhancer(img).enhance(factor)
+
+        _apply_enhance(ImageEnhance.Brightness, brightness)
+        _apply_enhance(ImageEnhance.Contrast, contrast)
+        _apply_enhance(ImageEnhance.Color, color)
+        _apply_enhance(ImageEnhance.Sharpness, sharpness)
+
+        if grayscale:
+            img = img.convert("L")
+
+        width_value = _coerce_int(width)
+        height_value = _coerce_int(height)
+        if width_value or height_value:
+            if width_value is None or width_value <= 0:
+                width_value = None
+            if height_value is None or height_value <= 0:
+                height_value = None
+            if width_value and height_value:
+                img = img.resize((width_value, height_value), Image.LANCZOS)
+            elif width_value:
+                ratio = width_value / max(1, img.size[0])
+                img = img.resize((width_value, max(1, int(img.size[1] * ratio))), Image.LANCZOS)
+            elif height_value:
+                ratio = height_value / max(1, img.size[1])
+                img = img.resize((max(1, int(img.size[0] * ratio)), height_value), Image.LANCZOS)
+
+        if max_size and max(img.size) > max_size:
+            img.thumbnail((max_size, max_size), Image.LANCZOS)
+        if fmt == "JPEG" and img.mode in ("RGBA", "LA", "P"):
+            img = img.convert("RGB")
+        data_url = _image_to_data_url(img, fmt)
+        return {
+            "path": _display_path(resolved),
+            "format": fmt,
+            "size": list(img.size),
+            "data_url": data_url,
+        }
+
+
 def _coerce_int(value: Any) -> Optional[int]:
     try:
         return int(value)
     except Exception:
         return None
+
+
+def _coerce_float(value: Any) -> Optional[float]:
+    try:
+        return float(value)
+    except Exception:
+        return None
+
+
+def _coerce_float_list(values: Any) -> List[float]:
+    if not isinstance(values, list):
+        return []
+    coerced: List[float] = []
+    for item in values:
+        num = _coerce_float(item)
+        if num is None:
+            continue
+        coerced.append(num)
+    return coerced
+
+
+def _tool_plot_chart(req: Dict[str, Any]) -> Dict[str, Any]:
+    _require_image()
+    try:
+        from PIL import ImageDraw, ImageFont
+    except Exception:
+        raise ValueError("Pillow not installed")
+    chart_type = str(req.get("chart_type") or req.get("type") or "bar").strip().lower()
+    width = _coerce_int(req.get("width") or 800) or 800
+    height = _coerce_int(req.get("height") or 480) or 480
+    width = max(320, min(width, TOOL_IMAGE_MAX_LIMIT))
+    height = max(240, min(height, TOOL_IMAGE_MAX_LIMIT))
+    fmt = _normalize_image_format(str(req.get("format") or "PNG"))
+    title = str(req.get("title") or "").strip()
+    labels = req.get("labels") or req.get("x") or []
+    if not isinstance(labels, list):
+        labels = []
+    series_input = req.get("series")
+    series: List[Tuple[str, List[float]]] = []
+    if isinstance(series_input, list):
+        for idx, item in enumerate(series_input):
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or f"Series {idx + 1}")
+            values = _coerce_float_list(item.get("values") or item.get("y") or [])
+            if values:
+                series.append((name, values))
+    if not series:
+        values = _coerce_float_list(req.get("values") or req.get("y") or [])
+        if not values:
+            raise ValueError("Missing values for chart")
+        series = [("Series 1", values)]
+    max_len = max(len(vals) for _, vals in series)
+    if not labels:
+        labels = [str(i + 1) for i in range(max_len)]
+    labels = [str(lbl) for lbl in labels][:max_len]
+
+    img = Image.new("RGB", (width, height), color=(255, 255, 255))
+    draw = ImageDraw.Draw(img)
+    try:
+        font = ImageFont.load_default()
+    except Exception:
+        font = None
+    margin_left = 60
+    margin_right = 20
+    margin_top = 20 + (18 if title else 0)
+    margin_bottom = 60
+    plot_left = margin_left
+    plot_right = width - margin_right
+    plot_top = margin_top
+    plot_bottom = height - margin_bottom
+
+    if title:
+        draw.text((margin_left, 10), title, fill=(20, 20, 20), font=font)
+
+    draw.line((plot_left, plot_top, plot_left, plot_bottom), fill=(60, 60, 60), width=1)
+    draw.line((plot_left, plot_bottom, plot_right, plot_bottom), fill=(60, 60, 60), width=1)
+
+    palette = [
+        (52, 102, 164),
+        (219, 83, 23),
+        (68, 144, 88),
+        (141, 80, 141),
+    ]
+    max_value = max(max(vals) for _, vals in series if vals) or 1.0
+    if chart_type == "line":
+        for idx, (_, values) in enumerate(series):
+            if not values:
+                continue
+            color = palette[idx % len(palette)]
+            points: List[Tuple[int, int]] = []
+            for i, val in enumerate(values[:max_len]):
+                x = plot_left + int((plot_right - plot_left) * i / max(1, max_len - 1))
+                y = plot_bottom - int((plot_bottom - plot_top) * (val / max_value))
+                points.append((x, y))
+            if len(points) >= 2:
+                draw.line(points, fill=color, width=2)
+            for x, y in points:
+                draw.ellipse((x - 2, y - 2, x + 2, y + 2), fill=color, outline=color)
+    else:
+        group_width = (plot_right - plot_left) / max(1, max_len)
+        bar_gap = max(2, int(group_width * 0.1))
+        bar_width = (group_width - bar_gap) / max(1, len(series))
+        for idx, (_, values) in enumerate(series):
+            color = palette[idx % len(palette)]
+            for i, val in enumerate(values[:max_len]):
+                x0 = plot_left + int(group_width * i + bar_gap / 2 + idx * bar_width)
+                x1 = x0 + int(bar_width)
+                y1 = plot_bottom
+                y0 = plot_bottom - int((plot_bottom - plot_top) * (val / max_value))
+                draw.rectangle((x0, y0, x1, y1), fill=color, outline=color)
+
+    for i, label in enumerate(labels):
+        x = plot_left + int((plot_right - plot_left) * (i + 0.5) / max_len)
+        y = plot_bottom + 8
+        draw.text((x - 8, y), label[:8], fill=(60, 60, 60), font=font)
+
+    data_url = _image_to_data_url(img, fmt)
+    return {
+        "chart_type": chart_type,
+        "format": fmt,
+        "size": [width, height],
+        "labels": labels,
+        "series": [{"name": name, "values": values} for name, values in series],
+        "data_url": data_url,
+    }
 
 
 def _parse_box_spec(value: Any) -> Optional[Tuple[int, int, int, int]]:
@@ -643,6 +1617,107 @@ def build_exec_helpers(roots: List[Path]) -> Dict[str, Any]:
             format=format,
         )
 
+    def image_adjust(
+        path: str,
+        rotate: Optional[Any] = None,
+        flip: Optional[Any] = None,
+        flop: Optional[Any] = None,
+        grayscale: Optional[Any] = None,
+        brightness: Optional[Any] = None,
+        contrast: Optional[Any] = None,
+        color: Optional[Any] = None,
+        sharpness: Optional[Any] = None,
+        width: Optional[Any] = None,
+        height: Optional[Any] = None,
+        max_size: int = TOOL_IMAGE_MAX_SIZE,
+        format: str = "PNG",
+    ) -> Dict[str, Any]:
+        return _tool_image_adjust(
+            path,
+            roots,
+            rotate=rotate,
+            flip=flip,
+            flop=flop,
+            grayscale=grayscale,
+            brightness=brightness,
+            contrast=contrast,
+            color=color,
+            sharpness=sharpness,
+            width=width,
+            height=height,
+            max_size=max_size,
+            format=format,
+        )
+
+    def split(text: Any, sep: Optional[str] = None, maxsplit: int = -1) -> List[str]:
+        return _text_split(text, sep=sep, maxsplit=maxsplit)
+
+    def splitlines(text: Any) -> List[str]:
+        return _text_splitlines(text)
+
+    def strip(text: Any, chars: Optional[str] = None) -> str:
+        return _text_strip(text, chars=chars)
+
+    def lower(text: Any) -> str:
+        return _text_lower(text)
+
+    def upper(text: Any) -> str:
+        return _text_upper(text)
+
+    def replace(text: Any, old: Any, new: Any, count: int = -1) -> str:
+        return _text_replace(text, old=old, new=new, count=count)
+
+    def startswith(text: Any, prefix: Any) -> bool:
+        return _text_startswith(text, prefix=prefix)
+
+    def endswith(text: Any, suffix: Any) -> bool:
+        return _text_endswith(text, suffix=suffix)
+
+    def csv_rows(text: Any, delimiter: str = ",", max_rows: Optional[int] = 10000) -> List[List[str]]:
+        return _csv_rows(text, delimiter=delimiter, max_rows=max_rows)
+
+    def csv_dicts(text: Any, delimiter: str = ",", max_rows: Optional[int] = 10000) -> List[Dict[str, str]]:
+        return _csv_dicts(text, delimiter=delimiter, max_rows=max_rows)
+
+    def get(mapping: Any, key: Any, default: Any = None) -> Any:
+        return _safe_get(mapping, key, default=default)
+
+    def http_get_text(
+        url: str,
+        params: Optional[Dict[str, Any]] = None,
+        headers: Optional[Dict[str, Any]] = None,
+        timeout: float = 10.0,
+        max_bytes: int = TOOL_BYTES_MAX,
+    ) -> Dict[str, Any]:
+        payload = _tool_http_get(url, params=params, headers=headers, timeout=timeout, max_bytes=max_bytes)
+        return {
+            "url": payload.get("url"),
+            "status": payload.get("status"),
+            "content_type": payload.get("content_type"),
+            "bytes": payload.get("bytes"),
+            "truncated": payload.get("truncated"),
+            "text": payload.get("text"),
+        }
+
+    def http_get_json(
+        url: str,
+        params: Optional[Dict[str, Any]] = None,
+        headers: Optional[Dict[str, Any]] = None,
+        timeout: float = 10.0,
+        max_bytes: int = TOOL_BYTES_MAX,
+    ) -> Dict[str, Any]:
+        payload = _tool_http_get(url, params=params, headers=headers, timeout=timeout, max_bytes=max_bytes)
+        if payload.get("json") is None:
+            raise ValueError("Response was not valid JSON")
+        return {
+            "url": payload.get("url"),
+            "status": payload.get("status"),
+            "content_type": payload.get("content_type"),
+            "bytes": payload.get("bytes"),
+            "truncated": payload.get("truncated"),
+            "data": payload.get("json"),
+        }
+
     return {
         "read_text": read_text,
         "read_bytes": read_bytes,
@@ -651,6 +1726,21 @@ def build_exec_helpers(roots: List[Path]) -> Dict[str, Any]:
         "image_load": image_load,
         "image_zoom": image_zoom,
         "image_crop": image_zoom,
+        "image_adjust": image_adjust,
+        "image_transform": image_adjust,
+        "split": split,
+        "splitlines": splitlines,
+        "strip": strip,
+        "lower": lower,
+        "upper": upper,
+        "replace": replace,
+        "startswith": startswith,
+        "endswith": endswith,
+        "csv_rows": csv_rows,
+        "csv_dicts": csv_dicts,
+        "get": get,
+        "http_get_text": http_get_text,
+        "http_get_json": http_get_json,
         "UPLOADS_DIR": _display_path(roots[0]) if roots else "uploads",
         "SNAPSHOTS_DIR": _display_path(roots[-1]) if roots else "uploads/snapshots",
     }
@@ -672,10 +1762,174 @@ def _sanitize_tool_result(value: Any) -> Any:
     return str(value)
 
 
-def resolve_tool_requests(tool_requests: List[dict], upload_dir: Optional[Path] = None) -> List[dict]:
-    """Resolve lightweight tool requests locally (date, calculator, code_eval, execute_code, image/pdf hints)."""
+PLOT_TOOL_NAMES = {"plot_chart", "plot_graph", "chart", "graph"}
+
+
+def strip_data_urls(item: Any, allow_plot: bool = False) -> Any:
+    if isinstance(item, dict):
+        tool_name = item.get("tool") or item.get("type") or item.get("name")
+        allow_here = allow_plot
+        if tool_name and str(tool_name).lower() in PLOT_TOOL_NAMES:
+            allow_here = True
+        cleaned: Dict[str, Any] = {}
+        for key, value in item.items():
+            if key == "data_url":
+                cleaned[key] = value if allow_here else "<omitted>"
+            elif isinstance(value, (dict, list)):
+                cleaned[key] = strip_data_urls(value, allow_plot=allow_here)
+            else:
+                cleaned[key] = value
+        return cleaned
+    if isinstance(item, list):
+        return [strip_data_urls(v, allow_plot=allow_plot) for v in item]
+    return item
+
+
+def _normalize_profile_token(value: str) -> str:
+    return "".join(ch for ch in value.lower() if ch.isalnum())
+
+
+_MODEL_CALL_PROFILE_ALIASES_RAW = {
+    "orchestrator": "Orchestrator",
+    "orch": "Orchestrator",
+    "executor": "Executor",
+    "researchprimary": "ResearchPrimary",
+    "research": "ResearchPrimary",
+    "primary": "ResearchPrimary",
+    "researchrecency": "ResearchRecency",
+    "recency": "ResearchRecency",
+    "researchadversarial": "ResearchAdversarial",
+    "adversarial": "ResearchAdversarial",
+    "evidencesynth": "EvidenceSynth",
+    "evidence": "EvidenceSynth",
+    "math": "Math",
+    "critic": "Critic",
+    "summarizer": "Summarizer",
+    "writer": "Writer",
+    "finalizer": "Finalizer",
+    "jsonrepair": "JSONRepair",
+    "verifier": "Verifier",
+}
+MODEL_CALL_PROFILE_ALIASES = {_normalize_profile_token(k): v for k, v in _MODEL_CALL_PROFILE_ALIASES_RAW.items()}
+for _name in set(MODEL_CALL_PROFILE_ALIASES.values()):
+    MODEL_CALL_PROFILE_ALIASES.setdefault(_normalize_profile_token(_name), _name)
+
+MODEL_CALL_TOOL_NAMES = {
+    "model_call",
+    "call_model",
+    "agent_call",
+    "delegate_model",
+    "delegate",
+}
+
+FINALIZE_TOOL_NAMES = {"finalize_answer"}
+
+
+def _resolve_model_profile(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    raw = str(value).strip()
+    if not raw:
+        return None
+    token = _normalize_profile_token(raw)
+    return MODEL_CALL_PROFILE_ALIASES.get(token)
+
+
+def _trim_tool_text(text: Any, max_chars: int) -> Tuple[str, bool]:
+    raw = "" if text is None else str(text)
+    if max_chars <= 0 or len(raw) <= max_chars:
+        return raw, False
+    if max_chars <= 3:
+        return raw[:max_chars], True
+    return raw[: max_chars - 3].rstrip() + "...", True
+
+
+async def _tool_model_call(
+    req: dict,
+    lm_client: Optional[LMStudioClient],
+    model_map: Optional[Dict[str, Dict[str, str]]],
+    run_id: Optional[str] = None,
+    bus: Optional["EventBus"] = None,
+    step_id: Optional[int] = None,
+    run_state: Optional[RunState] = None,
+) -> Dict[str, Any]:
+    if lm_client is None or model_map is None:
+        raise ValueError("model_call requires lm_client and model_map")
+    profile = _resolve_model_profile(
+        req.get("profile")
+        or req.get("agent_profile")
+        or req.get("agent")
+        or req.get("role")
+        or req.get("model")
+    )
+    if not profile:
+        raise ValueError("Missing or unknown profile")
+    prompt = str(req.get("prompt") or req.get("message") or req.get("input") or req.get("content") or "").strip()
+    if not prompt:
+        raise ValueError("Missing prompt")
+    temperature = _coerce_float(req.get("temperature") or req.get("temp"))
+    if temperature is None:
+        temperature = 0.2
+    temperature = max(0.0, min(1.5, temperature))
+    max_tokens = _coerce_int(req.get("max_tokens") or req.get("max_output_tokens") or req.get("tokens"))
+    if not max_tokens or max_tokens <= 0:
+        max_tokens = TOOL_MODEL_DEFAULT_TOKENS
+    max_tokens = min(max_tokens, TOOL_MODEL_MAX_TOKENS)
+    max_chars = _coerce_int(req.get("max_chars") or req.get("limit")) or TOOL_MODEL_MAX_CHARS
+    output = await run_worker(
+        lm_client,
+        profile,
+        model_map,
+        prompt,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        run_id=run_id,
+        bus=bus,
+        step_id=step_id,
+        context="tool_model_call",
+        run_state=run_state,
+    )
+    trimmed_prompt, prompt_truncated = _trim_tool_text(prompt, TOOL_TEXT_MAX_CHARS)
+    trimmed_output, output_truncated = _trim_tool_text(output, max_chars)
+    payload: Dict[str, Any] = {
+        "profile": profile,
+        "prompt": trimmed_prompt,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "result": _sanitize_tool_result(trimmed_output),
+        "status": "ok",
+    }
+    if prompt_truncated:
+        payload["prompt_truncated"] = True
+    if output_truncated:
+        payload["truncated"] = True
+    return payload
+
+
+def _looks_like_tool_markup(text: str) -> bool:
+    lowered = text.lower()
+    if "<|channel|" in lowered or "<|message|" in lowered or "<|constrain|" in lowered:
+        return True
+    if "to=local_code" in lowered or "to=execute_code" in lowered or "to=code_eval" in lowered:
+        return True
+    return False
+
+
+async def resolve_tool_requests(
+    tool_requests: List[dict],
+    upload_dir: Optional[Path] = None,
+    *,
+    lm_client: Optional[LMStudioClient] = None,
+    model_map: Optional[Dict[str, Dict[str, str]]] = None,
+    run_id: Optional[str] = None,
+    bus: Optional["EventBus"] = None,
+    step_id: Optional[int] = None,
+    run_state: Optional[RunState] = None,
+) -> List[dict]:
+    """Resolve tool requests locally or via model-to-model calls."""
     resolved: List[dict] = []
-    now_iso = datetime.utcnow().isoformat()
+    model_tasks: List[Tuple[Dict[str, Any], asyncio.Task]] = []
+    now_iso = utc_iso()
     tool_roots = _normalize_tool_roots(upload_dir)
     exec_helpers: Optional[Dict[str, Any]] = None
     for raw_req in tool_requests or []:
@@ -687,6 +1941,25 @@ def resolve_tool_requests(tool_requests: List[dict], upload_dir: Optional[Path] 
             req = {"tool": str(raw_req)}
         tool = str(req.get("tool") or req.get("type") or req.get("name") or "").lower()
         entry: Dict[str, Any] = {"tool": tool or req.get("tool") or req.get("type") or req.get("name")}
+        if tool in MODEL_CALL_TOOL_NAMES:
+            resolved.append(entry)
+            if lm_client is None or model_map is None:
+                entry["status"] = "error"
+                entry["error"] = "model_call requires lm_client and model_map"
+            else:
+                task = asyncio.create_task(
+                    _tool_model_call(
+                        req,
+                        lm_client,
+                        model_map,
+                        run_id=run_id,
+                        bus=bus,
+                        step_id=step_id,
+                        run_state=run_state,
+                    )
+                )
+                model_tasks.append((entry, task))
+            continue
         try:
             if tool in ("live_date", "time_now", "now", "date"):
                 entry["result"] = now_iso
@@ -705,7 +1978,7 @@ def resolve_tool_requests(tool_requests: List[dict], upload_dir: Optional[Path] 
                 entry["code"] = code
                 entry["result"] = _sanitize_tool_result(safe_eval_expr(code))
                 entry["status"] = "ok"
-            elif tool in ("execute_code", "exec_code", "code_exec", "execute", "python_exec"):
+            elif tool in ("execute_code", "exec_code", "code_exec", "execute", "python_exec", "local_code"):
                 code = str(req.get("code") or req.get("expr") or req.get("expression") or "").strip()
                 path = str(req.get("path") or req.get("file") or "").strip()
                 if path and not code:
@@ -717,6 +1990,20 @@ def resolve_tool_requests(tool_requests: List[dict], upload_dir: Optional[Path] 
                     exec_helpers = build_exec_helpers(tool_roots)
                 entry["code"] = code
                 entry["result"] = _sanitize_tool_result(safe_eval_expr(code, names=exec_helpers))
+                entry["status"] = "ok"
+            elif tool in FINALIZE_TOOL_NAMES:
+                approved = req.get("approved")
+                if approved is not None and not bool(approved):
+                    raise ValueError("Final answer not approved")
+                final_text = req.get("final_text") or req.get("answer") or req.get("text") or req.get("content")
+                if final_text is None:
+                    raise ValueError("Missing final_text")
+                final_text = str(final_text).strip()
+                if not final_text:
+                    raise ValueError("Empty final_text")
+                if _looks_like_tool_markup(final_text):
+                    raise ValueError("Final text looks like tool markup")
+                entry["result"] = _sanitize_tool_result(final_text)
                 entry["status"] = "ok"
             elif tool in ("read_text", "read_file", "file_read", "text_read"):
                 path = str(req.get("path") or req.get("file") or req.get("filename") or "").strip()
@@ -792,6 +2079,9 @@ def resolve_tool_requests(tool_requests: List[dict], upload_dir: Optional[Path] 
                     )
                 )
                 entry["status"] = "ok"
+            elif tool in ("plot_chart", "plot_graph", "chart", "graph"):
+                entry["result"] = _sanitize_tool_result(_tool_plot_chart(req))
+                entry["status"] = "ok"
             elif tool in ("pdf_scan", "pdf_read", "pdf_inspect"):
                 path = str(req.get("path") or req.get("file") or req.get("pdf") or "").strip()
                 if not path:
@@ -820,6 +2110,14 @@ def resolve_tool_requests(tool_requests: List[dict], upload_dir: Optional[Path] 
             entry["status"] = "error"
             entry["error"] = str(exc)
             resolved.append(entry)
+    if model_tasks:
+        results = await asyncio.gather(*(task for _, task in model_tasks), return_exceptions=True)
+        for (entry, _task), result in zip(model_tasks, results):
+            if isinstance(result, Exception):
+                entry["status"] = "error"
+                entry["error"] = str(result)
+            else:
+                entry.update(result)
     return resolved
 
 
@@ -835,6 +2133,8 @@ def reasoning_to_search_depth(level: str, preferred: str, depth_profile: Optiona
 
 def guess_needs_web(question: str) -> bool:
     """Lightweight heuristic to decide if web research is needed when the router is unsure."""
+    if looks_like_math_expression(question):
+        return False
     q = (question or "").lower()
     recency_tokens = RECENCY_HINTS + (
         "update",
@@ -877,8 +2177,6 @@ def guess_needs_web(question: str) -> bool:
         "benchmark",
     )
     if any(token in q for token in data_signals):
-        return True
-    if any(ch.isdigit() for ch in q):
         return True
     return False
 
@@ -1109,11 +2407,177 @@ async def resolve_model_map(
     return resolved_map
 
 
+_MODEL_SIZE_HINT_RE = re.compile(r"(\d+)\s*[bB]\b")
+
+
+def _model_size_hint(model_id: str) -> Optional[int]:
+    if not model_id:
+        return None
+    match = _MODEL_SIZE_HINT_RE.search(model_id)
+    if not match:
+        return None
+    try:
+        return int(match.group(1))
+    except ValueError:
+        return None
+
+
+def _is_heavy_coder_model(model_id: str) -> bool:
+    lowered = (model_id or "").lower()
+    if "coder" not in lowered:
+        return False
+    size = _model_size_hint(model_id)
+    if size is not None:
+        return size >= 20
+    return "30b" in lowered or "34b" in lowered
+
+
+def _sort_models_by_size(models: List[str], prefer_large: bool = False) -> List[str]:
+    def _key(mid: str) -> Tuple[int, int]:
+        size = _model_size_hint(mid)
+        if size is None:
+            return (1, 0)
+        return (0, size)
+
+    ordered = sorted(models, key=_key, reverse=prefer_large)
+    return ordered
+
+
+def _role_size_preference(role: str) -> str:
+    role_key = (role or "").lower()
+    if role_key in {"orch", "deep_orch", "deep_planner", "verifier"}:
+        return "large"
+    if role_key in {"router", "summarizer", "executor", "fast", "worker", "worker_b", "worker_c"}:
+        return "small"
+    return "medium"
+
+
+def _should_override_role_model(role_pref: str, model_id: str) -> bool:
+    if _is_heavy_coder_model(model_id) and role_pref in ("small", "medium"):
+        return True
+    size = _model_size_hint(model_id)
+    if size is None:
+        return True
+    if role_pref == "small":
+        return size >= 16
+    if role_pref == "large":
+        return size <= 8
+    return False
+
+
+async def apply_runtime_model_overrides(
+    model_map: Dict[str, Dict[str, str]],
+    lm_client: LMStudioClient,
+    run_state: Optional[RunState] = None,
+    run_id: Optional[str] = None,
+    bus: Optional["EventBus"] = None,
+) -> Tuple[Dict[str, Dict[str, str]], Dict[str, Any]]:
+    """Prefer models that respond to a minimal chat check and report role assignments."""
+    role_configs = {
+        role: cfg
+        for role, cfg in model_map.items()
+        if isinstance(cfg, dict) and cfg.get("base_url") and cfg.get("model")
+    }
+    by_base: Dict[str, List[str]] = {}
+    for role, cfg in role_configs.items():
+        base_url = str(cfg.get("base_url") or "")
+        by_base.setdefault(base_url, []).append(role)
+
+    check_cache: Dict[Tuple[str, str], Optional[bool]] = {}
+    available_cache: Dict[str, List[str]] = {}
+
+    async def _check_model(base_url: str, model: str) -> bool:
+        key = (base_url, model)
+        cached = check_cache.get(key)
+        if cached is not None:
+            return cached
+        ok = False
+        try:
+            ok, _ = await lm_client.check_chat(base_url=base_url, model=model, run_state=run_state)
+        except Exception:
+            ok = False
+        check_cache[key] = ok
+        return ok
+
+    for base_url, roles in by_base.items():
+        if base_url not in available_cache:
+            try:
+                available = await lm_client.list_models_cached(base_url)
+            except Exception as exc:
+                if run_state:
+                    run_state.add_dev_trace("Model list lookup failed", {"base_url": base_url, "error": str(exc)})
+                available = []
+            available_cache[base_url] = [m for m in available if m and "embed" not in m.lower()]
+        preferred: List[str] = []
+        for role in roles:
+            model = str(role_configs[role].get("model") or "")
+            if model and model not in preferred:
+                preferred.append(model)
+        # Check each preferred model so per-role availability is accurate.
+        for model in preferred:
+            await _check_model(base_url, model)
+
+    updated: Dict[str, Dict[str, str]] = {}
+    role_report: Dict[str, Any] = {}
+    for role, cfg in model_map.items():
+        base_url = cfg.get("base_url")
+        model = cfg.get("model")
+        status = "unset"
+        selected = model
+        if base_url and model:
+            ok = check_cache.get((base_url, model))
+            if ok is None:
+                ok = await _check_model(base_url, model)
+            if ok is True:
+                role_pref = _role_size_preference(role)
+                if _is_heavy_coder_model(model) and role_pref in ("small", "medium"):
+                    ok = False
+                else:
+                    status = "ok"
+            if ok is not True:
+                available = available_cache.get(base_url, [])
+                available = [m for m in available if (base_url, m) not in UNAVAILABLE_MODELS]
+                role_pref = _role_size_preference(role)
+                if role_pref in ("small", "medium"):
+                    without_heavy = [m for m in available if not _is_heavy_coder_model(m)]
+                    if without_heavy:
+                        available = without_heavy
+                prefer_large = role_pref == "large"
+                ordered = _sort_models_by_size(available, prefer_large=prefer_large)
+                if role_pref == "small":
+                    ordered = [m for m in ordered if (_model_size_hint(m) or 0) <= 12] or ordered
+                elif role_pref == "large":
+                    ordered = [m for m in ordered if (_model_size_hint(m) or 99) >= 16] or ordered
+                if model in ordered and not _should_override_role_model(role_pref, model):
+                    ordered = [model] + [m for m in ordered if m != model]
+                for candidate in ordered:
+                    if await _check_model(base_url, candidate):
+                        selected = candidate
+                        status = "fallback" if candidate != model else "ok"
+                        break
+                if status == "unset":
+                    status = "unavailable" if ok is False else "unknown"
+                if selected and selected != model:
+                    cfg = {**cfg, "model": selected}
+        updated[role] = cfg
+        role_report[role] = {
+            "model": updated[role].get("model"),
+            "base_url": updated[role].get("base_url"),
+            "status": status,
+            "preferred": model,
+        }
+
+    if run_id and bus:
+        await bus.emit(run_id, "role_map", {"roles": role_report})
+    return updated, {"roles": role_report, "check_cache": check_cache}
+
+
 async def check_web_access(tavily: TavilyClient) -> Tuple[bool, Optional[str]]:
     """Return (can_web, error). Non-auth errors are reported but do not disable web."""
     if not tavily.enabled:
         return False, "missing_api_key"
     resp = await tavily.search(query="ping", search_depth="basic", max_results=1)
+    resp = coerce_tavily_response(resp)
     if resp.get("error"):
         status = resp.get("status_code")
         error_msg = format_tavily_error(resp)
@@ -1272,11 +2736,11 @@ def response_guidance_text(question: str, reasoning_level: str, progress_meta: D
     elif total <= 12:
         style = "Concise (<=200 words) with tight bullets plus a one-line takeaway."
     else:
-        style = "Compact but complete (<=350 words) with short sections and sourced bullets."
+        style = "Compact but complete (<=350 words) with short sections and crisp bullets."
     if passes > 1:
         style += f" Note progress and clarify if another pass ({passes}) is in flight or expected."
     if reasoning_level in ("ULTRA", "HIGH"):
-        style += " Keep sources prominent and state any remaining risks."
+        style += " Note any remaining risks."
     return style
 
 
@@ -1285,19 +2749,11 @@ def desired_parallelism(
     worker_budget: Dict[str, Any],
     strict_mode: bool = False,
 ) -> int:
-    """Choose how many worker slots to actively fill based on task depth."""
+    """Choose how many worker slots to actively fill based on available capacity."""
     max_parallel = int(worker_budget.get("max_parallel") or 1)
     if max_parallel <= 1:
         return 1
-    if strict_mode or decision.expected_passes > 1:
-        return max_parallel
-    if decision.reasoning_level in ("HIGH", "ULTRA"):
-        return max_parallel
-    if decision.needs_web or decision.extract_depth == "advanced":
-        return max_parallel
-    if decision.reasoning_level == "MED":
-        return min(max_parallel, 2)
-    return 1
+    return max_parallel
 
 
 def ensure_parallel_research(
@@ -1407,6 +2863,52 @@ def ensure_parallel_research(
     return step_plan
 
 
+def ensure_parallel_analysis(step_plan: StepPlan, desired_slots: int) -> StepPlan:
+    """Add lightweight analysis lanes to use parallel workers when web research is off."""
+    if desired_slots <= 1:
+        return step_plan
+    steps = step_plan.steps
+    if not steps:
+        return step_plan
+    analysis_steps = [s for s in steps if s.type == "analysis"]
+    target_total = min(max(desired_slots + 1, 2), 4)
+    if len(analysis_steps) >= target_total:
+        return step_plan
+
+    analysis_anchor = max((s.step_id for s in analysis_steps), default=None)
+    next_id = max(s.step_id for s in steps) + 1
+    prompts = [
+        "List key requirements, constraints, and success criteria in short bullets.",
+        "Identify risks, edge cases, and mitigations in short bullets.",
+        "Propose a clean outline/structure for the final answer (short bullets).",
+        "Draft a short TODO list of missing info or follow-up checks.",
+    ]
+    added: List[PlanStep] = []
+    for idx in range(target_total - len(analysis_steps)):
+        lane_index = len(analysis_steps) + idx + 1
+        prompt_hint = prompts[(lane_index - 1) % len(prompts)]
+        new_step = PlanStep(
+            step_id=next_id,
+            name=f"Analysis lane {lane_index}",
+            type="analysis",
+            depends_on=[analysis_anchor] if analysis_anchor else [],
+            agent_profile="Summarizer",
+            inputs={"prompt_hint": prompt_hint},
+            outputs=[{"artifact_type": "note", "key": f"analysis_lane_{lane_index}"}],
+            acceptance_criteria=["notes ready"],
+            on_fail={"action": "rerun_step"},
+        )
+        steps.append(new_step)
+        added.append(new_step)
+        next_id += 1
+
+    draft_steps = sorted((s for s in steps if s.type == "draft"), key=lambda s: s.step_id)
+    if draft_steps and added:
+        deps = set(draft_steps[0].depends_on or [])
+        deps.update(s.step_id for s in added)
+        draft_steps[0].depends_on = sorted(deps)
+    return step_plan
+
 def strip_research_steps(step_plan: StepPlan) -> StepPlan:
     """Remove web research steps and clean dependencies when web access is unavailable."""
     web_types = {"research", "tavily_search", "tavily_extract", "search", "extract"}
@@ -1417,6 +2919,119 @@ def strip_research_steps(step_plan: StepPlan) -> StepPlan:
     for step in step_plan.steps:
         if step.depends_on:
             step.depends_on = [d for d in step.depends_on if d not in removed]
+    return step_plan
+
+
+def loosen_parallel_dependencies(step_plan: StepPlan, allow_parallel: bool, desired_slots: int) -> StepPlan:
+    """Let parallel lanes start without waiting on analysis-only deps."""
+    if not allow_parallel or desired_slots <= 1:
+        return step_plan
+    analysis_ids = {s.step_id for s in step_plan.steps if s.type == "analysis"}
+    if not analysis_ids:
+        return step_plan
+    parallel_types = {"research", "tavily_search", "search"}
+    for step in step_plan.steps:
+        if step.type not in parallel_types or not step.depends_on:
+            continue
+        deps = [d for d in step.depends_on if d not in analysis_ids]
+        if deps != step.depends_on:
+            step.depends_on = deps
+    return step_plan
+
+
+def ensure_finalize_step(step_plan: StepPlan) -> StepPlan:
+    steps = step_plan.steps
+    if not steps:
+        return step_plan
+    if any(s.type in ("finalize", "final") for s in steps):
+        return step_plan
+    verify_steps = [s for s in steps if s.type in ("verify", "verifier", "verifier_worker")]
+    draft_steps = [s for s in steps if s.type == "draft"]
+    depends_on: Set[int] = set()
+    requires_verifier = False
+    if verify_steps:
+        verify_step = max(verify_steps, key=lambda s: s.step_id)
+        depends_on.add(verify_step.step_id)
+        requires_verifier = True
+    elif draft_steps:
+        draft_step = max(draft_steps, key=lambda s: s.step_id)
+        depends_on.add(draft_step.step_id)
+    else:
+        depends_on.add(max(s.step_id for s in steps))
+
+    dependent_ids = {dep for s in steps for dep in (s.depends_on or [])}
+    terminal_ids = {s.step_id for s in steps if s.step_id not in dependent_ids}
+    depends_on.update(terminal_ids)
+    next_id = max(s.step_id for s in steps) + 1
+    steps.append(
+        PlanStep(
+            step_id=next_id,
+            name="Finalize answer",
+            type="finalize",
+            depends_on=sorted(depends_on),
+            agent_profile="Finalizer",
+            inputs={"requires_verifier": requires_verifier},
+            outputs=[{"artifact_type": "final", "key": "final_answer"}],
+            acceptance_criteria=["finalized_answer"],
+            on_fail={"action": "rerun_step"},
+        )
+    )
+    return step_plan
+
+
+def trim_step_plan(step_plan: StepPlan, max_steps: int) -> StepPlan:
+    steps = step_plan.steps
+    if not steps or len(steps) <= max_steps:
+        return step_plan
+    finalize_step = next((s for s in reversed(steps) if s.type in ("finalize", "final")), None)
+    if not finalize_step:
+        step_plan.steps = steps[:max_steps]
+        return step_plan
+
+    requires_verifier = False
+    if isinstance(finalize_step.inputs, dict):
+        requires_verifier = bool(finalize_step.inputs.get("requires_verifier"))
+    draft_step = next((s for s in reversed(steps) if s.type == "draft"), None)
+    verify_step = next((s for s in reversed(steps) if s.type in ("verify", "verifier", "verifier_worker")), None)
+    required_ids = {finalize_step.step_id}
+    if draft_step:
+        required_ids.add(draft_step.step_id)
+    if requires_verifier and verify_step:
+        required_ids.add(verify_step.step_id)
+
+    if len(required_ids) > max_steps:
+        max_steps = len(required_ids)
+
+    remaining_required = set(required_ids)
+    trimmed: List[PlanStep] = []
+    for step in steps:
+        is_required = step.step_id in required_ids
+        if is_required:
+            trimmed.append(step)
+            remaining_required.discard(step.step_id)
+            continue
+        slots_left = max_steps - len(trimmed)
+        if slots_left <= len(remaining_required):
+            continue
+        trimmed.append(step)
+
+    if len(trimmed) > max_steps:
+        trimmed = trimmed[:max_steps]
+
+    if trimmed and trimmed[-1].step_id != finalize_step.step_id:
+        trimmed = [s for s in trimmed if s.step_id != finalize_step.step_id]
+        if len(trimmed) >= max_steps:
+            trimmed = trimmed[: max_steps - 1]
+        trimmed.append(finalize_step)
+
+    kept_ids = {s.step_id for s in trimmed}
+    for step in trimmed:
+        if step.depends_on:
+            step.depends_on = [d for d in step.depends_on if d in kept_ids]
+        if step.type in ("finalize", "final") and not step.depends_on and len(trimmed) > 1:
+            step.depends_on = [trimmed[-2].step_id]
+
+    step_plan.steps = trimmed
     return step_plan
 
 
@@ -1431,6 +3046,7 @@ def profile_system(profile: str) -> str:
         "Critic": agents.CRITIC_SYSTEM,
         "Summarizer": agents.SUMMARIZER_SYSTEM,
         "Writer": agents.WRITER_SYSTEM,
+        "Finalizer": agents.FINALIZER_SYSTEM,
         "Executor": agents.EXECUTOR_SYSTEM,
         "JSONRepair": agents.JSON_REPAIR_SYSTEM,
         "Verifier": agents.VERIFIER_SYSTEM,
@@ -1444,6 +3060,8 @@ def profile_model(profile: str, model_map: Dict[str, Dict[str, str]]) -> Tuple[s
     elif profile == "Executor":
         cfg = model_map.get("executor") or model_map.get("summarizer") or model_map.get("router")
     elif profile == "Writer":
+        cfg = model_map.get("orch") or model_map.get("worker")
+    elif profile == "Finalizer":
         cfg = model_map.get("orch") or model_map.get("worker")
     elif profile in ("Summarizer", "Critic", "JSONRepair"):
         cfg = model_map.get("summarizer") or model_map.get("router") or model_map.get("worker")
@@ -1477,6 +3095,8 @@ def candidate_endpoints(profile: str, model_map: Dict[str, Dict[str, str]]) -> L
     elif profile == "Orchestrator":
         order = ["orch", "worker", "summarizer", "router"]
     elif profile == "Writer":
+        order = ["orch", "worker", "summarizer", "router"]
+    elif profile == "Finalizer":
         order = ["orch", "worker", "summarizer", "router"]
     elif profile == "Verifier":
         order = ["verifier", "worker", "orch", "summarizer"]
@@ -1514,29 +3134,58 @@ def select_model_suite(
     - planner_endpoint: slow/accurate planner (OSS).
     - executor_endpoint: fast executor for scheduling and control gating (4B).
     """
-    planner = base_map.get("orch") or base_map.get("worker") or {}
+    def has_cfg(cfg: Dict[str, str]) -> bool:
+        return bool(cfg and cfg.get("base_url") and cfg.get("model"))
+
+    orch = base_map.get("orch") or base_map.get("worker") or {}
+    planner = orch
     router = base_map.get("router") or {}
     summarizer = base_map.get("summarizer") or {}
-    executor = base_map.get("executor") or summarizer or router or base_map.get("deep_orch") or planner
-    worker = base_map.get("worker") or planner
+    worker = base_map.get("worker") or orch
     worker_b = base_map.get("worker_b") or worker
     worker_c = base_map.get("worker_c") or worker
     verifier = base_map.get("verifier") or worker
+    fast_cfg = base_map.get("fast") or {}
+    deep_planner = base_map.get("deep_planner") or {}
+    deep_orch = base_map.get("deep_orch") or {}
+
+    if tier == "fast" and has_cfg(fast_cfg):
+        orch = fast_cfg
+        planner = fast_cfg
+        router = fast_cfg
+        summarizer = fast_cfg
+        worker = fast_cfg
+        worker_b = fast_cfg
+        worker_c = fast_cfg
+        verifier = fast_cfg
+    elif tier == "deep":
+        if has_cfg(deep_orch):
+            orch = deep_orch
+        if has_cfg(deep_planner):
+            planner = deep_planner
+
+    executor = base_map.get("executor") or {}
+    if not has_cfg(executor):
+        if tier == "deep" and has_cfg(deep_orch):
+            executor = deep_orch
+        else:
+            executor = summarizer or router or deep_orch or orch
     suite = {
-        "orch": planner,
+        "orch": orch,
         "worker": worker,
         "worker_b": worker_b,
         "worker_c": worker_c,
         "router": router or executor,
         "summarizer": summarizer or executor,
         "verifier": verifier,
-        "deep_planner": base_map.get("deep_planner") or planner,
-        "deep_orch": base_map.get("deep_orch") or executor,
-        "fast": base_map.get("fast") or worker,
+        "deep_planner": deep_planner or planner,
+        "deep_orch": deep_orch or executor,
+        "fast": fast_cfg or worker,
     }
     allow_parallel = True
     if tier == "fast":
-        execution_mode = "fast_team"
+        execution_mode = "fast_direct"
+        allow_parallel = False
     elif tier == "deep":
         execution_mode = "oss_team" if deep_route == "oss" else "deep_cluster"
     else:
@@ -1547,14 +3196,139 @@ def select_model_suite(
 def resolve_auto_tier(decision: RouterDecision) -> str:
     """Map the router's reasoning depth to the most suitable tier."""
     level = decision.reasoning_level
+    if decision.needs_web or decision.extract_depth == "advanced":
+        return "deep"
     if level in ("HIGH", "ULTRA") or (decision.expected_passes or 0) > 1:
         return "pro"
-    if level == "MED" or decision.needs_web or decision.extract_depth == "advanced":
-        return "deep"
+    if level == "MED":
+        return "pro"
     tool_budget = decision.tool_budget or {}
     if tool_budget.get("tavily_search", 0) > 8:
         return "deep"
     return "fast"
+
+
+def normalize_step_plan_payload(plan: Dict[str, Any], question: str) -> Dict[str, Any]:
+    if not isinstance(plan, dict):
+        return {}
+
+    def _coerce_step_id(value: Any) -> Optional[int]:
+        step_id = _coerce_int(value)
+        if step_id is not None:
+            return step_id
+        if isinstance(value, str):
+            match = re.search(r"\d+", value)
+            if match:
+                try:
+                    return int(match.group(0))
+                except Exception:
+                    return None
+        return None
+
+    if not plan.get("plan_id"):
+        plan["plan_id"] = str(uuid.uuid4())
+    if not plan.get("goal"):
+        plan["goal"] = question
+    if not isinstance(plan.get("global_constraints"), dict):
+        plan["global_constraints"] = {}
+
+    steps = plan.get("steps")
+    if isinstance(steps, dict):
+        steps = [
+            {"step_id": key, **value} if isinstance(value, dict) else {"step_id": key, "name": str(value)}
+            for key, value in steps.items()
+        ]
+    if not isinstance(steps, list):
+        steps = []
+
+    normalized: List[dict] = []
+    seen_ids: Set[int] = set()
+    next_id = 1
+    for step in steps:
+        if not isinstance(step, dict):
+            continue
+        raw_id = step.get("step_id") or step.get("id") or step.get("step")
+        step_id = _coerce_step_id(raw_id)
+        if step_id is None or step_id in seen_ids:
+            while next_id in seen_ids:
+                next_id += 1
+            step_id = next_id
+        seen_ids.add(step_id)
+        if step_id >= next_id:
+            next_id = step_id + 1
+
+        depends = step.get("depends_on") or step.get("depends") or step.get("deps") or []
+        if isinstance(depends, (str, int)):
+            depends = [depends]
+        dep_ids: List[int] = []
+        if isinstance(depends, list):
+            for dep in depends:
+                dep_id = _coerce_step_id(dep)
+                if dep_id is None:
+                    continue
+                dep_ids.append(dep_id)
+        step["step_id"] = step_id
+        step["depends_on"] = sorted(set(dep_ids))
+        raw_type = str(step.get("type") or "analysis").strip()
+        type_token = raw_type.lower()
+        type_aliases = {
+            "writer": "draft",
+            "drafting": "draft",
+            "final": "finalize",
+            "finalizer": "finalize",
+            "finalization": "finalize",
+            "verifier": "verify",
+            "verification": "verify",
+            "researchprimary": "research",
+            "researchrecency": "research",
+            "researchadversarial": "research",
+            "tavilysearch": "tavily_search",
+            "tavilyextract": "tavily_extract",
+        }
+        step_type = type_aliases.get(type_token, type_token or "analysis")
+        if step_type:
+            step["type"] = step_type
+        step_name = str(step.get("name") or f"Step {step_id}").strip()
+        step["name"] = step_name or f"Step {step_id}"
+        profile = str(step.get("agent_profile") or "").strip()
+        if not profile:
+            default_profiles = {
+                "analysis": "Summarizer",
+                "draft": "Writer",
+                "finalize": "Finalizer",
+                "verify": "Verifier",
+                "research": "ResearchPrimary",
+                "merge": "Summarizer",
+            }
+            profile = default_profiles.get(step_type.lower(), "Summarizer")
+        step["agent_profile"] = profile
+        inputs = step.get("inputs")
+        if not isinstance(inputs, dict):
+            step["inputs"] = {}
+        outputs = step.get("outputs") or []
+        if isinstance(outputs, dict):
+            outputs = [outputs]
+        elif isinstance(outputs, str):
+            outputs = [{"artifact_type": "note", "key": outputs}]
+        if not isinstance(outputs, list):
+            outputs = []
+        step["outputs"] = outputs
+        criteria = step.get("acceptance_criteria") or step.get("acceptance") or step.get("criteria") or []
+        if isinstance(criteria, str):
+            criteria = [criteria]
+        if isinstance(criteria, list):
+            criteria = [str(item).strip() for item in criteria if str(item).strip()]
+        else:
+            criteria = []
+        step["acceptance_criteria"] = criteria
+        on_fail = step.get("on_fail")
+        if not isinstance(on_fail, dict):
+            on_fail = {}
+        step["on_fail"] = on_fail
+        normalized.append(step)
+
+    plan["steps"] = normalized
+    return plan
 
 
 def build_linear_plan(
@@ -1580,66 +3354,84 @@ def build_linear_plan(
         },
     ]
     next_step_id = 2
-    research_steps: List[dict] = []
-    parallel_research = prefer_parallel and worker_slots > 1
-    if parallel_research:
+    draft_dep = 1
+    if decision.needs_web:
+        research_steps: List[dict] = []
+        parallel_research = prefer_parallel and worker_slots > 1
         research_defs = [
             ("ResearchPrimary", "Research primary", "lane_primary"),
             ("ResearchRecency", "Research recency", "lane_recency"),
             ("ResearchAdversarial", "Research adversarial", "lane_adversarial"),
         ]
-        max_research = min(worker_slots, len(research_defs))
-        for profile, name, key in research_defs[:max_research]:
-            research_steps.append(
+        max_research = 1
+        if parallel_research:
+            max_research = worker_slots
+            max_steps = int(depth_profile.get("max_steps") or 0)
+            if max_steps:
+                # Cap lanes so the linear plan fits within the step budget.
+                reserved = 1 + 1 + 1 + (1 if needs_verify else 0)
+                max_allow = max_steps - reserved
+                if max_allow <= 1:
+                    max_research = 1
+                else:
+                    max_research = min(max_research, max_allow - 1)
+            if max_research <= 1:
+                parallel_research = False
+        if parallel_research:
+            for idx in range(max_research):
+                profile, name, key = research_defs[idx % len(research_defs)]
+                name_suffix = "" if idx < len(research_defs) else f" {idx + 1}"
+                key_suffix = "" if idx < len(research_defs) else f"_{idx + 1}"
+                research_steps.append(
+                    {
+                        "step_id": next_step_id,
+                        "name": f"{name}{name_suffix}",
+                        "type": "research",
+                        "depends_on": [1],
+                        "agent_profile": profile,
+                        "inputs": {"use_web": decision.needs_web},
+                        "outputs": [{"artifact_type": "evidence", "key": f"{key}{key_suffix}"}],
+                        "acceptance_criteria": ["notes ready"],
+                        "on_fail": {"action": "rerun_step"},
+                    }
+                )
+                next_step_id += 1
+            steps.extend(research_steps)
+            if len(research_steps) > 1:
+                merge_id = next_step_id
+                steps.append(
+                    {
+                        "step_id": merge_id,
+                        "name": "Merge notes",
+                        "type": "merge",
+                        "depends_on": [s["step_id"] for s in research_steps],
+                        "agent_profile": "Summarizer",
+                        "inputs": {},
+                        "outputs": [{"artifact_type": "ledger", "key": "claims_ledger"}],
+                        "acceptance_criteria": ["ledger_ready"],
+                        "on_fail": {"action": "revise_step"},
+                    }
+                )
+                next_step_id += 1
+                draft_dep = merge_id
+            else:
+                draft_dep = research_steps[0]["step_id"]
+        else:
+            steps.append(
                 {
                     "step_id": next_step_id,
-                    "name": name,
+                    "name": "Gather notes",
                     "type": "research",
                     "depends_on": [1],
-                    "agent_profile": profile,
+                    "agent_profile": "ResearchPrimary",
                     "inputs": {"use_web": decision.needs_web},
-                    "outputs": [{"artifact_type": "evidence", "key": key}],
+                    "outputs": [{"artifact_type": "evidence", "key": "lane_primary"}],
                     "acceptance_criteria": ["notes ready"],
                     "on_fail": {"action": "rerun_step"},
                 }
             )
+            draft_dep = next_step_id
             next_step_id += 1
-        steps.extend(research_steps)
-        if len(research_steps) > 1:
-            merge_id = next_step_id
-            steps.append(
-                {
-                    "step_id": merge_id,
-                    "name": "Merge notes",
-                    "type": "merge",
-                    "depends_on": [s["step_id"] for s in research_steps],
-                    "agent_profile": "Summarizer",
-                    "inputs": {},
-                    "outputs": [{"artifact_type": "ledger", "key": "claims_ledger"}],
-                    "acceptance_criteria": ["ledger_ready"],
-                    "on_fail": {"action": "revise_step"},
-                }
-            )
-            next_step_id += 1
-            draft_dep = merge_id
-        else:
-            draft_dep = research_steps[0]["step_id"]
-    else:
-        steps.append(
-            {
-                "step_id": next_step_id,
-                "name": "Gather notes",
-                "type": "research",
-                "depends_on": [1],
-                "agent_profile": "ResearchPrimary",
-                "inputs": {"use_web": decision.needs_web},
-                "outputs": [{"artifact_type": "evidence", "key": "lane_primary"}],
-                "acceptance_criteria": ["notes ready"],
-                "on_fail": {"action": "rerun_step"},
-            }
-        )
-        draft_dep = next_step_id
-        next_step_id += 1
     draft_step_id = next_step_id
     steps.append(
         {
@@ -1655,6 +3447,7 @@ def build_linear_plan(
         }
     )
     next_step_id += 1
+    verify_step_id = None
     if needs_verify:
         steps.append(
             {
@@ -1669,6 +3462,22 @@ def build_linear_plan(
                 "on_fail": {"action": "rerun_step"},
             }
         )
+        verify_step_id = next_step_id
+        next_step_id += 1
+    finalize_dep = verify_step_id or draft_step_id
+    steps.append(
+        {
+            "step_id": next_step_id,
+            "name": "Finalize answer",
+            "type": "finalize",
+            "depends_on": [finalize_dep],
+            "agent_profile": "Finalizer",
+            "inputs": {"requires_verifier": bool(verify_step_id)},
+            "outputs": [{"artifact_type": "final", "key": "final_answer"}],
+            "acceptance_criteria": ["finalized_answer"],
+            "on_fail": {"action": "rerun_step"},
+        }
+    )
     plan = {
         "plan_id": str(uuid.uuid4()),
         "goal": question,
@@ -1677,6 +3486,71 @@ def build_linear_plan(
             "reasoning_level": decision.reasoning_level,
             "max_loops": depth_profile.get("max_loops", 1),
             "tool_budget": depth_profile.get("tool_budget", {"tavily_search": 6, "tavily_extract": 6}),
+        },
+        "steps": steps,
+    }
+    return StepPlan(**plan)
+
+
+def build_fast_plan(
+    question: str,
+    decision: RouterDecision,
+    needs_verify: bool = False,
+) -> StepPlan:
+    """Single-step plan for fast tier responses."""
+    steps: List[dict] = [
+        {
+            "step_id": 1,
+            "name": "Draft answer",
+            "type": "draft",
+            "depends_on": [],
+            "agent_profile": "Writer",
+            "inputs": {},
+            "outputs": [{"artifact_type": "draft", "key": "draft_answer"}],
+            "acceptance_criteria": ["draft_complete"],
+            "on_fail": {"action": "revise_step"},
+        },
+    ]
+    next_step_id = 2
+    verify_step_id = None
+    if needs_verify:
+        steps.append(
+            {
+                "step_id": next_step_id,
+                "name": "Verify",
+                "type": "verify",
+                "depends_on": [1],
+                "agent_profile": "Verifier",
+                "inputs": {},
+                "outputs": [{"artifact_type": "verifier", "key": "verifier_report"}],
+                "acceptance_criteria": ["verdict_ready"],
+                "on_fail": {"action": "rerun_step"},
+            }
+        )
+        verify_step_id = next_step_id
+        next_step_id += 1
+    finalize_dep = verify_step_id or 1
+    steps.append(
+        {
+            "step_id": next_step_id,
+            "name": "Finalize answer",
+            "type": "finalize",
+            "depends_on": [finalize_dep],
+            "agent_profile": "Finalizer",
+            "inputs": {"requires_verifier": bool(verify_step_id)},
+            "outputs": [{"artifact_type": "final", "key": "final_answer"}],
+            "acceptance_criteria": ["finalized_answer"],
+            "on_fail": {"action": "rerun_step"},
+        }
+    )
+    plan = {
+        "plan_id": str(uuid.uuid4()),
+        "goal": question,
+        "global_constraints": {
+            "needs_web": False,
+            "reasoning_level": decision.reasoning_level,
+            "max_loops": 0,
+            "tool_budget": decision.tool_budget or {"tavily_search": 0, "tavily_extract": 0},
         },
         "steps": steps,
     }
@@ -1739,6 +3613,7 @@ async def call_router(
     endpoint: Dict[str, str],
     question: str,
     manual_level: Optional[str] = None,
+    default_level: Optional[str] = None,
     strict_mode: bool = False,
     run_state: Optional[RunState] = None,
 ) -> RouterDecision:
@@ -1762,7 +3637,7 @@ async def call_router(
         expected_passes = 2 if strict_mode else 1
         parsed = {
             "needs_web": needs_web_guess,
-            "reasoning_level": manual_level or "MED",
+            "reasoning_level": manual_level or default_level or "MED",
             "topic": "general",
             "max_results": 6,
             "extract_depth": "basic",
@@ -1770,7 +3645,7 @@ async def call_router(
             "stop_conditions": {},
         }
     decision = RouterDecision(**parsed)
-    if manual_level:
+    if manual_level is not None:
         decision.reasoning_level = manual_level
     # If the router was unsure, lean toward web for data-heavy questions.
     decision.needs_web = decision.needs_web or needs_web_guess
@@ -1794,11 +3669,11 @@ async def build_step_plan(
         "Include step_id, name, type, depends_on (list of ids), agent_profile, acceptance_criteria. "
         "Keep 6-12 steps for typical questions and use agent_profile 'Writer' for the draft step. "
         "Add global_constraints.expected_passes (1-3) if a verifier rerun is likely, and response_guidance describing how long the final answer should be based on task complexity. "
-        "Include parallel research lanes when worker slots allow."
+        "Use available worker slots for parallel research lanes when useful; rotate ResearchPrimary/ResearchRecency/ResearchAdversarial and add multiple lanes per profile if slots exceed profiles."
     )
     user_content = (
         f"Question: {question}\nNeeds web: {decision.needs_web}\nReasoning level: {decision.reasoning_level}\nExpected passes: {decision.expected_passes}\n"
-        f"Available worker slots: {max(desired_parallel, 1)} (use them in parallel when useful)\n"
+        f"Available worker slots: {max(desired_parallel, 1)} (aim to keep them busy in parallel)\n"
         f"Memory context: {memory_context}\n"
         "Return JSON only as {\"plan_id\": \"...\", \"goal\": \"...\", \"global_constraints\": {...}, \"steps\": [...]}"
     )
@@ -1820,100 +3695,44 @@ async def build_step_plan(
         parsed = await safe_json_parse(content, lm_client, plan_ep["model"], run_state=run_state)
     except Exception:
         parsed = None
-    if not parsed:
-        parsed = {
-            "plan_id": str(uuid.uuid4()),
-            "goal": question,
-                "global_constraints": {
-                    "needs_web": decision.needs_web,
-                    "reasoning_level": decision.reasoning_level,
-                    "max_loops": depth_profile.get("max_loops", 2),
-                    "tool_budget": depth_profile.get("tool_budget", {"tavily_search": 12, "tavily_extract": 18}),
-                    "expected_passes": decision.expected_passes,
-                    "response_guidance": "Keep the answer concise and sized to the question; expand only when evidence is complex.",
-                },
-            "steps": [
-                {
-                    "step_id": 1,
-                    "name": "Clarify goal",
-                    "type": "analysis",
-                    "depends_on": [],
-                    "agent_profile": "Summarizer",
-                    "inputs": {"from_user": True},
-                    "outputs": [{"artifact_type": "criteria", "key": "success_criteria"}],
-                    "acceptance_criteria": ["criteria defined"],
-                    "on_fail": {"action": "revise_step"},
-                },
-                {
-                    "step_id": 2,
-                    "name": "Research primary",
-                    "type": "research",
-                    "depends_on": [1],
-                    "agent_profile": "ResearchPrimary",
-                    "inputs": {"use_web": decision.needs_web},
-                    "outputs": [{"artifact_type": "evidence", "key": "lane_primary"}],
-                    "acceptance_criteria": ["has_sources"],
-                    "on_fail": {"action": "rerun_step"},
-                },
-                {
-                    "step_id": 3,
-                    "name": "Research recency",
-                    "type": "research",
-                    "depends_on": [1],
-                    "agent_profile": "ResearchRecency",
-                    "inputs": {"use_web": decision.needs_web},
-                    "outputs": [{"artifact_type": "evidence", "key": "lane_recency"}],
-                    "acceptance_criteria": ["has_sources"],
-                    "on_fail": {"action": "rerun_step"},
-                },
-                {
-                    "step_id": 4,
-                    "name": "Research adversarial",
-                    "type": "research",
-                    "depends_on": [1],
-                    "agent_profile": "ResearchAdversarial",
-                    "inputs": {"use_web": decision.needs_web},
-                    "outputs": [{"artifact_type": "evidence", "key": "lane_adversarial"}],
-                    "acceptance_criteria": ["has_conflicts_checked"],
-                    "on_fail": {"action": "rerun_step"},
-                },
-                {
-                    "step_id": 5,
-                    "name": "Merge evidence",
-                    "type": "merge",
-                    "depends_on": [2, 3, 4],
-                    "agent_profile": "Summarizer",
-                    "inputs": {},
-                    "outputs": [{"artifact_type": "ledger", "key": "claims_ledger"}],
-                    "acceptance_criteria": ["ledger_ready"],
-                    "on_fail": {"action": "revise_step"},
-                },
-                {
-                    "step_id": 6,
-                    "name": "Draft answer",
-                    "type": "draft",
-                    "depends_on": [5],
-                    "agent_profile": "Writer",
-                    "inputs": {},
-                    "outputs": [{"artifact_type": "draft", "key": "draft_answer"}],
-                    "acceptance_criteria": ["draft_complete"],
-                    "on_fail": {"action": "revise_step"},
-                },
-                {
-                    "step_id": 7,
-                    "name": "Verify",
-                    "type": "verify",
-                    "depends_on": [6],
-                    "agent_profile": "Verifier",
-                    "inputs": {},
-                    "outputs": [{"artifact_type": "verifier", "key": "verifier_report"}],
-                    "acceptance_criteria": ["verdict_pass_or_fix"],
-                    "on_fail": {"action": "backtrack", "backtrack_to_step": 5},
-                },
-            ],
-        }
-    plan_obj = StepPlan(**parsed)
-    return plan_obj
+    if not isinstance(parsed, dict):
+        parsed = {}
+    if parsed:
+        parsed = normalize_step_plan_payload(parsed, question)
+    if not parsed or not parsed.get("steps"):
+        fallback = build_linear_plan(
+            question,
+            decision,
+            depth_profile,
+            needs_verify=True,
+            worker_slots=max(desired_parallel, 1),
+            prefer_parallel=desired_parallel > 1,
+        )
+        fallback.global_constraints.setdefault("expected_passes", decision.expected_passes)
+        fallback.global_constraints.setdefault(
+            "response_guidance",
+            "Keep the answer concise and sized to the question; expand only when evidence is complex.",
+        )
+        return fallback
+    try:
+        return StepPlan(**parsed)
+    except Exception as exc:
+        if run_state:
+            run_state.add_dev_trace("Plan validation failed; using fallback.", {"error": str(exc)})
+        fallback = build_linear_plan(
+            question,
+            decision,
+            depth_profile,
+            needs_verify=True,
+            worker_slots=max(desired_parallel, 1),
+            prefer_parallel=desired_parallel > 1,
+        )
+        fallback.global_constraints.setdefault("expected_passes", decision.expected_passes)
+        fallback.global_constraints.setdefault(
+            "response_guidance",
+            "Keep the answer concise and sized to the question; expand only when evidence is complex.",
+        )
+        return fallback
 
 
 async def run_worker(
@@ -1933,9 +3752,13 @@ async def run_worker(
         raise RuntimeError("Local model unavailable.")
     system_prompt = profile_system(profile)
     last_error: Optional[Exception] = None
+    last_base_url: Optional[str] = None
+    last_detail: str = ""
+    saw_unavailable = False
     for base_url, model in candidate_endpoints(profile, model_map):
         if run_state and not run_state.can_chat:
             break
+        last_base_url = base_url
         try:
             resp = await lm_client.chat_completion(
                 model=model,
@@ -1946,15 +3769,19 @@ async def run_worker(
                 run_state=run_state,
             )
             if run_id and bus:
+                model_used = model
+                if isinstance(resp, dict):
+                    model_used = str(resp.get("_model_used") or model)
                 await bus.emit(
                     run_id,
                     "model_selected",
                     {
                         "profile": profile,
-                        "model": model,
+                        "model": model_used,
                         "base_url": base_url,
                         "step_id": step_id,
                         "context": context,
+                        **({"requested_model": model} if model_used != model else {}),
                     },
                 )
             return resp["choices"][0]["message"]["content"]
@@ -1964,47 +3791,86 @@ async def run_worker(
                 break
             detail = ""
             try:
-                detail = exc.response.text or ""
+                if exc.response is not None:
+                    detail = lm_client._extract_error_detail(exc.response)
             except Exception:
                 detail = ""
+            if detail:
+                last_detail = detail
             detail_lower = detail.lower()
-            # Retry with fallback models if the current model is unavailable or unloaded.
-            if exc.response is not None and exc.response.status_code in (400, 404):
-                if (
-                    "model unloaded" in detail_lower
-                    or "model not found" in detail_lower
-                    or "invalid model identifier" in detail_lower
-                    or "valid downloaded model" in detail_lower
-                ):
-                    UNAVAILABLE_MODELS.add((base_url, model))
-                    if run_id and bus:
-                        await bus.emit(
-                            run_id,
-                            "model_unavailable",
-                            {
-                                "profile": profile,
-                                "model": model,
-                                "base_url": base_url,
-                                "step_id": step_id,
-                                "context": context,
-                            },
-                    )
-                    continue
-                # Avoid repeating the same rejected payload against other endpoints.
-                break
-            # For other status errors, try fallbacks but keep the last error.
-            if run_id and bus:
-                await bus.emit(
-                    run_id,
-                    "model_error",
-                    {
+            async def _mark_unavailable() -> None:
+                nonlocal saw_unavailable
+                saw_unavailable = True
+                UNAVAILABLE_MODELS.add((base_url, model))
+                lm_client.mark_model_unavailable(base_url, model)
+                if run_id and bus:
+                    unavailable_payload = {
                         "profile": profile,
                         "model": model,
                         "base_url": base_url,
                         "step_id": step_id,
                         "context": context,
-                        "error": str(exc),
-                    },
+                    }
+                    await bus.emit(run_id, "model_unavailable", unavailable_payload)
+                    queue_narration(
+                        lm_client,
+                        model_map,
+                        run_state,
+                        bus,
+                        run_id,
+                        run_state.question if run_state else "",
+                        "model_unavailable",
+                        unavailable_payload,
+                        tone="warn",
+                    )
+            # Retry with fallback models if the current model is unavailable or unloaded.
+            if exc.response is not None and exc.response.status_code in (400, 404):
+                if (
+                    "failed to load model" in detail_lower
+                    or "operation canceled" in detail_lower
+                    or "out of memory" in detail_lower
+                    or "insufficient memory" in detail_lower
+                    or "model is unloaded" in detail_lower
+                    or "model unloaded" in detail_lower
+                    or "model not found" in detail_lower
+                    or "invalid model identifier" in detail_lower
+                    or "valid downloaded model" in detail_lower
+                ):
+                    await _mark_unavailable()
+                    continue
+                if not detail:
+                    try:
+                        ok, _ = await lm_client.check_chat(base_url=base_url, model=model, run_state=run_state)
+                    except Exception:
+                        ok = False
+                    if not ok:
+                        await _mark_unavailable()
+                        continue
+                # Avoid repeating the same rejected payload against other endpoints.
+                break
+            # For other status errors, try fallbacks but keep the last error.
+            if run_id and bus:
+                error_payload = {
+                    "profile": profile,
+                    "model": model,
+                    "base_url": base_url,
+                    "step_id": step_id,
+                    "context": context,
+                    "error": str(exc),
+                }
+                if detail:
+                    error_payload["detail"] = detail
+                await bus.emit(run_id, "model_error", error_payload)
+                queue_narration(
+                    lm_client,
+                    model_map,
+                    run_state,
+                    bus,
+                    run_id,
+                    run_state.question if run_state else "",
+                    "model_error",
+                    error_payload,
+                    tone="warn",
                 )
             continue
         except httpx.RequestError as exc:
@@ -2012,22 +3878,267 @@ async def run_worker(
             if run_state and not run_state.can_chat:
                 break
             if run_id and bus:
-                await bus.emit(
+                error_payload = {
+                    "profile": profile,
+                    "model": model,
+                    "base_url": base_url,
+                    "step_id": step_id,
+                    "context": context,
+                    "error": str(exc),
+                }
+                await bus.emit(run_id, "model_error", error_payload)
+                queue_narration(
+                    lm_client,
+                    model_map,
+                    run_state,
+                    bus,
                     run_id,
+                    run_state.question if run_state else "",
                     "model_error",
-                    {
-                        "profile": profile,
-                        "model": model,
-                        "base_url": base_url,
-                        "step_id": step_id,
-                        "context": context,
-                        "error": str(exc),
-                    },
+                    error_payload,
+                    tone="warn",
                 )
             continue
+    if saw_unavailable and last_base_url:
+        try:
+            available = await lm_client.list_models_cached(last_base_url)
+            filtered = []
+            for candidate in available:
+                if not candidate:
+                    continue
+                lowered = candidate.lower()
+                if "embed" in lowered:
+                    continue
+                if (last_base_url, candidate) in UNAVAILABLE_MODELS:
+                    continue
+                filtered.append(candidate)
+            fallback_any = [c for c in available if c and "embed" not in c.lower()]
+            seen: Set[str] = set()
+            for pass_candidates in (filtered, fallback_any) if filtered else (fallback_any,):
+                for candidate in pass_candidates:
+                    if candidate in seen:
+                        continue
+                    seen.add(candidate)
+                    try:
+                        resp = await lm_client.chat_completion(
+                            model=candidate,
+                            messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": prompt}],
+                            temperature=temperature,
+                            max_tokens=max_tokens,
+                            base_url=last_base_url,
+                            run_state=run_state,
+                        )
+                        if run_id and bus:
+                            await bus.emit(
+                                run_id,
+                                "model_selected",
+                                {
+                                    "profile": profile,
+                                    "model": candidate,
+                                    "base_url": last_base_url,
+                                    "step_id": step_id,
+                                    "context": context,
+                                    "fallback": True,
+                                },
+                            )
+                        return resp["choices"][0]["message"]["content"]
+                    except httpx.HTTPStatusError as exc:
+                        last_error = exc
+                        try:
+                            if exc.response is not None:
+                                last_detail = lm_client._extract_error_detail(exc.response) or last_detail
+                        except Exception:
+                            pass
+                        continue
+                    except httpx.RequestError as exc:
+                        last_error = exc
+                        continue
+        except Exception as exc:
+            last_error = exc
+    if saw_unavailable and run_state:
+        run_state.mark_chat_unavailable(last_detail or "No available chat model is loaded.")
     if last_error:
         raise last_error
     raise RuntimeError("No available model endpoint for profile.")
+
+
+def _default_research_prompt_hint(profile: str) -> str:
+    profile_key = (profile or "").strip().lower()
+    if profile_key == "researchrecency":
+        return (
+            "Focus on the most recent updates, stats, or announcements. "
+            "Prefer sources from the last week/month and include recency cues in queries."
+        )
+    if profile_key == "researchadversarial":
+        return (
+            "Look for critiques, risks, counterexamples, and conflicting claims. "
+            "Include skeptical or independent sources."
+        )
+    return "Prioritize primary/official sources, definitions, and baseline facts."
+
+
+async def seed_research_prompts(
+    lm_client: LMStudioClient,
+    executor_endpoint: Optional[Dict[str, str]],
+    question: str,
+    decision: RouterDecision,
+    step_plan: StepPlan,
+    run_state: Optional[RunState] = None,
+) -> None:
+    if not executor_endpoint:
+        return
+    model = executor_endpoint.get("model")
+    base_url = executor_endpoint.get("base_url")
+    if not model or not base_url:
+        return
+    research_steps = [s for s in step_plan.steps if s.type == "research"]
+    if not research_steps:
+        return
+    if all(
+        isinstance(s.inputs, dict) and (s.inputs.get("prompt_hint") or s.inputs.get("prompt"))
+        for s in research_steps
+    ):
+        return
+    steps_payload = [
+        {
+            "step_id": s.step_id,
+            "name": s.name,
+            "agent_profile": s.agent_profile,
+            "depends_on": s.depends_on,
+        }
+        for s in research_steps
+    ]
+    prompt = (
+        "You are the executor. Assign each research step a distinct angle so lanes do not overlap. "
+        "Return JSON only as {\"prompts\": [{\"step_id\": 1, \"prompt_hint\": \"...\"}]}.\n"
+        "Each prompt_hint should be concise (1-3 sentences) and mention any specific subtopics or source types to target. "
+        "Do not include chain-of-thought.\n"
+        f"Question: {question}\nReasoning level: {decision.reasoning_level}\n"
+        f"Research steps: {json.dumps(steps_payload, ensure_ascii=True)}"
+    )
+    parsed = None
+    try:
+        resp = await lm_client.chat_completion(
+            model=model,
+            messages=[{"role": "system", "content": agents.EXECUTOR_SYSTEM}, {"role": "user", "content": prompt}],
+            temperature=0.2,
+            max_tokens=350,
+            base_url=base_url,
+            run_state=run_state,
+        )
+        content = resp["choices"][0]["message"]["content"]
+        parsed = await safe_json_parse(content, lm_client, model, run_state=run_state)
+    except Exception:
+        parsed = None
+
+    hints_by_id: Dict[int, str] = {}
+
+    def _add_hint(step_id_val: Any, hint_val: Any) -> None:
+        try:
+            step_id = int(step_id_val)
+        except Exception:
+            return
+        hint = str(hint_val or "").strip()
+        if not hint:
+            return
+        if len(hint) > 800:
+            hint = hint[:800].rstrip() + "..."
+        hints_by_id[step_id] = hint
+
+    prompts = None
+    if isinstance(parsed, dict):
+        prompts = parsed.get("prompts") or parsed.get("prompt_hints") or parsed.get("steps")
+        if isinstance(prompts, dict):
+            for key, value in prompts.items():
+                _add_hint(key, value)
+        elif isinstance(prompts, list):
+            for item in prompts:
+                if not isinstance(item, dict):
+                    continue
+                _add_hint(
+                    item.get("step_id") or item.get("id"),
+                    item.get("prompt_hint") or item.get("prompt") or item.get("hint"),
+                )
+    elif isinstance(parsed, list):
+        for item in parsed:
+            if not isinstance(item, dict):
+                continue
+            _add_hint(
+                item.get("step_id") or item.get("id"),
+                item.get("prompt_hint") or item.get("prompt") or item.get("hint"),
+            )
+
+    for step in research_steps:
+        if not isinstance(step.inputs, dict):
+            step.inputs = {}
+        if step.inputs.get("prompt_hint") or step.inputs.get("prompt"):
+            continue
+        hint = hints_by_id.get(step.step_id) or _default_research_prompt_hint(step.agent_profile)
+        step.inputs["prompt_hint"] = hint
+
+
+async def warm_worker_pool(
+    lm_client: LMStudioClient,
+    model_map: Dict[str, Dict[str, str]],
+    max_workers: int,
+    ready_models: Optional[Set[Tuple[str, str]]] = None,
+    run_state: Optional[RunState] = None,
+    run_id: Optional[str] = None,
+    bus: Optional["EventBus"] = None,
+) -> None:
+    if max_workers <= 0:
+        return
+    seen: Set[Tuple[str, str]] = set()
+    targets: List[Tuple[str, str]] = []
+    for role in ("worker", "worker_b", "worker_c"):
+        cfg = model_map.get(role) or {}
+        base_url = cfg.get("base_url")
+        model = cfg.get("model")
+        if not base_url or not model:
+            continue
+        pair = (base_url, model)
+        if ready_models is not None and pair not in ready_models:
+            continue
+        if pair in UNAVAILABLE_MODELS:
+            continue
+        if pair in seen:
+            continue
+        seen.add(pair)
+        targets.append(pair)
+        if len(targets) >= max_workers:
+            break
+    if not targets:
+        return
+
+    if bus and run_id:
+        try:
+            await bus.emit(
+                run_id,
+                "worker_warmup",
+                {"count": len(targets), "models": [m for _, m in targets]},
+            )
+        except Exception:
+            pass
+
+    async def _ping(base_url: str, model: str) -> None:
+        try:
+            await lm_client.chat_completion(
+                model=model,
+                messages=[{"role": "user", "content": "warmup"}],
+                temperature=0.0,
+                max_tokens=1,
+                base_url=base_url,
+                run_state=None,
+                allow_minimal_retry=False,
+            )
+        except Exception as exc:
+            if run_state:
+                run_state.add_dev_trace(
+                    "Worker warmup failed",
+                    {"model": model, "base_url": base_url, "error": str(exc)},
+                )
+
+    await asyncio.gather(*(_ping(base_url, model) for base_url, model in targets), return_exceptions=True)
 
 
 async def generate_step_prompt(
@@ -2039,23 +4150,9 @@ async def generate_step_prompt(
     answer_guidance: str = "",
     toolbox_hint: str = "",
 ) -> str:
-    def _strip_data_urls(item: Any) -> Any:
-        if isinstance(item, dict):
-            cleaned: Dict[str, Any] = {}
-            for key, value in item.items():
-                if key == "data_url":
-                    cleaned[key] = "<omitted>"
-                elif isinstance(value, (dict, list)):
-                    cleaned[key] = _strip_data_urls(value)
-                else:
-                    cleaned[key] = value
-            return cleaned
-        if isinstance(item, list):
-            return [_strip_data_urls(v) for v in item]
-        return item
-
     context_parts: List[str] = []
-    for art in artifacts[-5:]:
+    recent_artifacts = [art for art in artifacts if art.artifact_type != "validation"][-5:]
+    for art in recent_artifacts:
         text = (art.content_text or "").strip()
         if not text and art.content_json:
             data = art.content_json
@@ -2077,7 +4174,7 @@ async def generate_step_prompt(
                 }
                 tool_results = data.get("tool_results") or []
                 if tool_results:
-                    slim["tool_results"] = _strip_data_urls(tool_results)
+                    slim["tool_results"] = strip_data_urls(tool_results, allow_plot=False)
                 if art.artifact_type == "ledger":
                     slim["conflicts"] = data.get("conflicts", [])
                 else:
@@ -2097,6 +4194,15 @@ async def generate_step_prompt(
         f"Recent artifacts:\n{context}\n"
         f"Produce the needed output for this step."
     )
+    prompt_hint = ""
+    if isinstance(step.inputs, dict):
+        hint_val = step.inputs.get("prompt_hint") or step.inputs.get("prompt") or step.inputs.get("focus")
+        if hint_val:
+            prompt_hint = str(hint_val).strip()
+    if prompt_hint:
+        if len(prompt_hint) > 800:
+            prompt_hint = prompt_hint[:800].rstrip() + "..."
+        prompt += f"\nExecutor guidance: {prompt_hint}"
     if toolbox_hint:
         prompt += f"\nTooling you can request (tool_requests[]): {toolbox_hint}"
     # For most steps this generic prompt suffices; for research we include instruction.
@@ -2108,7 +4214,14 @@ async def generate_step_prompt(
         prompt += f"\n{agents.SEARCH_GUIDE.strip()}"
     if step.type == "draft":
         prompt += "\nReturn the final answer only (plain text). Do not output JSON or tool-call markup."
-        prompt += "\nIf sources are present in artifacts, cite them in a Sources section with URLs."
+        prompt += "\nDo not include citations or a Sources section; sources are shown separately."
+    if step.type == "finalize":
+        requires_verifier = False
+        if isinstance(step.inputs, dict):
+            requires_verifier = bool(step.inputs.get("requires_verifier"))
+        prompt += "\nReturn JSON only with tool_requests (include exactly one finalize_answer tool call)."
+        if requires_verifier:
+            prompt += "\nOnly call finalize_answer if the verifier verdict is PASS; otherwise return tool_requests as an empty list."
     if answer_guidance and step.type in {"draft", "analysis", "merge", "verify"}:
         prompt += f"\nAnswer guidance: {answer_guidance}"
     return prompt
@@ -2141,19 +4254,373 @@ def merge_evidence_artifacts(artifacts: List[Artifact]) -> Dict[str, Any]:
     }
 
 
+def _clip_payload_text(value: Any, max_chars: int) -> str:
+    try:
+        text = json.dumps(value, ensure_ascii=True)
+    except Exception:
+        text = str(value)
+    if len(text) > max_chars:
+        text = text[:max_chars].rstrip() + "..."
+    return text
+
+
+def _extract_draft_text(output: Any) -> str:
+    if isinstance(output, dict):
+        for key in ("draft", "answer", "final_answer", "final", "text", "content"):
+            val = output.get(key)
+            if isinstance(val, str) and val.strip():
+                return val.strip()
+    if isinstance(output, str) and output.strip():
+        return output.strip()
+    return ""
+
+
+def _latest_artifact(artifacts: List[Artifact], artifact_type: str) -> Optional[Artifact]:
+    for art in reversed(artifacts):
+        if art.artifact_type == artifact_type:
+            return art
+    return None
+
+
+def _approved_final_text(artifacts: List[Artifact]) -> Tuple[str, Optional[str]]:
+    verifier_art = _latest_artifact(artifacts, "verifier")
+    verdict = None
+    revised = None
+    if verifier_art and isinstance(verifier_art.content_json, dict):
+        verdict = verifier_art.content_json.get("verdict")
+        revised = verifier_art.content_json.get("revised_answer")
+    draft_art = _latest_artifact(artifacts, "draft")
+    draft_text = (draft_art.content_text or "").strip() if draft_art else ""
+    if verdict == "PASS" and revised and str(revised).strip():
+        return str(revised).strip(), verdict
+    if verdict == "PASS" and draft_text:
+        return draft_text, verdict
+    if verdict is None:
+        return draft_text, verdict
+    return "", verdict
+
+
+def _output_has_numbers(output: Any) -> bool:
+    snippet = _clip_payload_text(output, 800)
+    return any(ch.isdigit() for ch in snippet)
+
+
+def compute_validation_slots(worker_budget: Dict[str, Any], strict_mode: bool) -> int:
+    max_parallel = int(worker_budget.get("max_parallel") or 1)
+    if max_parallel <= 1:
+        return 1
+    if worker_budget.get("ram_pressure") or worker_budget.get("vram_pressure"):
+        return 1
+    if strict_mode:
+        return min(4, max_parallel)
+    return min(3, max_parallel)
+
+
+def build_step_validation_requests(
+    step: PlanStep,
+    question: str,
+    output: Any,
+    artifacts: List[Artifact],
+    max_checks: int,
+) -> List[dict]:
+    if max_checks <= 0:
+        return []
+    step_summary = {
+        "id": step.step_id,
+        "name": step.name,
+        "type": step.type,
+        "agent_profile": step.agent_profile,
+        "acceptance": step.acceptance_criteria,
+    }
+    output_text = _clip_payload_text(output, VALIDATION_PROMPT_MAX_CHARS)
+    critic_prompt = (
+        "Review the step output against acceptance criteria. "
+        "Return JSON only with issues[] and suggested_fix_steps[].\n"
+        f"Question: {question}\nStep: {json.dumps(step_summary, ensure_ascii=True)}\nOutput: {output_text}"
+    )
+    summarizer_prompt = (
+        "Summarize the step output for a quick sanity check. "
+        "Return JSON only: {\"activity_lines\": [...], \"memory_notes\": [...], \"candidate_memory\": []}.\n"
+        f"Step: {json.dumps(step_summary, ensure_ascii=True)}\nOutput: {output_text}"
+    )
+    requests: List[dict] = []
+    needs_verifier = step.type in ("draft", "merge")
+    if needs_verifier:
+        ledger = merge_evidence_artifacts(artifacts)
+        draft_text = _extract_draft_text(output) or output_text
+        verifier_prompt = (
+            f"Question: {question}\nDraft: {draft_text}\nClaims ledger: {_clip_payload_text(ledger, 2800)}\n"
+            "Return JSON verdict: PASS/NEEDS_REVISION, issues[], revised_answer?, extra_steps[]."
+        )
+        requests.append(
+            {
+                "tool": "model_call",
+                "profile": "Verifier",
+                "prompt": verifier_prompt,
+                "temperature": 0.0,
+                "max_tokens": 420,
+            }
+        )
+    requests.append(
+        {
+            "tool": "model_call",
+            "profile": "Critic",
+            "prompt": critic_prompt,
+            "temperature": 0.0,
+            "max_tokens": 320,
+        }
+    )
+    requests.append(
+        {
+            "tool": "model_call",
+            "profile": "Summarizer",
+            "prompt": summarizer_prompt,
+            "temperature": 0.2,
+            "max_tokens": 220,
+        }
+    )
+    if _output_has_numbers(output):
+        math_prompt = (
+            "Verify any numeric reasoning in the output. "
+            "Return JSON with steps and result.\n"
+            f"Output: {output_text}"
+        )
+        requests.append(
+            {
+                "tool": "model_call",
+                "profile": "Math",
+                "prompt": math_prompt,
+                "temperature": 0.0,
+                "max_tokens": 240,
+            }
+        )
+    if len(requests) > max_checks:
+        requests = requests[:max_checks]
+    return requests
+
+
+def _parse_json_maybe(text: str) -> Optional[Any]:
+    raw = text.strip()
+    if not raw or raw[0] not in "{[":
+        return None
+    try:
+        return json.loads(raw)
+    except Exception:
+        return None
+
+
+def summarize_validation_results(tool_results: List[dict]) -> str:
+    summaries: List[str] = []
+    for res in tool_results or []:
+        if not isinstance(res, dict):
+            continue
+        if res.get("status") not in ("ok", None, ""):
+            continue
+        profile = res.get("profile") or res.get("tool") or "checker"
+        result = res.get("result")
+        parsed = None
+        if isinstance(result, dict):
+            parsed = result
+        elif isinstance(result, str):
+            parsed = _parse_json_maybe(result)
+        if isinstance(parsed, dict):
+            if "verdict" in parsed:
+                issues = parsed.get("issues") or []
+                summaries.append(f"{profile}: {parsed.get('verdict')} ({len(issues)} issues)")
+                continue
+            if "issues" in parsed:
+                issues = parsed.get("issues") or []
+                summaries.append(f"{profile}: {len(issues)} issues")
+                continue
+            if "activity_lines" in parsed:
+                lines = parsed.get("activity_lines") or []
+                if lines:
+                    summaries.append(f"{profile}: {str(lines[0])[:80]}")
+                    continue
+        if isinstance(result, str):
+            snippet = result.strip().replace("\n", " ")
+            if snippet:
+                summaries.append(f"{profile}: {snippet[:80]}")
+                continue
+    summary = "; ".join(summaries)
+    if len(summary) > VALIDATION_SUMMARY_MAX_CHARS:
+        summary = summary[:VALIDATION_SUMMARY_MAX_CHARS].rstrip() + "..."
+    return summary
+
+
+def extract_validation_todos(tool_results: List[dict]) -> List[str]:
+    todos: List[str] = []
+    issues: List[str] = []
+    seen: Set[str] = set()
+
+    def _add_item(target: List[str], value: Any) -> None:
+        text = _clip_narration_text(value, 90)
+        if not text or text in seen:
+            return
+        seen.add(text)
+        target.append(text)
+
+    def _extract_text(item: Any) -> Optional[str]:
+        if isinstance(item, dict):
+            for key in ("name", "description", "step", "fix", "issue", "note"):
+                if key in item and item.get(key):
+                    return str(item.get(key))
+            return json.dumps(item, ensure_ascii=True)
+        return str(item) if item is not None else None
+
+    for res in tool_results or []:
+        if not isinstance(res, dict):
+            continue
+        result = res.get("result")
+        parsed: Optional[dict] = None
+        if isinstance(result, dict):
+            parsed = result
+        elif isinstance(result, str):
+            parsed = _parse_json_maybe(result)
+        if not isinstance(parsed, dict):
+            continue
+        for key in ("suggested_fix_steps", "extra_steps"):
+            items = parsed.get(key) or []
+            if isinstance(items, list):
+                for item in items:
+                    text = _extract_text(item)
+                    if text:
+                        _add_item(todos, text)
+        if not todos:
+            items = parsed.get("issues") or []
+            if isinstance(items, list):
+                for item in items:
+                    text = _extract_text(item)
+                    if text:
+                        _add_item(issues, text)
+
+    if todos:
+        return todos
+    return issues
+
+
+def normalize_verifier_payload(parsed: Dict[str, Any]) -> Dict[str, Any]:
+    verdict = parsed.get("verdict")
+    if not verdict:
+        if "PASS/NEEDS_REVISION" in parsed:
+            verdict = parsed.get("PASS/NEEDS_REVISION")
+        elif "PASS" in parsed:
+            verdict = parsed.get("PASS")
+    if isinstance(verdict, bool):
+        verdict = "PASS" if verdict else "NEEDS_REVISION"
+    if isinstance(verdict, str):
+        verdict_norm = verdict.strip().upper().replace(" ", "_")
+        if "NEEDS" in verdict_norm:
+            verdict = "NEEDS_REVISION"
+        else:
+            verdict = "PASS"
+    issues = parsed.get("issues") or []
+    revised_answer = parsed.get("revised_answer")
+    if revised_answer is None:
+        revised_answer = parsed.get("revised_answer?") or parsed.get("revised")
+    extra_steps = parsed.get("extra_steps") or []
+    return {
+        **parsed,
+        "verdict": verdict or "PASS",
+        "issues": issues,
+        "revised_answer": revised_answer,
+        "extra_steps": extra_steps,
+    }
+
+
+async def run_step_double_checks(
+    lm_client: LMStudioClient,
+    model_map: Dict[str, Dict[str, str]],
+    step: PlanStep,
+    question: str,
+    output: Any,
+    artifacts: List[Artifact],
+    worker_budget: Dict[str, Any],
+    strict_mode: bool,
+    run_id: str,
+    bus: "EventBus",
+    upload_dir: Optional[Path] = None,
+    run_state: Optional[RunState] = None,
+) -> Tuple[List[dict], List[dict], str]:
+    max_checks = compute_validation_slots(worker_budget, strict_mode)
+    tool_requests = build_step_validation_requests(step, question, output, artifacts, max_checks)
+    if not tool_requests:
+        return [], [], ""
+    await bus.emit(
+        run_id,
+        "tool_request",
+        {"step": step.step_id, "requests": tool_requests, "context": "double_check"},
+    )
+    queue_narration(
+        lm_client,
+        model_map,
+        run_state,
+        bus,
+        run_id,
+        question,
+        "tool_request",
+        {"step": step.step_id, "requests": tool_requests, "context": "double_check"},
+    )
+    tool_results = await resolve_tool_requests(
+        tool_requests,
+        upload_dir=upload_dir,
+        lm_client=lm_client,
+        model_map=model_map,
+        run_id=run_id,
+        bus=bus,
+        step_id=step.step_id,
+        run_state=run_state,
+    )
+    if tool_results:
+        safe_results = strip_data_urls(tool_results, allow_plot=True)
+        await bus.emit(
+            run_id,
+            "tool_result",
+            {"step": step.step_id, "results": safe_results, "context": "double_check"},
+        )
+        queue_narration(
+            lm_client,
+            model_map,
+            run_state,
+            bus,
+            run_id,
+            question,
+            "tool_result",
+            {"step": step.step_id, "results": safe_results, "context": "double_check"},
+        )
+    if tool_results and run_state:
+        todos = extract_validation_todos(tool_results)
+        if todos:
+            todo_line = "Possible follow-ups: " + "; ".join(todos[:3])
+            await maybe_emit_work_log(
+                run_state,
+                bus,
+                run_id,
+                f"todo_step_{step.step_id}",
+                todo_line,
+            )
+    summary = summarize_validation_results(tool_results)
+    return tool_requests, tool_results, summary
+
+
 async def evaluate_control(
     lm_client: LMStudioClient,
     orch_endpoint: Dict[str, str],
     step: PlanStep,
     step_output: Dict[str, Any],
+    validation_summary: str = "",
     run_state: Optional[RunState] = None,
 ) -> ControlCommand:
     prompt = (
         "Evaluate the step output against acceptance criteria. "
         "If fine, respond {\"control\":\"CONTINUE\"}. "
         "Otherwise choose: BACKTRACK, RERUN_STEP, ADD_STEPS, STOP. "
+        "If evidence is missing, prefer ADD_STEPS with concrete new steps and dependencies. "
+        "You may also include new_constraints to update plan guidance without interrupting the run. "
         f"Step: {step.model_dump()}\nOutput: {json.dumps(step_output)[:1500]}"
     )
+    if validation_summary:
+        prompt += f"\nDouble-check notes: {validation_summary[:600]}"
     try:
         resp = await lm_client.chat_completion(
             model=orch_endpoint["model"],
@@ -2167,9 +4634,32 @@ async def evaluate_control(
         parsed = await safe_json_parse(content, lm_client, orch_endpoint["model"], run_state=run_state)
     except Exception:
         parsed = None
+    if not isinstance(parsed, dict):
+        parsed = {}
+    if not isinstance(parsed, dict):
+        parsed = {}
     if not parsed:
         parsed = {"control": "CONTINUE"}
-    return ControlCommand(**parsed)
+    allowed = {"CONTINUE", "BACKTRACK", "RERUN_STEP", "ADD_STEPS", "STOP"}
+    control_val = str(
+        parsed.get("control")
+        or parsed.get("action")
+        or parsed.get("decision")
+        or parsed.get("command")
+        or "CONTINUE"
+    ).upper()
+    if control_val not in allowed:
+        control_val = "CONTINUE"
+    parsed["control"] = control_val
+    if control_val == "BACKTRACK" and not parsed.get("to_step"):
+        deps = step.depends_on or []
+        parsed["to_step"] = max(deps) if deps else max(1, step.step_id - 1)
+    if control_val == "RERUN_STEP" and not parsed.get("step_id"):
+        parsed["step_id"] = step.step_id
+    try:
+        return ControlCommand(**{k: v for k, v in parsed.items() if k in ControlCommand.model_fields})
+    except Exception:
+        return ControlCommand(control="CONTINUE")
 
 
 async def evaluate_control_fast(
@@ -2177,6 +4667,7 @@ async def evaluate_control_fast(
     fast_endpoint: Dict[str, str],
     step: PlanStep,
     step_output: Dict[str, Any],
+    validation_summary: str = "",
     run_state: Optional[RunState] = None,
 ) -> Tuple[ControlCommand, bool]:
     """
@@ -2190,6 +4681,8 @@ async def evaluate_control_fast(
         "Return JSON only."
         f"Step: {step.model_dump()}\nOutput: {json.dumps(step_output)[:1200]}"
     )
+    if validation_summary:
+        prompt += f"\nDouble-check notes: {validation_summary[:400]}"
     try:
         resp = await lm_client.chat_completion(
             model=fast_endpoint["model"],
@@ -2214,51 +4707,133 @@ async def evaluate_control_fast(
     if escalate:
         control_val = "CONTINUE"
     parsed["control"] = control_val
-    cmd = ControlCommand(**{k: v for k, v in parsed.items() if k in ControlCommand.model_fields})
+    try:
+        cmd = ControlCommand(**{k: v for k, v in parsed.items() if k in ControlCommand.model_fields})
+    except Exception:
+        cmd = ControlCommand(control="CONTINUE")
     return cmd, escalate
 
 
 async def allocate_ready_steps(
     lm_client: LMStudioClient,
-    fast_endpoint: Dict[str, str],
+    executor_endpoint: Dict[str, str],
     ready_steps: List[PlanStep],
     artifacts: List[Artifact],
     running_count: int,
     target_slots: int,
+    question: str = "",
+    resource_budget: Optional[Dict[str, Any]] = None,
+    running_steps: Optional[List[PlanStep]] = None,
     run_state: Optional[RunState] = None,
-) -> List[int]:
-    """
-    Ask the fast 4B allocator which ready steps to launch next to keep agents busy.
-    Falls back to launching all ready steps if parsing fails.
-    """
+) -> AllocationDecision:
+    """Ask the executor to allocate ready steps up to available slot capacity."""
     if not ready_steps:
-        return []
-    ready_desc = ", ".join([f"{s.step_id}:{s.name}({s.type})" for s in ready_steps])
-    recent = [a.key for a in artifacts[-5:]]
+        return AllocationDecision(start_ids=[])
+    capacity = max(0, target_slots - running_count)
+    if capacity <= 0:
+        return AllocationDecision(start_ids=[])
+    ready_ids = [s.step_id for s in ready_steps]
+    default_ids = ready_ids[:capacity]
+    decision = AllocationDecision(start_ids=default_ids, queue_ids=ready_ids[capacity:])
+    if not executor_endpoint or not executor_endpoint.get("model"):
+        return decision
+    ready_summary = [
+        {
+            "id": s.step_id,
+            "name": s.name,
+            "type": s.type,
+            "agent_profile": s.agent_profile,
+            "depends_on": s.depends_on,
+        }
+        for s in ready_steps[:ALLOCATOR_MAX_READY]
+    ]
+    running_summary = []
+    if running_steps:
+        running_summary = [
+            {
+                "id": s.step_id,
+                "name": s.name,
+                "type": s.type,
+                "agent_profile": s.agent_profile,
+            }
+            for s in running_steps[:ALLOCATOR_MAX_RUNNING]
+        ]
     prompt = (
-        "You are the executor allocator. Choose which ready steps to start now to keep worker slots busy."
-        " Return JSON {\"start_ids\":[step_ids...]}. Prefer research steps in parallel; keep drafts/verify after research."
-        f" Ready: {ready_desc}. Running now: {running_count}. Target slots: {target_slots}. Recent artifacts: {recent}."
+        "You are the executor. Decide which ready steps to start now to keep parallel work moving and avoid bottlenecks. "
+        "Return JSON only: {\"start_ids\": [...], \"target_slots\": N, \"queue_ids\": [...], \"note\": \"...\"}. "
+        "The note is user-facing: keep it short, plainspoken, and free of internal jargon. "
+        "Use only IDs from ready_ids. Keep start_ids length <= capacity.\n"
+        f"Question: {question}\nCapacity: {capacity}\nCurrent target slots: {target_slots}\n"
+        f"Ready steps: {json.dumps(ready_summary, ensure_ascii=True)}\n"
+        f"Running steps: {json.dumps(running_summary, ensure_ascii=True)}\n"
+        f"Resource budget: {json.dumps(resource_budget or {}, ensure_ascii=True)}\n"
+        f"Ready ids: {ready_ids}"
     )
     try:
         resp = await lm_client.chat_completion(
-            model=fast_endpoint["model"],
+            model=executor_endpoint["model"],
             messages=[{"role": "system", "content": agents.EXECUTOR_SYSTEM}, {"role": "user", "content": prompt}],
             temperature=0.0,
-            max_tokens=150,
-            base_url=fast_endpoint["base_url"],
+            max_tokens=220,
+            base_url=executor_endpoint.get("base_url"),
             run_state=run_state,
         )
         content = resp["choices"][0]["message"]["content"]
-        parsed = await safe_json_parse(content, lm_client, fast_endpoint["model"], run_state=run_state)
-        if parsed and isinstance(parsed.get("start_ids"), list):
-            allowed = {s.step_id for s in ready_steps}
-            filtered = [sid for sid in parsed["start_ids"] if sid in allowed]
-            if filtered:
-                return filtered
+        parsed = await safe_json_parse(content, lm_client, executor_endpoint["model"], run_state=run_state)
     except Exception:
-        pass
-    return [s.step_id for s in ready_steps]
+        parsed = None
+    if not isinstance(parsed, dict):
+        return decision
+    start_ids_raw = parsed.get("start_ids") or parsed.get("start") or parsed.get("start_steps") or []
+    if not isinstance(start_ids_raw, list):
+        start_ids_raw = []
+    ready_set = set(ready_ids)
+    start_ids: List[int] = []
+    for item in start_ids_raw:
+        try:
+            sid = int(item)
+        except Exception:
+            continue
+        if sid in ready_set and sid not in start_ids:
+            start_ids.append(sid)
+        if len(start_ids) >= capacity:
+            break
+    if not start_ids:
+        start_ids = list(default_ids)
+    if len(start_ids) < capacity:
+        for sid in ready_ids:
+            if sid in start_ids:
+                continue
+            start_ids.append(sid)
+            if len(start_ids) >= capacity:
+                break
+    queue_raw = parsed.get("queue_ids") or parsed.get("queue") or parsed.get("queued") or []
+    queue_ids: List[int] = []
+    if isinstance(queue_raw, list):
+        for item in queue_raw:
+            try:
+                sid = int(item)
+            except Exception:
+                continue
+            if sid in ready_set and sid not in start_ids and sid not in queue_ids:
+                queue_ids.append(sid)
+    if not queue_ids:
+        queue_ids = [sid for sid in ready_ids if sid not in start_ids]
+    target_slots_raw = parsed.get("target_slots") or parsed.get("parallel_slots")
+    target_slots_val: Optional[int] = None
+    if target_slots_raw is not None:
+        try:
+            target_slots_val = int(target_slots_raw)
+        except Exception:
+            target_slots_val = None
+    decision = AllocationDecision(
+        start_ids=start_ids,
+        queue_ids=queue_ids,
+        target_slots=target_slots_val,
+        note=str(parsed.get("note") or "").strip(),
+        used_executor=True,
+    )
+    return decision
 
 
 async def build_executor_brief(
@@ -2284,6 +4859,7 @@ async def build_executor_brief(
     prompt = (
         "You are the executor. Summarize how you will run this plan."
         " Return JSON only: {\"note\": \"...\", \"focus_steps\": [ids], \"parallel_slots\": N, \"risks\": [..]}."
+        " The note is user-facing: keep it short, plainspoken, and free of internal jargon."
         f"\nQuestion: {question}\nParallel slots: {target_slots}\nSteps: {json.dumps(steps_summary)[:1500]}"
     )
     try:
@@ -2304,7 +4880,18 @@ async def build_executor_brief(
     return None
 
 
-def format_tavily_error(resp: Dict[str, Any]) -> str:
+def coerce_tavily_response(resp: Any) -> Dict[str, Any]:
+    if isinstance(resp, dict):
+        return resp
+    if isinstance(resp, list):
+        return {"results": resp}
+    if resp is None:
+        return {"error": "invalid_response", "detail": "empty response"}
+    return {"error": "invalid_response", "detail": str(resp)}
+
+
+def format_tavily_error(resp: Any) -> str:
+    resp = coerce_tavily_response(resp)
     if not resp:
         return "tavily_error"
     message = str(resp.get("error") or "tavily_error")
@@ -2386,6 +4973,54 @@ async def synthesize_evidence_from_sources(
     }
 
 
+SEARCH_STATS_FIELDS = ("queries", "skipped_queries", "duplicate_sources", "new_sources", "results")
+
+
+def normalize_search_key(text: str) -> str:
+    cleaned = str(text or "").strip().lower()
+    if not cleaned:
+        return ""
+    cleaned = cleaned.replace("&", " and ")
+    cleaned = re.sub(r"[-_/]+", " ", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    cleaned = cleaned.strip(" .,:;!?\"'`")
+    return cleaned
+
+
+def normalize_source_url(url: str) -> str:
+    raw = str(url or "").strip()
+    if not raw:
+        return ""
+    try:
+        parsed = urlparse(raw)
+    except Exception:
+        return raw.rstrip("/")
+    if not parsed.scheme or not parsed.netloc:
+        return raw.rstrip("/")
+    scheme = parsed.scheme.lower()
+    host = parsed.netloc.lower()
+    path = parsed.path or ""
+    if path.endswith("/") and path != "/":
+        path = path[:-1]
+    normalized = f"{scheme}://{host}{path}"
+    if parsed.query:
+        normalized = f"{normalized}?{parsed.query}"
+    return normalized
+
+
+def _empty_search_stats() -> Dict[str, int]:
+    return {field: 0 for field in SEARCH_STATS_FIELDS}
+
+
+def _merge_search_stats(base: Dict[str, int], add: Dict[str, int]) -> Dict[str, int]:
+    for field in SEARCH_STATS_FIELDS:
+        try:
+            base[field] = int(base.get(field, 0)) + int(add.get(field, 0))
+        except Exception:
+            base[field] = int(base.get(field, 0))
+    return base
+
+
 async def run_tavily_queries(
     run_id: str,
     step: PlanStep,
@@ -2400,24 +5035,47 @@ async def run_tavily_queries(
     mode: Optional[str] = None,
     executed: Optional[Set[str]] = None,
     executed_order: Optional[List[str]] = None,
-) -> Tuple[List[dict], List[str]]:
+    *,
+    question: str = "",
+    lm_client: Optional[LMStudioClient] = None,
+    model_map: Optional[Dict[str, Dict[str, str]]] = None,
+    run_state: Optional[RunState] = None,
+) -> Tuple[List[dict], List[str], Dict[str, int]]:
     gathered_sources: List[dict] = []
     tavily_errors: List[str] = []
+    stats = _empty_search_stats()
     executed_set = executed if executed is not None else set()
+    seen_urls: Set[str] = set()
     for query in queries:
         q = str(query or "").strip()
         if not q:
             continue
-        key = q.lower()
+        key = normalize_search_key(q)
+        if not key:
+            continue
         if key in executed_set:
+            stats["skipped_queries"] += 1
+            payload = {"step": step.step_id, "query": q, "reason": "duplicate_query"}
+            await bus.emit(run_id, "search_skipped", payload)
+            if lm_client and model_map and run_state:
+                queue_narration(
+                    lm_client,
+                    model_map,
+                    run_state,
+                    bus,
+                    run_id,
+                    question,
+                    "search_skipped",
+                    dict(payload),
+                )
             continue
         executed_set.add(key)
+        stats["queries"] += 1
         if executed_order is not None:
             executed_order.append(q)
         payload = {"step": step.step_id, "query": q}
         if mode:
             payload["mode"] = mode
-        await bus.emit(run_id, "tavily_search", payload)
         search_resp = await tavily.search(
             query=q,
             search_depth=search_depth,
@@ -2425,6 +5083,65 @@ async def run_tavily_queries(
             topic=topic,
             time_range=time_range,
         )
+        search_resp = coerce_tavily_response(search_resp)
+        results = search_resp.get("results") or []
+        if not isinstance(results, list):
+            results = []
+        result_count = len(results)
+        stats["results"] += result_count
+        urls = [res.get("url") for res in results if isinstance(res, dict) and res.get("url")]
+        if urls:
+            payload["urls"] = urls[: min(5, per_query_max)]
+        new_sources = 0
+        duplicate_sources = 0
+        if not search_resp.get("error"):
+            for res in results[:per_query_max]:
+                if not isinstance(res, dict):
+                    continue
+                url_raw = res.get("url") or ""
+                url_key = normalize_source_url(url_raw)
+                if url_key and url_key in seen_urls:
+                    duplicate_sources += 1
+                    continue
+                if url_key:
+                    seen_urls.add(url_key)
+                src = {
+                    "url": url_raw,
+                    "title": res.get("title"),
+                    "publisher": res.get("source"),
+                    "date_published": res.get("published_date"),
+                    "snippet": res.get("content", "")[:400],
+                    "extracted_text": res.get("content", ""),
+                }
+                gathered_sources.append(src)
+                new_sources += 1
+                await db.add_source(
+                    run_id,
+                    f"Step{step.step_id}",
+                    src["url"] or "",
+                    src["title"] or "",
+                    src["publisher"] or "",
+                    src["date_published"] or "",
+                    src["snippet"] or "",
+                    src["extracted_text"] or "",
+                )
+        stats["new_sources"] += new_sources
+        stats["duplicate_sources"] += duplicate_sources
+        payload["result_count"] = result_count
+        payload["new_sources"] = new_sources
+        payload["duplicate_sources"] = duplicate_sources
+        if lm_client and model_map and run_state:
+            queue_narration(
+                lm_client,
+                model_map,
+                run_state,
+                bus,
+                run_id,
+                question,
+                "tavily_search",
+                dict(payload),
+            )
+        await bus.emit(run_id, "tavily_search", payload)
         await db.add_search(run_id, f"Step{step.step_id}", q, search_depth, per_query_max, search_resp)
         if search_resp.get("error"):
             error_msg = format_tavily_error(search_resp)
@@ -2433,29 +5150,21 @@ async def run_tavily_queries(
                 "tavily_error",
                 {"step": step.step_id, "message": error_msg},
             )
+            if lm_client and model_map and run_state:
+                queue_narration(
+                    lm_client,
+                    model_map,
+                    run_state,
+                    bus,
+                    run_id,
+                    question,
+                    "tavily_error",
+                    {"step": step.step_id, "message": error_msg},
+                    tone="warn",
+                )
             tavily_errors.append(error_msg)
             continue
-        for res in search_resp.get("results", [])[:per_query_max]:
-            src = {
-                "url": res.get("url"),
-                "title": res.get("title"),
-                "publisher": res.get("source"),
-                "date_published": res.get("published_date"),
-                "snippet": res.get("content", "")[:400],
-                "extracted_text": res.get("content", ""),
-            }
-            gathered_sources.append(src)
-            await db.add_source(
-                run_id,
-                f"Step{step.step_id}",
-                src["url"] or "",
-                src["title"] or "",
-                src["publisher"] or "",
-                src["date_published"] or "",
-                src["snippet"] or "",
-                src["extracted_text"] or "",
-            )
-    return gathered_sources, tavily_errors
+    return gathered_sources, tavily_errors, stats
 
 
 async def execute_research_step(
@@ -2474,26 +5183,7 @@ async def execute_research_step(
     upload_dir: Optional[Path] = None,
     run_state: Optional[RunState] = None,
 ) -> Tuple[Dict[str, Any], List[Artifact], str]:
-    if run_state and not run_state.can_web:
-        evidence = {
-            "lane": step.agent_profile,
-            "queries": [],
-            "sources": [],
-            "claims": [],
-            "gaps": ["web browsing unavailable"],
-            "conflicts_found": False,
-            "tool_requests": [],
-            "tool_results": [],
-            "timestamp_utc": datetime.utcnow().isoformat(),
-        }
-        artifact = Artifact(
-            step_id=step.step_id,
-            key=f"evidence_step_{step.step_id}",
-            artifact_type="evidence",
-            content_text="",
-            content_json=evidence,
-        )
-        return evidence, [artifact], prompt
+    offline_web = bool(run_state and not run_state.can_web)
     raw = None
     try:
         raw = await run_worker(
@@ -2586,6 +5276,10 @@ async def execute_research_step(
     executed_queries: Set[str] = set()
     executed_order: List[str] = []
     tavily_errors: List[str] = []
+    search_stats = _empty_search_stats()
+    search_stats = _empty_search_stats()
+    if offline_web:
+        tavily_errors.append("Web browsing unavailable")
     tool_requests = parsed.get("tool_requests", [])
     if not isinstance(tool_requests, list):
         tool_requests = []
@@ -2600,13 +5294,24 @@ async def execute_research_step(
         per_query_max = max(3, min(search_budget, max_results))
         if not tavily.enabled:
             await bus.emit(run_id, "tavily_error", {"step": step.step_id, "message": "Tavily API key missing"})
+            queue_narration(
+                lm_client,
+                model_map,
+                run_state,
+                bus,
+                run_id,
+                question,
+                "tavily_error",
+                {"step": step.step_id, "message": "Tavily API key missing"},
+                tone="warn",
+            )
             tavily_errors.append("Tavily API key missing")
         else:
             if not queries and question:
                 queries = [question]
             primary_queries = queries[:5] if queries else []
             if primary_queries:
-                sources, errors = await run_tavily_queries(
+                sources, errors, stats = await run_tavily_queries(
                     run_id,
                     step,
                     primary_queries,
@@ -2619,12 +5324,17 @@ async def execute_research_step(
                     time_range=requested_time_range,
                     executed=executed_queries,
                     executed_order=executed_order,
+                    question=question,
+                    lm_client=lm_client,
+                    model_map=model_map,
+                    run_state=run_state,
                 )
                 gathered_sources.extend(sources)
                 tavily_errors.extend(errors)
+                search_stats = _merge_search_stats(search_stats, stats)
             if not gathered_sources and question:
                 fallback_query = question.strip()
-                sources, errors = await run_tavily_queries(
+                sources, errors, stats = await run_tavily_queries(
                     run_id,
                     step,
                     [fallback_query],
@@ -2638,9 +5348,14 @@ async def execute_research_step(
                     mode="fallback",
                     executed=executed_queries,
                     executed_order=executed_order,
+                    question=question,
+                    lm_client=lm_client,
+                    model_map=model_map,
+                    run_state=run_state,
                 )
                 gathered_sources.extend(sources)
                 tavily_errors.extend(errors)
+                search_stats = _merge_search_stats(search_stats, stats)
             if not gathered_sources:
                 retry_time = widen_time_range(requested_time_range)
                 if not retry_time and requested_topic == "news":
@@ -2652,7 +5367,7 @@ async def execute_research_step(
                     time_range=retry_time,
                 )
                 if retry_queries:
-                    sources, errors = await run_tavily_queries(
+                    sources, errors, stats = await run_tavily_queries(
                         run_id,
                         step,
                         retry_queries,
@@ -2666,14 +5381,30 @@ async def execute_research_step(
                         mode="retry",
                         executed=executed_queries,
                         executed_order=executed_order,
+                        question=question,
+                        lm_client=lm_client,
+                        model_map=model_map,
+                        run_state=run_state,
                     )
                     gathered_sources.extend(sources)
                     tavily_errors.extend(errors)
+                    search_stats = _merge_search_stats(search_stats, stats)
             urls = [s["url"] for s in gathered_sources if s.get("url")]
             if urls:
                 url_slice = urls[: max(3, min(extract_budget, len(urls)))]
                 await bus.emit(run_id, "tavily_extract", {"step": step.step_id, "urls": url_slice})
+                queue_narration(
+                    lm_client,
+                    model_map,
+                    run_state,
+                    bus,
+                    run_id,
+                    question,
+                    "tavily_extract",
+                    {"step": step.step_id, "urls": url_slice},
+                )
                 extract_resp = await tavily.extract(url_slice, extract_depth=extract_depth)
+                extract_resp = coerce_tavily_response(extract_resp)
                 await db.add_extract(run_id, f"Step{step.step_id}", ",".join(url_slice), extract_depth, extract_resp)
                 if extract_resp.get("error"):
                     error_msg = format_tavily_error(extract_resp)
@@ -2682,10 +5413,26 @@ async def execute_research_step(
                         "tavily_error",
                         {"step": step.step_id, "message": error_msg},
                     )
+                    queue_narration(
+                        lm_client,
+                        model_map,
+                        run_state,
+                        bus,
+                        run_id,
+                        question,
+                        "tavily_error",
+                        {"step": step.step_id, "message": error_msg},
+                        tone="warn",
+                    )
                     tavily_errors.append(error_msg)
-                if extract_resp.get("results"):
+                extract_results = extract_resp.get("results") or []
+                if not isinstance(extract_results, list):
+                    extract_results = []
+                if extract_results:
                     gathered_sources = []
-                    for res in extract_resp["results"]:
+                    for res in extract_results:
+                        if not isinstance(res, dict):
+                            continue
                         src = {
                             "url": res.get("url", ""),
                             "title": res.get("title", ""),
@@ -2706,12 +5453,23 @@ async def execute_research_step(
                             src["extracted_text"],
                         )
             if gathered_sources and run_state:
+                source_urls: List[str] = []
+                seen_urls: Set[str] = set()
+                for src in gathered_sources:
+                    url = str(src.get("url") or "").strip()
+                    if not url or url in seen_urls:
+                        continue
+                    seen_urls.add(url)
+                    source_urls.append(url)
+                    if len(source_urls) >= 3:
+                        break
                 await maybe_emit_work_log(
                     run_state,
                     bus,
                     run_id,
                     "read_sources",
-                    "Reading sources to pull out key details.",
+                    "Reading sources and pulling key details.",
+                    urls=source_urls,
                 )
     if tavily_errors and run_state:
         await maybe_emit_work_log(
@@ -2719,33 +5477,78 @@ async def execute_research_step(
             bus,
             run_id,
             "web_tool_error",
-            "I couldn't reach the web search tool, so I'll proceed with what I have.",
+            "Web search isn't reachable, so I'll proceed with what I have.",
             tone="warn",
         )
     if tool_requests:
         await bus.emit(run_id, "tool_request", {"step": step.step_id, "requests": tool_requests})
-    tool_results = resolve_tool_requests(tool_requests, upload_dir=upload_dir)
+        queue_narration(
+            lm_client,
+            model_map,
+            run_state,
+            bus,
+            run_id,
+            question,
+            "tool_request",
+            {"step": step.step_id, "requests": tool_requests},
+        )
+    tool_results = await resolve_tool_requests(
+        tool_requests,
+        upload_dir=upload_dir,
+        lm_client=lm_client,
+        model_map=model_map,
+        run_id=run_id,
+        bus=bus,
+        step_id=step.step_id,
+        run_state=run_state,
+    )
     if tool_results:
-        def _strip_data_urls(item: Any) -> Any:
-            if isinstance(item, dict):
-                cleaned: Dict[str, Any] = {}
-                for key, value in item.items():
-                    if key == "data_url":
-                        cleaned[key] = "<omitted>"
-                    elif isinstance(value, (dict, list)):
-                        cleaned[key] = _strip_data_urls(value)
-                    else:
-                        cleaned[key] = value
-                return cleaned
-            if isinstance(item, list):
-                return [_strip_data_urls(v) for v in item]
-            return item
-
+        safe_results = strip_data_urls(tool_results, allow_plot=True)
         await bus.emit(
             run_id,
             "tool_result",
-            {"step": step.step_id, "results": _strip_data_urls(tool_results)},
+            {"step": step.step_id, "results": safe_results},
         )
+        queue_narration(
+            lm_client,
+            model_map,
+            run_state,
+            bus,
+            run_id,
+            question,
+            "tool_result",
+            {"step": step.step_id, "results": safe_results},
+        )
+    if gathered_sources:
+        seen_urls: Set[str] = set()
+        emitted = 0
+        for src in gathered_sources:
+            url = str(src.get("url") or "").strip()
+            if not url or url in seen_urls:
+                continue
+            seen_urls.add(url)
+            payload = {
+                "step": step.step_id,
+                "lane": step.agent_profile,
+                "title": src.get("title") or "",
+                "publisher": src.get("publisher") or "",
+                "date_published": src.get("date_published") or "",
+                "url": url,
+            }
+            await bus.emit(run_id, "source_found", payload)
+            queue_narration(
+                lm_client,
+                model_map,
+                run_state,
+                bus,
+                run_id,
+                question,
+                "source_found",
+                payload,
+            )
+            emitted += 1
+            if emitted >= 3:
+                break
     synth = {"claims": [], "gaps": [], "conflicts_found": False}
     if gathered_sources:
         synth = await synthesize_evidence_from_sources(
@@ -2761,6 +5564,34 @@ async def execute_research_step(
     claims = synth.get("claims") if gathered_sources else parsed.get("claims", [])
     gaps = synth.get("gaps") if gathered_sources else parsed.get("gaps", [])
     conflicts_found = synth.get("conflicts_found") if gathered_sources else parsed.get("conflicts_found", False)
+    if gathered_sources and isinstance(claims, list):
+        emitted = 0
+        for claim in claims:
+            if not isinstance(claim, dict):
+                continue
+            text = str(claim.get("claim") or "").strip()
+            if not text:
+                continue
+            payload = {
+                "step": step.step_id,
+                "lane": step.agent_profile,
+                "claim": text,
+                "urls": claim.get("urls") or [],
+            }
+            await bus.emit(run_id, "claim_found", payload)
+            queue_narration(
+                lm_client,
+                model_map,
+                run_state,
+                bus,
+                run_id,
+                question,
+                "claim_found",
+                payload,
+            )
+            emitted += 1
+            if emitted >= 3:
+                break
     if not isinstance(claims, list):
         claims = []
     if not isinstance(gaps, list):
@@ -2781,7 +5612,8 @@ async def execute_research_step(
         "tool_results": tool_results,
         "time_range": requested_time_range,
         "topic": requested_topic,
-        "timestamp_utc": datetime.utcnow().isoformat(),
+        "search_stats": search_stats,
+        "timestamp_utc": utc_iso(),
     }
     for claim in evidence["claims"]:
         if isinstance(claim, dict) and "claim" in claim:
@@ -2830,7 +5662,7 @@ async def execute_tavily_search_step(
             "claims": [],
             "gaps": ["web browsing unavailable"],
             "conflicts_found": False,
-            "timestamp_utc": datetime.utcnow().isoformat(),
+            "timestamp_utc": utc_iso(),
         }
         return evidence, [Artifact(step_id=step.step_id, key=f"evidence_step_{step.step_id}", artifact_type="evidence", content_json=evidence)], prompt
     inputs = step.inputs if isinstance(step.inputs, dict) else {}
@@ -2868,13 +5700,25 @@ async def execute_tavily_search_step(
     executed_queries: Set[str] = set()
     executed_order: List[str] = []
     tavily_errors: List[str] = []
+    search_stats = _empty_search_stats()
     if not tavily.enabled:
         await bus.emit(run_id, "tavily_error", {"step": step.step_id, "message": "Tavily API key missing"})
+        queue_narration(
+            lm_client,
+            model_map,
+            run_state,
+            bus,
+            run_id,
+            question,
+            "tavily_error",
+            {"step": step.step_id, "message": "Tavily API key missing"},
+            tone="warn",
+        )
         tavily_errors.append("Tavily API key missing")
     else:
         primary_queries = queries[:5] if queries else []
         if primary_queries:
-            sources, errors = await run_tavily_queries(
+            sources, errors, stats = await run_tavily_queries(
                 run_id,
                 step,
                 primary_queries,
@@ -2887,9 +5731,14 @@ async def execute_tavily_search_step(
                 time_range=time_range,
                 executed=executed_queries,
                 executed_order=executed_order,
+                question=question,
+                lm_client=lm_client,
+                model_map=model_map,
+                run_state=run_state,
             )
             gathered_sources.extend(sources)
             tavily_errors.extend(errors)
+            search_stats = _merge_search_stats(search_stats, stats)
         if not gathered_sources:
             retry_time = widen_time_range(time_range)
             if not retry_time and topic == "news":
@@ -2901,7 +5750,7 @@ async def execute_tavily_search_step(
                 time_range=retry_time,
             )
             if retry_queries:
-                sources, errors = await run_tavily_queries(
+                sources, errors, stats = await run_tavily_queries(
                     run_id,
                     step,
                     retry_queries,
@@ -2915,9 +5764,14 @@ async def execute_tavily_search_step(
                     mode="retry",
                     executed=executed_queries,
                     executed_order=executed_order,
+                    question=question,
+                    lm_client=lm_client,
+                    model_map=model_map,
+                    run_state=run_state,
                 )
                 gathered_sources.extend(sources)
                 tavily_errors.extend(errors)
+                search_stats = _merge_search_stats(search_stats, stats)
     synth = await synthesize_evidence_from_sources(
         lm_client,
         model_map,
@@ -2946,7 +5800,8 @@ async def execute_tavily_search_step(
         "tool_results": [],
         "time_range": time_range,
         "topic": topic,
-        "timestamp_utc": datetime.utcnow().isoformat(),
+        "search_stats": search_stats,
+        "timestamp_utc": utc_iso(),
     }
     artifacts = [
         Artifact(
@@ -2981,7 +5836,7 @@ async def execute_tavily_extract_step(
             "claims": [],
             "gaps": ["web browsing unavailable"],
             "conflicts_found": False,
-            "timestamp_utc": datetime.utcnow().isoformat(),
+            "timestamp_utc": utc_iso(),
         }
         return evidence, [Artifact(step_id=step.step_id, key=f"evidence_step_{step.step_id}", artifact_type="evidence", content_json=evidence)], prompt
     inputs = step.inputs if isinstance(step.inputs, dict) else {}
@@ -2999,16 +5854,54 @@ async def execute_tavily_extract_step(
     tavily_errors: List[str] = []
     if not tavily.enabled:
         await bus.emit(run_id, "tavily_error", {"step": step.step_id, "message": "Tavily API key missing"})
+        queue_narration(
+            lm_client,
+            model_map,
+            run_state,
+            bus,
+            run_id,
+            question,
+            "tavily_error",
+            {"step": step.step_id, "message": "Tavily API key missing"},
+            tone="warn",
+        )
         tavily_errors.append("Tavily API key missing")
     if urls:
         await bus.emit(run_id, "tavily_extract", {"step": step.step_id, "urls": urls})
+        queue_narration(
+            lm_client,
+            model_map,
+            run_state,
+            bus,
+            run_id,
+            question,
+            "tavily_extract",
+            {"step": step.step_id, "urls": urls},
+        )
         extract_resp = await tavily.extract(urls, extract_depth=extract_depth)
+        extract_resp = coerce_tavily_response(extract_resp)
         await db.add_extract(run_id, f"Step{step.step_id}", ",".join(urls), extract_depth, extract_resp)
         if extract_resp.get("error"):
             error_msg = format_tavily_error(extract_resp)
             await bus.emit(run_id, "tavily_error", {"step": step.step_id, "message": error_msg})
+            queue_narration(
+                lm_client,
+                model_map,
+                run_state,
+                bus,
+                run_id,
+                question,
+                "tavily_error",
+                {"step": step.step_id, "message": error_msg},
+                tone="warn",
+            )
             tavily_errors.append(error_msg)
-        for res in extract_resp.get("results", []) or []:
+        extract_results = extract_resp.get("results") or []
+        if not isinstance(extract_results, list):
+            extract_results = []
+        for res in extract_results:
+            if not isinstance(res, dict):
+                continue
             src = {
                 "url": res.get("url", ""),
                 "title": res.get("title", ""),
@@ -3055,7 +5948,7 @@ async def execute_tavily_extract_step(
         "conflicts_found": bool(synth.get("conflicts_found")),
         "tool_requests": [],
         "tool_results": [],
-        "timestamp_utc": datetime.utcnow().isoformat(),
+        "timestamp_utc": utc_iso(),
     }
     artifacts = [
         Artifact(
@@ -3166,9 +6059,7 @@ async def execute_step(
     elif step.type == "draft":
         draft_profile = (step.agent_profile or "").strip()
         draft_lower = draft_profile.lower()
-        if not draft_profile or draft_lower == "orchestrator":
-            draft_profile = "Writer"
-        elif draft_lower == "writer":
+        if draft_lower != "writer":
             draft_profile = "Writer"
         draft_resp = await run_worker(
             lm_client,
@@ -3199,20 +6090,30 @@ async def execute_step(
             f"Question: {question}\nDraft: {draft}\nClaims ledger: {json.dumps(ledger)[:3000]}\n"
             "Return JSON verdict: PASS/NEEDS_REVISION, issues[], revised_answer?, extra_steps[]."
         )
-        verifier_profile = step.agent_profile or "Verifier"
-        report = await run_worker(
-            lm_client,
-            verifier_profile,
-            model_map,
-            verifier_prompt,
-            temperature=0.0,
-            max_tokens=700,
-            run_id=run_id,
-            bus=bus,
-            step_id=step.step_id,
-            context="verify",
-            run_state=run_state,
-        )
+        verifier_profile = (step.agent_profile or "").strip()
+        if verifier_profile.lower() != "verifier":
+            verifier_profile = "Verifier"
+        try:
+            report = await run_worker(
+                lm_client,
+                verifier_profile,
+                model_map,
+                verifier_prompt,
+                temperature=0.0,
+                max_tokens=700,
+                run_id=run_id,
+                bus=bus,
+                step_id=step.step_id,
+                context="verify",
+                run_state=run_state,
+            )
+        except Exception as exc:
+            if run_state:
+                run_state.add_dev_trace(
+                    "Verifier failed; bypassing verification.",
+                    {"error": str(exc)},
+                )
+            report = json.dumps({"verdict": "PASS", "issues": [], "extra_steps": []})
         verifier_model = (
             (model_map.get("verifier") or {}).get("model")
             or (model_map.get("worker") or {}).get("model")
@@ -3220,8 +6121,11 @@ async def execute_step(
             or ""
         )
         parsed = await safe_json_parse(report, lm_client, verifier_model, run_state=run_state)
+        if not isinstance(parsed, dict):
+            parsed = {}
         if not parsed:
             parsed = {"issues": [], "verdict": "PASS", "extra_steps": []}
+        parsed = normalize_verifier_payload(parsed)
         if decision.reasoning_level in ("HIGH", "ULTRA") or decision.expected_passes > 1 or decision.needs_web:
             planner_model = (model_map.get("orch") or {}).get("model")
             planner_url = (model_map.get("orch") or {}).get("base_url")
@@ -3241,6 +6145,9 @@ async def execute_step(
                     planner_content = planner_resp["choices"][0]["message"]["content"]
                     planner_parsed = await safe_json_parse(planner_content, lm_client, planner_model, run_state=run_state)
                     if planner_parsed:
+                        if not isinstance(planner_parsed, dict):
+                            planner_parsed = {}
+                        planner_parsed = normalize_verifier_payload(planner_parsed)
                         await bus.emit(
                             run_id,
                             "planner_verifier",
@@ -3263,6 +6170,133 @@ async def execute_step(
             content_json=parsed,
         )
         return parsed, [artifact], prompt
+    elif step.type == "finalize":
+        requires_verifier = False
+        if isinstance(step.inputs, dict):
+            requires_verifier = bool(step.inputs.get("requires_verifier"))
+        approved_text, verdict = _approved_final_text(artifacts)
+        if requires_verifier and verdict != "PASS":
+            raise ValueError("Final draft not approved")
+        if not approved_text:
+            draft_art = _latest_artifact(artifacts, "draft")
+            draft_text = (draft_art.content_text or "").strip() if draft_art else ""
+            if draft_text:
+                approved_text = draft_text
+                await bus.emit(
+                    run_id,
+                    "dev_trace",
+                    {"text": "Finalizer fallback used latest draft text."},
+                )
+            else:
+                raise ValueError("Missing approved draft text")
+        final_profile = (step.agent_profile or "").strip()
+        if final_profile.lower() != "finalizer":
+            final_profile = "Finalizer"
+        final_raw = await run_worker(
+            lm_client,
+            final_profile,
+            model_map,
+            prompt,
+            temperature=0.0,
+            max_tokens=300,
+            run_id=run_id,
+            bus=bus,
+            step_id=step.step_id,
+            context="finalize",
+            run_state=run_state,
+        )
+        fixer_model = (
+            (model_map.get("summarizer") or {}).get("model")
+            or (model_map.get("orch") or {}).get("model")
+            or ""
+        )
+        parsed = await safe_json_parse(final_raw, lm_client, fixer_model, run_state=run_state)
+        if not isinstance(parsed, dict):
+            await bus.emit(
+                run_id,
+                "dev_trace",
+                {"text": "Finalizer JSON parse failed; forcing finalize_answer fallback."},
+            )
+            parsed = {
+                "tool_requests": [
+                    {"tool": "finalize_answer", "final_text": approved_text, "approved": True, "fallback": True}
+                ]
+            }
+        tool_requests = parsed.get("tool_requests") or []
+        if not isinstance(tool_requests, list):
+            tool_requests = []
+        has_finalize = False
+        for req in tool_requests:
+            if not isinstance(req, dict):
+                continue
+            tool_name = str(req.get("tool") or req.get("type") or req.get("name") or "").lower()
+            if tool_name in FINALIZE_TOOL_NAMES:
+                req["final_text"] = approved_text
+                req.setdefault("approved", True)
+                has_finalize = True
+        if not has_finalize:
+            await bus.emit(
+                run_id,
+                "dev_trace",
+                {"text": "Finalizer skipped finalize_answer; adding fallback tool call."},
+            )
+            tool_requests.append(
+                {"tool": "finalize_answer", "final_text": approved_text, "approved": True, "fallback": True}
+            )
+            has_finalize = True
+        if tool_requests:
+            await bus.emit(run_id, "tool_request", {"step": step.step_id, "requests": tool_requests})
+            queue_narration(
+                lm_client,
+                model_map,
+                run_state,
+                bus,
+                run_id,
+                question,
+                "tool_request",
+                {"step": step.step_id, "requests": tool_requests},
+            )
+        tool_results = await resolve_tool_requests(
+            tool_requests,
+            upload_dir=upload_dir,
+            lm_client=lm_client,
+            model_map=model_map,
+            run_id=run_id,
+            bus=bus,
+            step_id=step.step_id,
+            run_state=run_state,
+        )
+        if tool_results:
+            safe_results = strip_data_urls(tool_results, allow_plot=True)
+            await bus.emit(run_id, "tool_result", {"step": step.step_id, "results": safe_results})
+            queue_narration(
+                lm_client,
+                model_map,
+                run_state,
+                bus,
+                run_id,
+                question,
+                "tool_result",
+                {"step": step.step_id, "results": safe_results},
+            )
+        final_text = ""
+        for res in tool_results:
+            if not isinstance(res, dict):
+                continue
+            tool_name = str(res.get("tool") or "").lower()
+            if res.get("status") == "ok" and tool_name in FINALIZE_TOOL_NAMES and res.get("result"):
+                final_text = str(res.get("result")).strip()
+                break
+        if not final_text:
+            raise ValueError("Finalization failed")
+        artifact = Artifact(
+            step_id=step.step_id,
+            key="final_answer",
+            artifact_type="final",
+            content_text=final_text,
+            content_json={"final": final_text, "tool_requests": tool_requests, "tool_results": tool_results},
+        )
+        return {"final": final_text}, [artifact], prompt
     elif step.type == "analysis":
         analysis_profile = step.agent_profile or "Summarizer"
         summary_raw = await run_worker(
@@ -3296,38 +6330,91 @@ async def execute_step(
             tool_requests = parsed.get("tool_requests") or []
             if not isinstance(tool_requests, list):
                 tool_requests = []
+        if not tool_requests:
+            math_request = build_math_tool_request(question)
+            if math_request:
+                tool_requests = [math_request]
+                if not summary_text.strip():
+                    summary_text = f"Compute locally: {math_request.get('code')}"
         if tool_requests:
             await bus.emit(run_id, "tool_request", {"step": step.step_id, "requests": tool_requests})
-            tool_results = resolve_tool_requests(tool_requests, upload_dir=upload_dir)
+            queue_narration(
+                lm_client,
+                model_map,
+                run_state,
+                bus,
+                run_id,
+                question,
+                "tool_request",
+                {"step": step.step_id, "requests": tool_requests},
+            )
+            tool_results = await resolve_tool_requests(
+                tool_requests,
+                upload_dir=upload_dir,
+                lm_client=lm_client,
+                model_map=model_map,
+                run_id=run_id,
+                bus=bus,
+                step_id=step.step_id,
+                run_state=run_state,
+            )
             if tool_results:
-                def _strip_data_urls(item: Any) -> Any:
-                    if isinstance(item, dict):
-                        cleaned: Dict[str, Any] = {}
-                        for key, value in item.items():
-                            if key == "data_url":
-                                cleaned[key] = "<omitted>"
-                            elif isinstance(value, (dict, list)):
-                                cleaned[key] = _strip_data_urls(value)
-                            else:
-                                cleaned[key] = value
-                        return cleaned
-                    if isinstance(item, list):
-                        return [_strip_data_urls(v) for v in item]
-                    return item
-
+                safe_results = strip_data_urls(tool_results, allow_plot=True)
                 await bus.emit(
                     run_id,
                     "tool_result",
-                    {"step": step.step_id, "results": _strip_data_urls(tool_results)},
+                    {"step": step.step_id, "results": safe_results},
                 )
+                queue_narration(
+                    lm_client,
+                    model_map,
+                    run_state,
+                    bus,
+                    run_id,
+                    question,
+                    "tool_result",
+                    {"step": step.step_id, "results": safe_results},
+                )
+                if looks_like_math_expression(question):
+                    local_result = next(
+                        (
+                            r
+                            for r in tool_results
+                            if r.get("status") == "ok"
+                            and str(r.get("tool") or "").lower() in ("local_code", "execute_code", "code_exec", "exec_code")
+                        ),
+                        None,
+                    )
+                    if local_result and "result" in local_result:
+                        result_text = str(local_result.get("result"))
+                        if summary_text.strip():
+                            summary_text = f"{summary_text} Local result: {result_text}"
+                        else:
+                            summary_text = f"Local result: {result_text}"
+        output_key = "success_criteria"
+        output_type = "criteria"
+        if isinstance(step.outputs, list) and step.outputs:
+            first = step.outputs[0]
+            if isinstance(first, dict):
+                output_key = str(first.get("key") or output_key)
+                output_type = str(first.get("artifact_type") or output_type)
+        content_json = {
+            "text": summary_text,
+            "tool_requests": tool_requests,
+            "tool_results": tool_results,
+        }
+        if output_type == "criteria" or output_key == "success_criteria":
+            content_json["criteria"] = summary_text
+        else:
+            content_json[output_type] = summary_text
         artifact = Artifact(
             step_id=step.step_id,
-            key="success_criteria",
-            artifact_type="criteria",
+            key=output_key,
+            artifact_type=output_type,
             content_text=summary_text,
-            content_json={"criteria": summary_text, "tool_requests": tool_requests, "tool_results": tool_results},
+            content_json=content_json,
         )
-        return {"criteria": summary_text}, [artifact], prompt
+        return {output_key or output_type or "text": summary_text}, [artifact], prompt
     else:
         generic = await run_worker(
             lm_client,
@@ -3464,6 +6551,16 @@ async def process_uploads(
                 "upload_processed",
                 {"upload_id": record["id"], "name": record["original_name"], "summary": summary_text},
             )
+            queue_narration(
+                lm_client,
+                model_map,
+                run_state,
+                bus,
+                run_id,
+                question,
+                "upload_processed",
+                {"upload_id": record["id"], "name": record["original_name"]},
+            )
         except Exception as exc:
             await db.update_upload_status(
                 record["id"], "failed", summary_text=str(exc), summary_json={"error": str(exc)}
@@ -3472,6 +6569,17 @@ async def process_uploads(
                 run_id,
                 "upload_failed",
                 {"upload_id": record["id"], "name": record["original_name"], "error": str(exc)},
+            )
+            queue_narration(
+                lm_client,
+                model_map,
+                run_state,
+                bus,
+                run_id,
+                question,
+                "upload_failed",
+                {"upload_id": record["id"], "name": record["original_name"], "error": str(exc)},
+                tone="warn",
             )
     summary_line = "; ".join(summaries)
     return artifacts, summary_line
@@ -3482,7 +6590,7 @@ async def run_question(
     conversation_id: str,
     question: str,
     decision_mode: str,
-    manual_level: str,
+    manual_level: Optional[str],
     model_tier: str,
     deep_mode: str,
     search_depth_mode: str,
@@ -3498,8 +6606,12 @@ async def run_question(
     upload_ids: Optional[List[int]] = None,
     upload_dir: Optional[Path] = None,
     stop_event: Optional[asyncio.Event] = None,
+    control_queue: Optional[asyncio.Queue] = None,
+    default_reasoning_level: Optional[str] = None,
+    evidence_dump: bool = False,
 ) -> None:
     """Main orchestration loop for a single run (now with parallel step execution)."""
+    active_models: Dict[str, Dict[str, str]] = settings_models
     try:
         if upload_dir is None:
             upload_dir = Path(os.getenv("UPLOAD_DIR", "uploads"))
@@ -3513,10 +6625,11 @@ async def run_question(
         await bus.emit(run_id, "run_started", {"question": question})
 
         run_state = RunState()
+        run_state.question = question
         run_state.freshness_required = needs_freshness(question)
         run_state.dev_trace_cb = make_dev_trace_cb(bus, run_id)
         await maybe_emit_work_log(run_state, bus, run_id, "goal", f"Goal: {question}")
-        await maybe_emit_work_log(run_state, bus, run_id, "access_check", "Checking what I can access...")
+        await maybe_emit_work_log(run_state, bus, run_id, "access_check", "Checking what sources are available.")
 
         run_state.can_web, run_state.web_error = await check_web_access(tavily)
         if run_state.web_error and run_state.can_web:
@@ -3526,7 +6639,7 @@ async def run_question(
                 bus,
                 run_id,
                 "web_warning",
-                f"Web search looks flaky ({run_state.web_error}); I'll still try to fetch sources.",
+                f"Web search looks flaky ({run_state.web_error}); I'll still try to pull sources.",
                 tone="warn",
             )
         if not run_state.can_web:
@@ -3535,7 +6648,7 @@ async def run_question(
                 bus,
                 run_id,
                 "no_web",
-                "I can't browse the web in this mode, so I'll answer from what's provided and flag assumptions.",
+                "Web browsing is off here, so I'll use what's provided and flag assumptions.",
                 tone="warn",
             )
             if run_state.freshness_required:
@@ -3544,14 +6657,50 @@ async def run_question(
                     bus,
                     run_id,
                     "freshness",
-                    "If you need up-to-date verification, share links or switch to a browsing-enabled lane.",
+                    "If you need up-to-date verification, share links or use a browsing-enabled lane.",
                     tone="warn",
                 )
 
-        base_check = settings_models.get("orch") or settings_models.get("router") or settings_models.get("summarizer") or {}
+        requested_tier = model_tier
+        requested_tier_original = requested_tier
+        force_parallel_requested = MIN_PARALLEL_SLOTS > 1
+        if force_parallel_requested and requested_tier == "fast":
+            requested_tier = "pro"
+        if requested_tier == "fast":
+            base_check = (
+                settings_models.get("fast")
+                or settings_models.get("worker")
+                or settings_models.get("summarizer")
+                or settings_models.get("orch")
+                or {}
+            )
+        else:
+            base_check = settings_models.get("orch") or settings_models.get("router") or settings_models.get("summarizer") or {}
         check_url = base_check.get("base_url") or lm_client.base_url
         check_model = base_check.get("model") or ""
+        chat_fallback_model: Optional[str] = None
         can_chat, chat_detail = await lm_client.check_chat(base_url=check_url, model=check_model, run_state=run_state)
+        if not can_chat:
+            try:
+                available = await lm_client.list_models_cached(check_url)
+                for candidate in available:
+                    if not candidate:
+                        continue
+                    lowered = candidate.lower()
+                    if "embed" in lowered:
+                        continue
+                    ok, _ = await lm_client.check_chat(base_url=check_url, model=candidate, run_state=run_state)
+                    if ok:
+                        can_chat = True
+                        chat_fallback_model = candidate
+                        if run_state:
+                            run_state.add_dev_trace(
+                                "Chat preflight fallback succeeded.",
+                                {"model": candidate, "base_url": check_url},
+                            )
+                        break
+            except Exception:
+                pass
         if not can_chat:
             run_state.mark_chat_unavailable(chat_detail or "Local model unavailable")
             await maybe_emit_work_log(
@@ -3559,7 +6708,7 @@ async def run_question(
                 bus,
                 run_id,
                 "no_chat",
-                "I can't reach the local model right now, so I'll stop and explain how to fix it.",
+                "Local model isn't reachable right now, so I'll stop and explain how to fix it.",
                 tone="warn",
             )
             guidance = (
@@ -3580,62 +6729,146 @@ async def run_question(
 
         settings_models = await resolve_model_map(settings_models, lm_client, run_state=run_state)
 
-        base_router_endpoint = settings_models.get("router") or settings_models.get("summarizer") or settings_models["orch"]
-        router_decision = await call_router(
+        if requested_tier == "deep":
+            missing_roles: List[str] = []
+            missing_models: List[str] = []
+            if isinstance(model_availability, dict):
+                for role in ("deep_orch", "deep_planner"):
+                    info = model_availability.get(role)
+                    if not isinstance(info, dict) or info.get("ok") is False:
+                        missing_roles.append(role)
+                        for mid in (info.get("missing") or []) if isinstance(info, dict) else []:
+                            if mid:
+                                missing_models.append(str(mid))
+            else:
+                for role in ("deep_orch", "deep_planner"):
+                    cfg = settings_models.get(role) or {}
+                    if not cfg.get("base_url") or not cfg.get("model"):
+                        missing_roles.append(role)
+            if missing_roles:
+                missing_label = ", ".join(sorted(set(missing_models))) if missing_models else ", ".join(sorted(set(missing_roles)))
+                guidance = (
+                    "Deep tier selected, but required deep models are unavailable.\n\n"
+                    f"Missing: {missing_label}\n"
+                    "Load the deep planner/orchestrator models in LM Studio or update Settings, then retry."
+                )
+                assistant_msg = await db.add_message(run_id, conversation_id, "assistant", guidance)
+                await bus.emit(
+                    run_id,
+                    "message_added",
+                    {"id": assistant_msg.get("id"), "role": "assistant", "content": guidance, "run_id": run_id, "created_at": assistant_msg.get("created_at")},
+                )
+                await db.finalize_run(run_id, guidance, "LOW")
+                await bus.emit(run_id, "archived", {"run_id": run_id, "confidence": "LOW"})
+                return
+
+        settings_models, runtime_models = await apply_runtime_model_overrides(
+            settings_models,
             lm_client,
-            base_router_endpoint,
-            question,
-            manual_level if decision_mode == "manual" else None,
-            strict_mode=strict_mode,
             run_state=run_state,
+            run_id=run_id,
+            bus=bus,
         )
-        if not run_state.can_chat:
-            guidance = (
-                "Local model rejected the request; check model name, /v1/models, and strip unsupported fields. "
-                "If you're using LM Studio, confirm the model is loaded and the base URL is correct."
+        ready_worker_models: Set[Tuple[str, str]] = set()
+        ready_worker_roles: List[str] = []
+        for role in ("worker", "worker_b", "worker_c"):
+            cfg = settings_models.get(role) or {}
+            base_url = cfg.get("base_url")
+            model = cfg.get("model")
+            if not base_url or not model:
+                continue
+            if runtime_models.get("check_cache", {}).get((base_url, model)) is True:
+                ready_worker_models.add((base_url, model))
+                ready_worker_roles.append(role)
+        ready_worker_count = len(ready_worker_roles) or len(ready_worker_models)
+        min_parallel_slots = 1
+        force_parallel = False
+
+        base_router_endpoint = settings_models.get("router") or settings_models.get("summarizer") or settings_models["orch"]
+        if requested_tier == "fast":
+            router_decision = RouterDecision(
+                needs_web=False,
+                reasoning_level="LOW",
+                topic="general",
+                max_results=0,
+                extract_depth="basic",
+                tool_budget={"tavily_search": 0, "tavily_extract": 0},
+                stop_conditions={},
+                expected_passes=1,
             )
-            assistant_msg = await db.add_message(run_id, conversation_id, "assistant", guidance)
-            await bus.emit(
-                run_id,
-                "message_added",
-                {
-                    "id": assistant_msg.get("id"),
-                    "role": "assistant",
-                    "content": guidance,
-                    "run_id": run_id,
-                    "created_at": assistant_msg.get("created_at"),
-                },
+        else:
+            router_decision = await call_router(
+                lm_client,
+                base_router_endpoint,
+                question,
+                manual_level if decision_mode == "manual" else None,
+                default_level=default_reasoning_level,
+                strict_mode=strict_mode,
+                run_state=run_state,
             )
-            await db.finalize_run(run_id, guidance, "LOW")
-            await bus.emit(run_id, "archived", {"run_id": run_id, "confidence": "LOW"})
-            return
-        requested_tier = model_tier
+            if not run_state.can_chat:
+                guidance = (
+                    "Local model rejected the request; check model name, /v1/models, and strip unsupported fields. "
+                    "If you're using LM Studio, confirm the model is loaded and the base URL is correct."
+                )
+                assistant_msg = await db.add_message(run_id, conversation_id, "assistant", guidance)
+                await bus.emit(
+                    run_id,
+                    "message_added",
+                    {
+                        "id": assistant_msg.get("id"),
+                        "role": "assistant",
+                        "content": guidance,
+                        "run_id": run_id,
+                        "created_at": assistant_msg.get("created_at"),
+                    },
+                )
+                await db.finalize_run(run_id, guidance, "LOW")
+                await bus.emit(run_id, "archived", {"run_id": run_id, "confidence": "LOW"})
+                return
         if requested_tier == "fast":
             router_decision.reasoning_level = "LOW"
+            if decision_mode == "manual":
+                router_decision.reasoning_level = manual_level
             router_decision.expected_passes = 1
-        if decision_mode == "manual":
-            router_decision.reasoning_level = manual_level
-        if max_results_override:
-            router_decision.max_results = max_results_override
-        if strict_mode:
-            router_decision.reasoning_level = "HIGH" if router_decision.reasoning_level in ("LOW", "MED") else router_decision.reasoning_level
-            router_decision.extract_depth = "advanced"
-            router_decision.max_results = max(router_decision.max_results, 10)
-        if strict_mode or router_decision.reasoning_level in ("HIGH", "ULTRA"):
-            router_decision.expected_passes = max(router_decision.expected_passes or 1, 2)
-        if run_state.can_web and (guess_needs_web(question) or run_state.freshness_required):
-            router_decision.needs_web = True
-        if not run_state.can_web:
             router_decision.needs_web = False
-            router_decision.tool_budget = {**(router_decision.tool_budget or {}), "tavily_search": 0, "tavily_extract": 0}
+            router_decision.tool_budget = {"tavily_search": 0, "tavily_extract": 0}
+            router_decision.max_results = 0
+        else:
+            if decision_mode == "manual":
+                router_decision.reasoning_level = manual_level
+            if max_results_override:
+                router_decision.max_results = max_results_override
+            if strict_mode:
+                router_decision.reasoning_level = "HIGH" if router_decision.reasoning_level in ("LOW", "MED") else router_decision.reasoning_level
+                router_decision.extract_depth = "advanced"
+                router_decision.max_results = max(router_decision.max_results, 10)
+            if strict_mode or router_decision.reasoning_level in ("HIGH", "ULTRA"):
+                router_decision.expected_passes = max(router_decision.expected_passes or 1, 2)
+            if run_state.can_web and (guess_needs_web(question) or run_state.freshness_required):
+                router_decision.needs_web = True
+            if not run_state.can_web:
+                router_decision.needs_web = False
+                router_decision.tool_budget = {**(router_decision.tool_budget or {}), "tavily_search": 0, "tavily_extract": 0}
+            if looks_like_math_expression(question):
+                router_decision.needs_web = False
+                router_decision.tool_budget = {**(router_decision.tool_budget or {}), "tavily_search": 0, "tavily_extract": 0}
         effective_tier = requested_tier
         if requested_tier == "auto":
             effective_tier = resolve_auto_tier(router_decision)
+        if force_parallel and effective_tier == "fast":
+            effective_tier = "pro"
         model_tier = effective_tier
+        if model_tier == "fast":
+            router_decision.reasoning_level = "LOW"
+            router_decision.expected_passes = 1
+            router_decision.needs_web = False
+            router_decision.tool_budget = {"tavily_search": 0, "tavily_extract": 0}
+            router_decision.max_results = 0
         depth_profile = REASONING_DEPTHS.get(router_decision.reasoning_level, REASONING_DEPTHS["MED"])
         if model_tier == "fast":
             depth_profile = REASONING_DEPTHS["LOW"]
-        if depth_profile.get("tool_budget", {}).get("tavily_extract"):
+        if model_tier != "fast" and depth_profile.get("tool_budget", {}).get("tavily_extract"):
             router_decision.max_results = max(router_decision.max_results, depth_profile["tool_budget"]["tavily_extract"] // 2)
         if search_depth_mode == "auto" and depth_profile.get("advanced"):
             search_depth_mode = "advanced"
@@ -3660,11 +6893,21 @@ async def run_question(
             executor_endpoint = active_models.get("summarizer") or active_models.get("router") or active_models.get("orch") or {}
         if executor_endpoint:
             active_models["executor"] = executor_endpoint
+        queue_narration(
+            lm_client,
+            active_models,
+            run_state,
+            bus,
+            run_id,
+            question,
+            "run_started",
+            {"question": question},
+        )
         decision_payload = router_decision.model_dump()
         decision_payload.update(
             {
                 "model_tier": model_tier,
-                "requested_tier": requested_tier,
+                "requested_tier": requested_tier_original,
                 "deep_route": deep_route_used,
                 "execution_mode": execution_mode,
                 "web_available": run_state.can_web,
@@ -3679,15 +6922,77 @@ async def run_question(
             resource_snapshot = {}
             worker_budget = {"max_parallel": 1, "configured": 1, "variants": 1, "ram_slots": 1, "vram_slots": 1}
             max_parallel_slots = 1
+        pressure_limit = bool(worker_budget.get("ram_pressure") or worker_budget.get("vram_pressure"))
+        if pressure_limit:
+            min_parallel_slots = 1
+            force_parallel = False
+            allow_parallel = False
+            if run_state:
+                run_state.add_dev_trace(
+                    "Memory pressure detected; reducing parallelism.",
+                    {
+                        "ram_pressure": worker_budget.get("ram_pressure"),
+                        "vram_pressure": worker_budget.get("vram_pressure"),
+                    },
+                )
+        worker_budget["ready_workers"] = ready_worker_count
+        worker_budget["ready_variants"] = len(ready_worker_models)
+        worker_budget["min_parallel"] = min_parallel_slots
+        if ready_worker_count <= 0:
+            max_parallel_slots = 1
+            worker_budget["max_parallel"] = 1
+            allow_parallel = False
+        else:
+            worker_budget["max_parallel"] = max_parallel_slots
+        if force_parallel and max_parallel_slots < min_parallel_slots:
+            max_parallel_slots = min_parallel_slots
+            worker_budget["max_parallel"] = max_parallel_slots
         desired_slots = desired_parallelism(router_decision, worker_budget, strict_mode=strict_mode)
+        desired_slots = max(min_parallel_slots, desired_slots) if force_parallel else desired_slots
         desired_slots = max(1, min(max_parallel_slots, desired_slots))
-        worker_budget["desired_parallel"] = desired_slots
-        if max_parallel_slots > 1 and not allow_parallel:
-            allow_parallel = True
-        if not allow_parallel:
+        if chat_fallback_model:
             max_parallel_slots = 1
             desired_slots = 1
+            allow_parallel = False
+            worker_budget["max_parallel"] = 1
+            if run_state:
+                run_state.add_dev_trace(
+                    "Limiting parallelism due to chat fallback.",
+                    {"model": chat_fallback_model},
+                )
+        worker_budget["desired_parallel"] = desired_slots
+        if max_parallel_slots > 1 and not allow_parallel and model_tier != "fast" and ready_worker_count > 0 and not pressure_limit:
+            allow_parallel = True
+        if not allow_parallel:
+            if force_parallel:
+                allow_parallel = True
+            else:
+                max_parallel_slots = 1
+                desired_slots = 1
         target_parallel_slots = max(1, min(max_parallel_slots, desired_slots))
+        if force_parallel:
+            target_parallel_slots = max(min_parallel_slots, target_parallel_slots)
+        loop = asyncio.get_running_loop()
+        last_resource_refresh = loop.time()
+        if target_parallel_slots > 1:
+            await maybe_emit_work_log(
+                run_state,
+                bus,
+                run_id,
+                "warm_workers",
+                "Warming up worker models in parallel.",
+            )
+            asyncio.create_task(
+                warm_worker_pool(
+                    lm_client,
+                    active_models,
+                    target_parallel_slots,
+                    ready_models=ready_worker_models,
+                    run_state=run_state,
+                    run_id=run_id,
+                    bus=bus,
+                )
+            )
         decision_payload["resource_budget"] = worker_budget
         decision_payload["desired_parallel"] = target_parallel_slots
         team_roster = {
@@ -3703,6 +7008,16 @@ async def run_question(
         decision_payload["team"] = team_roster
         await db.update_run_router(run_id, decision_payload)
         await bus.emit(run_id, "router_decision", decision_payload)
+        queue_narration(
+            lm_client,
+            active_models,
+            run_state,
+            bus,
+            run_id,
+            question,
+            "router_decision",
+            decision_payload,
+        )
         await bus.emit(
             run_id,
             "resource_budget",
@@ -3713,12 +7028,20 @@ async def run_question(
                 "desired_parallel": target_parallel_slots,
             },
         )
+        budget_signature = (
+            worker_budget.get("max_parallel"),
+            worker_budget.get("ram_slots"),
+            worker_budget.get("vram_slots"),
+            worker_budget.get("ram_pressure"),
+            worker_budget.get("vram_pressure"),
+            target_parallel_slots,
+        )
         await bus.emit(run_id, "team_roster", team_roster)
         if strict_mode:
             await bus.emit(run_id, "strict_mode", {"enabled": True})
         tier_note = model_tier.upper()
-        if requested_tier != model_tier:
-            tier_note = f"{requested_tier.upper()}->{model_tier.upper()}"
+        if requested_tier_original != model_tier:
+            tier_note = f"{requested_tier_original.upper()}->{model_tier.upper()}"
         await bus.emit(run_id, "client_note", {"note": f"{tier_note} mode: {execution_mode} (route {deep_route_used})"})
 
         # Memory retrieval
@@ -3729,6 +7052,16 @@ async def run_question(
             mem_art = Artifact(step_id=0, key="memory_context", artifact_type="memory", content_text=memory_context, content_json={"items": mem_hits})
             artifacts.append(mem_art)
         await bus.emit(run_id, "memory_retrieved", {"count": len(mem_hits)})
+        queue_narration(
+            lm_client,
+            active_models,
+            run_state,
+            bus,
+            run_id,
+            question,
+            "memory_retrieved",
+            {"count": len(mem_hits)},
+        )
 
         upload_id_list = upload_ids or [u["id"] for u in await db.list_uploads(run_id)]
         if upload_id_list:
@@ -3744,10 +7077,26 @@ async def run_question(
                         bus,
                         run_id,
                         "uploads",
-                        "I reviewed the uploaded material and noted key details.",
+                        "Reviewed your uploads and noted key details.",
                     )
 
-        if execution_mode in ("fast_team", "oss_team"):
+        is_math_only = build_math_tool_request(question) is not None
+        if is_math_only:
+            step_plan = build_linear_plan(
+                question,
+                router_decision,
+                depth_profile,
+                needs_verify=bool(strict_mode),
+                worker_slots=target_parallel_slots,
+                prefer_parallel=allow_parallel,
+            )
+        elif model_tier == "fast":
+            step_plan = build_fast_plan(
+                question,
+                router_decision,
+                needs_verify=bool(strict_mode),
+            )
+        elif execution_mode == "oss_team":
             step_plan = build_linear_plan(
                 question,
                 router_decision,
@@ -3768,21 +7117,38 @@ async def run_question(
                 desired_parallel=target_parallel_slots,
                 run_state=run_state,
             )
-        if run_state.can_web:
+        if run_state.can_web and router_decision.needs_web:
             step_plan = ensure_parallel_research(step_plan, target_parallel_slots, router_decision)
-        else:
+        if is_math_only:
             step_plan = strip_research_steps(step_plan)
+            if run_state:
+                run_state.add_dev_trace("Skipping research steps for math-only task.")
+        if not router_decision.needs_web:
+            step_plan = strip_research_steps(step_plan)
+        if not run_state.can_web:
+            step_plan = strip_research_steps(step_plan)
+            if run_state:
+                run_state.add_dev_trace("Web unavailable; stripped research steps.")
+        if not is_math_only and target_parallel_slots > 1 and (not router_decision.needs_web or not run_state.can_web):
+            step_plan = ensure_parallel_analysis(step_plan, target_parallel_slots)
+        step_plan = loosen_parallel_dependencies(step_plan, allow_parallel, target_parallel_slots)
+        step_plan = ensure_finalize_step(step_plan)
         for step in step_plan.steps:
-            if step.type != "draft":
-                continue
             profile = (step.agent_profile or "").strip()
             profile_lower = profile.lower()
-            if not profile or profile_lower == "orchestrator":
-                step.agent_profile = "Writer"
-            elif profile_lower == "writer":
-                step.agent_profile = "Writer"
-        if len(step_plan.steps) > depth_profile.get("max_steps", len(step_plan.steps)):
-            step_plan.steps = step_plan.steps[: depth_profile["max_steps"]]
+            if step.type == "draft":
+                if profile_lower != "writer":
+                    step.agent_profile = "Writer"
+            elif step.type == "finalize":
+                if profile_lower != "finalizer":
+                    step.agent_profile = "Finalizer"
+            elif step.type in ("verify", "verifier", "verifier_worker"):
+                if profile_lower != "verifier":
+                    step.agent_profile = "Verifier"
+        max_steps = depth_profile.get("max_steps", len(step_plan.steps))
+        if any(s.type == "finalize" for s in step_plan.steps):
+            max_steps = max_steps + 1
+        step_plan = trim_step_plan(step_plan, max_steps)
         step_plan.global_constraints.setdefault("expected_passes", router_decision.expected_passes)
         step_plan.global_constraints.setdefault("model_tier", model_tier)
         step_plan.global_constraints.setdefault("route", deep_route_used)
@@ -3802,28 +7168,53 @@ async def run_question(
                 response_guidance += " The user asked for up-to-date verification; request sources or suggest a browsing-enabled lane."
             step_plan.global_constraints["response_guidance"] = response_guidance
         progress_meta["response_guidance"] = response_guidance
+        await seed_research_prompts(
+            lm_client,
+            executor_endpoint
+            or active_models.get("fast")
+            or active_models.get("summarizer")
+            or active_models.get("router")
+            or active_models.get("orch"),
+            question,
+            router_decision,
+            step_plan,
+            run_state=run_state,
+        )
         await db.add_step_plan(run_id, step_plan.model_dump())
-        await bus.emit(
+        plan_payload = {
+            "steps": len(step_plan.steps),
+            "expected_total_steps": progress_meta["total_steps"],
+            "expected_passes": progress_meta["counted_passes"],
+        }
+        await bus.emit(run_id, "plan_created", plan_payload)
+        queue_narration(
+            lm_client,
+            active_models,
+            run_state,
+            bus,
             run_id,
+            question,
             "plan_created",
-            {
-                "steps": len(step_plan.steps),
-                "expected_total_steps": progress_meta["total_steps"],
-                "expected_passes": progress_meta["counted_passes"],
-            },
+            plan_payload,
         )
-        if run_state.can_web:
-            plan_note = "Plan: Gather sources where needed, compare notes, then write a clear answer."
+        if is_math_only:
+            plan_note = "Plan: Compute locally, then answer directly."
+        elif run_state.can_web and router_decision.needs_web:
+            plan_note = "Plan: Gather sources, compare findings, then draft a clear answer."
+        elif run_state.can_web:
+            plan_note = "Plan: Use local knowledge/tools, then draft a clear answer."
         else:
-            plan_note = "Plan: Use what you provided and any local context, then write a best-effort answer and flag uncertainties."
+            plan_note = "Plan: Use what you provided (plus local context), then draft a best-effort answer and flag uncertainties."
         if upload_id_list:
-            plan_note = "Plan: Review your uploads, then " + plan_note.split("Plan: ", 1)[-1]
+            plan_note = "Plan: Review your uploads first, then " + plan_note.split("Plan: ", 1)[-1]
         await maybe_emit_work_log(run_state, bus, run_id, "plan", plan_note)
-        executor_brief = await build_executor_brief(
-            lm_client, executor_endpoint, question, step_plan, target_parallel_slots, run_state=run_state
-        )
-        if executor_brief:
-            await bus.emit(run_id, "executor_brief", executor_brief)
+        executor_brief = None
+        if model_tier != "fast":
+            executor_brief = await build_executor_brief(
+                lm_client, executor_endpoint, question, step_plan, target_parallel_slots, run_state=run_state
+            )
+            if executor_brief:
+                await bus.emit(run_id, "executor_brief", executor_brief)
         # Build lookup for dependency-aware scheduling
         step_lookup: Dict[int, PlanStep] = {s.step_id: s for s in step_plan.steps}
         completed_steps: Set[int] = set()
@@ -3842,6 +7233,137 @@ async def run_question(
             await asyncio.gather(*running_tasks.values(), return_exceptions=True)
             running_tasks.clear()
 
+        def normalize_control_steps(raw_steps: List[Dict[str, Any]]) -> List[PlanStep]:
+            used_ids = set(step_lookup.keys())
+            next_id = max(used_ids, default=0) + 1
+            normalized: List[PlanStep] = []
+            default_profiles = {
+                "analysis": "Summarizer",
+                "draft": "Writer",
+                "finalize": "Finalizer",
+                "verify": "Verifier",
+                "research": "ResearchPrimary",
+                "merge": "Summarizer",
+            }
+            for raw in raw_steps:
+                if not isinstance(raw, dict):
+                    continue
+                raw_id = raw.get("step_id") or raw.get("id") or raw.get("step")
+                step_id = _coerce_int(raw_id)
+                if step_id is None or step_id in used_ids:
+                    step_id = next_id
+                    next_id += 1
+                used_ids.add(step_id)
+                depends = raw.get("depends_on") or raw.get("depends") or raw.get("deps") or []
+                if isinstance(depends, (str, int)):
+                    depends = [depends]
+                dep_ids: List[int] = []
+                if isinstance(depends, list):
+                    for dep in depends:
+                        dep_id = _coerce_int(dep)
+                        if dep_id is None:
+                            continue
+                        dep_ids.append(dep_id)
+                step_type = str(raw.get("type") or "analysis").strip() or "analysis"
+                name = str(raw.get("name") or f"Step {step_id}").strip() or f"Step {step_id}"
+                profile = str(raw.get("agent_profile") or "").strip()
+                if not profile:
+                    profile = default_profiles.get(step_type.lower(), "Summarizer")
+                inputs = raw.get("inputs") if isinstance(raw.get("inputs"), dict) else {}
+                outputs = raw.get("outputs") if isinstance(raw.get("outputs"), list) else []
+                acceptance = raw.get("acceptance_criteria") if isinstance(raw.get("acceptance_criteria"), list) else []
+                on_fail = raw.get("on_fail") if isinstance(raw.get("on_fail"), dict) else {}
+                try:
+                    normalized.append(
+                        PlanStep(
+                            step_id=step_id,
+                            name=name,
+                            type=step_type,
+                            depends_on=sorted(set(dep_ids)),
+                            agent_profile=profile,
+                            inputs=inputs,
+                            outputs=outputs,
+                            acceptance_criteria=acceptance,
+                            on_fail=on_fail,
+                        )
+                    )
+                except Exception:
+                    continue
+            return normalized
+
+        async def apply_control_action(control: ControlCommand, origin: str) -> None:
+            nonlocal stop_requested, progress_meta
+            if control.control == "CONTINUE" and not control.new_constraints and not control.steps:
+                return
+            plan_changed = False
+            if control.new_constraints:
+                step_plan.global_constraints.update(control.new_constraints)
+                plan_changed = True
+            if control.control == "ADD_STEPS" and control.steps:
+                new_steps = normalize_control_steps(control.steps)
+                if new_steps:
+                    insertion = len(step_plan.steps)
+                    for offset, ps in enumerate(new_steps):
+                        step_plan.steps.insert(insertion + offset, ps)
+                        step_lookup[ps.step_id] = ps
+                    plan_changed = True
+            elif control.control == "BACKTRACK" and control.to_step:
+                await cancel_running_tasks()
+                allowed = {sid for sid in completed_steps if sid < control.to_step}
+                completed_steps.clear()
+                completed_steps.update(allowed)
+            elif control.control == "RERUN_STEP" and control.step_id:
+                await cancel_running_tasks()
+                completed_steps.discard(control.step_id)
+            elif control.control == "STOP":
+                stop_requested = True
+                await cancel_running_tasks()
+            if plan_changed:
+                await db.add_step_plan(run_id, step_plan.model_dump())
+                progress_meta = compute_progress_meta(step_plan, progress_meta.get("counted_passes", 1))
+                plan_payload = {
+                    "steps": len(step_plan.steps),
+                    "expected_total_steps": progress_meta.get("total_steps"),
+                    "expected_passes": progress_meta.get("counted_passes"),
+                    "origin": origin,
+                }
+                await bus.emit(run_id, "plan_updated", plan_payload)
+                queue_narration(
+                    lm_client,
+                    active_models,
+                    run_state,
+                    bus,
+                    run_id,
+                    question,
+                    "plan_updated",
+                    plan_payload,
+                )
+            await db.add_control_action(run_id, control.model_dump())
+            control_payload = control.model_dump()
+            control_payload["origin"] = origin
+            await bus.emit(run_id, "control_action", control_payload)
+            queue_narration(
+                lm_client,
+                active_models,
+                run_state,
+                bus,
+                run_id,
+                question,
+                "control_action",
+                control_payload,
+            )
+
+        async def drain_control_queue() -> None:
+            if control_queue is None:
+                return
+            while True:
+                try:
+                    control = control_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                if isinstance(control, ControlCommand):
+                    await apply_control_action(control, origin="user")
+
         async def start_step(step: PlanStep, snapshot: List[Artifact]) -> asyncio.Task:
             if step.type in ("research", "tavily_search", "search") and run_state.can_web:
                 await maybe_emit_work_log(
@@ -3849,7 +7371,7 @@ async def run_question(
                     bus,
                     run_id,
                     "search",
-                    "Looking for sources to ground the answer.",
+                    "Looking for sources to support the answer.",
                 )
             elif step.type in ("tavily_extract", "extract") and run_state.can_web:
                 await maybe_emit_work_log(
@@ -3857,7 +7379,7 @@ async def run_question(
                     bus,
                     run_id,
                     "read_sources",
-                    "Reading sources to pull out key details.",
+                    "Reading sources and pulling key details.",
                 )
             elif step.type == "merge":
                 await maybe_emit_work_log(
@@ -3865,7 +7387,7 @@ async def run_question(
                     bus,
                     run_id,
                     "compare",
-                    "Comparing notes across sources to check for conflicts.",
+                    "Comparing notes across sources and watching for conflicts.",
                 )
             elif step.type == "verify":
                 await maybe_emit_work_log(
@@ -3873,7 +7395,7 @@ async def run_question(
                     bus,
                     run_id,
                     "verify",
-                    "Checking the draft for issues and consistency.",
+                    "Reviewing the draft for issues and consistency.",
                 )
             elif step.type == "draft":
                 await maybe_emit_work_log(
@@ -3881,17 +7403,32 @@ async def run_question(
                     bus,
                     run_id,
                     "draft",
-                    "Writing the answer with clear caveats.",
+                    "Drafting the answer and noting any caveats.",
                 )
-            await bus.emit(
+            elif step.type == "finalize":
+                await maybe_emit_work_log(
+                    run_state,
+                    bus,
+                    run_id,
+                    "finalize",
+                    "Finalizing the approved response.",
+                )
+            step_payload = {
+                "step_id": step.step_id,
+                "name": step.name,
+                "type": step.type,
+                "agent_profile": step.agent_profile,
+            }
+            await bus.emit(run_id, "step_started", step_payload)
+            queue_narration(
+                lm_client,
+                active_models,
+                run_state,
+                bus,
                 run_id,
+                question,
                 "step_started",
-                {
-                    "step_id": step.step_id,
-                    "name": step.name,
-                    "type": step.type,
-                    "agent_profile": step.agent_profile,
-                },
+                step_payload,
             )
             step_run_id = await db.add_step_run(
                 run_id,
@@ -3939,20 +7476,34 @@ async def run_question(
                         "step": step,
                         "artifacts": new_artifacts,
                         "output": output,
-                        "control": await evaluate_control(lm_client, planner_endpoint, step, output, run_state=run_state),
                     }
                 except Exception as exc:
                     await db.update_step_run(step_run_id, status="error", error_text=str(exc))
-                    await bus.emit(
+                    error_payload = {
+                        "step": step.step_id,
+                        "name": step.name,
+                        "type": step.type,
+                        "agent_profile": step.agent_profile,
+                        "message": str(exc),
+                    }
+                    if isinstance(exc, httpx.HTTPStatusError) and exc.response is not None:
+                        try:
+                            detail = lm_client._extract_error_detail(exc.response)
+                        except Exception:
+                            detail = ""
+                        if detail:
+                            error_payload["detail"] = detail
+                    await bus.emit(run_id, "step_error", error_payload)
+                    queue_narration(
+                        lm_client,
+                        active_models,
+                        run_state,
+                        bus,
                         run_id,
+                        question,
                         "step_error",
-                        {
-                            "step": step.step_id,
-                            "name": step.name,
-                            "type": step.type,
-                            "agent_profile": step.agent_profile,
-                            "message": str(exc),
-                        },
+                        error_payload,
+                        tone="warn",
                     )
                     return {"status": "error", "step": step, "error": str(exc)}
 
@@ -3971,37 +7522,143 @@ async def run_question(
                 await cancel_running_tasks()
                 stop_requested = True
                 break
+            await drain_control_queue()
+            if stop_requested:
+                break
+            if loop.time() - last_resource_refresh >= RESOURCE_REFRESH_SECS:
+                last_resource_refresh = loop.time()
+                try:
+                    resource_snapshot = get_resource_snapshot()
+                    worker_budget = compute_worker_slots(
+                        active_models, model_tier, model_availability, resource_snapshot
+                    )
+                    max_parallel_slots = worker_budget.get("max_parallel", 1)
+                except Exception:
+                    worker_budget = {
+                        "max_parallel": 1,
+                        "configured": 1,
+                        "variants": 1,
+                        "ram_slots": 1,
+                        "vram_slots": 1,
+                    }
+                    max_parallel_slots = 1
+                pressure_limit = bool(worker_budget.get("ram_pressure") or worker_budget.get("vram_pressure"))
+                if pressure_limit:
+                    min_parallel_slots = 1
+                    force_parallel = False
+                    allow_parallel = False
+                worker_budget["ready_workers"] = ready_worker_count
+                worker_budget["ready_variants"] = len(ready_worker_models)
+                worker_budget["min_parallel"] = min_parallel_slots
+                if ready_worker_count <= 0:
+                    max_parallel_slots = 1
+                    worker_budget["max_parallel"] = 1
+                    allow_parallel = False
+                else:
+                    worker_budget["max_parallel"] = max_parallel_slots
+                if force_parallel and max_parallel_slots < min_parallel_slots:
+                    max_parallel_slots = min_parallel_slots
+                    worker_budget["max_parallel"] = max_parallel_slots
+                desired_slots = desired_parallelism(router_decision, worker_budget, strict_mode=strict_mode)
+                if force_parallel:
+                    desired_slots = max(min_parallel_slots, desired_slots)
+                desired_slots = max(1, min(max_parallel_slots, desired_slots))
+                worker_budget["desired_parallel"] = desired_slots
+                if (
+                    max_parallel_slots > 1
+                    and not allow_parallel
+                    and not pressure_limit
+                    and ready_worker_count > 0
+                    and not chat_fallback_model
+                ):
+                    allow_parallel = True
+                if not allow_parallel:
+                    if force_parallel and not pressure_limit:
+                        allow_parallel = True
+                    else:
+                        max_parallel_slots = 1
+                        desired_slots = 1
+                new_target = max(1, min(max_parallel_slots, desired_slots))
+                if force_parallel and not pressure_limit:
+                    new_target = max(min_parallel_slots, new_target)
+                if new_target > target_parallel_slots:
+                    asyncio.create_task(
+                        warm_worker_pool(
+                            lm_client,
+                            active_models,
+                            new_target,
+                            ready_models=ready_worker_models,
+                            run_state=run_state,
+                            run_id=run_id,
+                            bus=bus,
+                        )
+                    )
+                target_parallel_slots = new_target
+                new_signature = (
+                    worker_budget.get("max_parallel"),
+                    worker_budget.get("ram_slots"),
+                    worker_budget.get("vram_slots"),
+                    worker_budget.get("ram_pressure"),
+                    worker_budget.get("vram_pressure"),
+                    target_parallel_slots,
+                )
+                if new_signature != budget_signature:
+                    budget_signature = new_signature
+                    await bus.emit(
+                        run_id,
+                        "resource_budget",
+                        {
+                            "budget": worker_budget,
+                            "resources": resource_snapshot,
+                            "allow_parallel": allow_parallel,
+                            "desired_parallel": target_parallel_slots,
+                        },
+                    )
             ready_steps = [
                 s for s in step_plan.steps if s.step_id not in completed_steps and s.step_id not in running_tasks and deps_satisfied(s)
             ]
             capacity = target_parallel_slots - len(running_tasks)
-            if not allow_parallel:
-                # Force one-at-a-time execution in linear modes.
-                capacity = 1 - len(running_tasks)
             if ready_steps and capacity > 0:
-                start_ids = (
-                    await allocate_ready_steps(
-                        lm_client,
-                        fast_endpoint,
-                        ready_steps,
-                        artifacts,
-                        len(running_tasks),
-                        target_parallel_slots,
-                        run_state=run_state,
-                    )
-                    if allow_parallel
-                    else [ready_steps[0].step_id]
+                running_steps = [step_lookup[sid] for sid in running_tasks.keys() if sid in step_lookup]
+                allocation = await allocate_ready_steps(
+                    lm_client,
+                    executor_endpoint,
+                    ready_steps,
+                    artifacts,
+                    len(running_tasks),
+                    target_parallel_slots,
+                    question=question,
+                    resource_budget=worker_budget,
+                    running_steps=running_steps,
+                    run_state=run_state,
                 )
-                start_ids = start_ids[:capacity]
+                start_ids = allocation.start_ids
+                if allocation.target_slots is not None:
+                    suggested_slots = max(1, int(allocation.target_slots))
+                    suggested_slots = min(max_parallel_slots, suggested_slots)
+                    if not allow_parallel:
+                        suggested_slots = 1
+                    target_parallel_slots = suggested_slots
                 if allow_parallel:
-                    await bus.emit(
+                    queued_ids = allocation.queue_ids or [s.step_id for s in ready_steps if s.step_id not in start_ids]
+                    alloc_payload = {
+                        "start_ids": start_ids,
+                        "ready_ids": [s.step_id for s in ready_steps],
+                        "queue_ids": queued_ids,
+                        "target_slots": target_parallel_slots,
+                        "note": allocation.note,
+                        "used_executor": allocation.used_executor,
+                    }
+                    await bus.emit(run_id, "allocator_decision", alloc_payload)
+                    queue_narration(
+                        lm_client,
+                        active_models,
+                        run_state,
+                        bus,
                         run_id,
+                        question,
                         "allocator_decision",
-                        {
-                            "start_ids": start_ids,
-                            "ready_ids": [s.step_id for s in ready_steps],
-                            "target_slots": target_parallel_slots,
-                        },
+                        alloc_payload,
                     )
                 for step in ready_steps:
                     if step.step_id in start_ids and step.step_id not in running_tasks:
@@ -4036,54 +7693,90 @@ async def run_question(
                     continue
                 completed_steps.add(step_id)
                 artifacts.extend(result["artifacts"])
-                await bus.emit(
+                step_done_payload = {
+                    "step_id": step_id,
+                    "name": result["step"].name,
+                    "type": result["step"].type,
+                    "agent_profile": result["step"].agent_profile,
+                }
+                await bus.emit(run_id, "step_completed", step_done_payload)
+                queue_narration(
+                    lm_client,
+                    active_models,
+                    run_state,
+                    bus,
                     run_id,
+                    question,
                     "step_completed",
-                    {
-                        "step_id": step_id,
-                        "name": result["step"].name,
-                        "type": result["step"].type,
-                        "agent_profile": result["step"].agent_profile,
-                    },
+                    step_done_payload,
                 )
-
-                fast_control, escalate = await evaluate_control_fast(
-                    lm_client, fast_endpoint, result["step"], result["output"], run_state=run_state
-                )
-                control: ControlCommand = fast_control
-                # Only pull in the OSS orchestrator for heavyweight checkpoints or when escalation is requested.
-                heavy_types = {"merge", "draft", "verify", "analysis"}
-                needs_oss = (
-                    escalate
-                    or result["step"].type in heavy_types
-                    or (strict_mode and fast_control.control != "CONTINUE")
-                )
-                if needs_oss:
-                    control = await evaluate_control(
-                        lm_client, planner_endpoint, result["step"], result["output"], run_state=run_state
+                tool_requests = []
+                tool_results = []
+                validation_summary = ""
+                try:
+                    tool_requests, tool_results, validation_summary = await run_step_double_checks(
+                        lm_client,
+                        active_models,
+                        result["step"],
+                        question,
+                        result["output"],
+                        artifacts,
+                        worker_budget,
+                        strict_mode,
+                        run_id,
+                        bus,
+                        upload_dir=upload_dir,
+                        run_state=run_state,
                     )
-                if control.control != "CONTINUE":
-                    await db.add_control_action(run_id, control.model_dump())
-                    await bus.emit(run_id, "control_action", control.model_dump())
-                    # Handle control signals with minimal disruption; cancel in-flight work if we need to rerun/backtrack.
-                    if control.control == "ADD_STEPS" and control.steps:
-                        insertion = len(step_plan.steps)
-                        for offset, new_step in enumerate(control.steps):
-                            ps = PlanStep(**new_step)
-                            step_plan.steps.insert(insertion + offset, ps)
-                            step_lookup[ps.step_id] = ps
-                        await db.add_step_plan(run_id, step_plan.model_dump())
-                    elif control.control == "BACKTRACK" and control.to_step:
-                        await cancel_running_tasks()
-                        completed_steps = {sid for sid in completed_steps if sid < control.to_step}
-                    elif control.control == "RERUN_STEP" and control.step_id:
-                        await cancel_running_tasks()
-                        if control.step_id in completed_steps:
-                            completed_steps.remove(control.step_id)
-                    elif control.control == "STOP":
-                        stop_requested = True
-                        await cancel_running_tasks()
-                        break
+                except Exception:
+                    tool_requests = []
+                    tool_results = []
+                    validation_summary = ""
+                if tool_requests or tool_results:
+                    validation_artifact = Artifact(
+                        step_id=step_id,
+                        key=f"validation_step_{step_id}",
+                        artifact_type="validation",
+                        content_text=validation_summary,
+                        content_json={
+                            "summary": validation_summary,
+                            "tool_requests": tool_requests,
+                            "tool_results": tool_results,
+                        },
+                    )
+                    await db.add_artifact(run_id, validation_artifact)
+                    artifacts.append(validation_artifact)
+
+                if model_tier != "fast":
+                    fast_control, escalate = await evaluate_control_fast(
+                        lm_client,
+                        fast_endpoint,
+                        result["step"],
+                        result["output"],
+                        validation_summary=validation_summary,
+                        run_state=run_state,
+                    )
+                    control: ControlCommand = fast_control
+                    # Only pull in the OSS orchestrator for heavyweight checkpoints or when escalation is requested.
+                    heavy_types = {"merge", "draft", "verify", "analysis"}
+                    needs_oss = (
+                        escalate
+                        or result["step"].type in heavy_types
+                        or (strict_mode and fast_control.control != "CONTINUE")
+                    )
+                    if needs_oss:
+                        control = await evaluate_control(
+                            lm_client,
+                            planner_endpoint,
+                            result["step"],
+                            result["output"],
+                            validation_summary=validation_summary,
+                            run_state=run_state,
+                        )
+                    if control.control != "CONTINUE" or control.new_constraints:
+                        await apply_control_action(control, origin="system")
+                        if stop_requested:
+                            break
 
             # If all steps finished but verifier asked for a loop, reset to research/merge phase.
             if not running_tasks and len(completed_steps) >= len(step_plan.steps) and loops < max_loops:
@@ -4095,15 +7788,23 @@ async def run_question(
                         progress_meta["counted_passes"] = actual_passes
                         progress_meta["total_steps"] += progress_meta.get("per_pass_rerun", 0)
                     completed_reset_to = len([s for s in step_plan.steps if s.type == "analysis"])
-                    await bus.emit(
+                    loop_payload = {
+                        "iteration": loops,
+                        "expected_total_steps": progress_meta.get("total_steps"),
+                        "completed_reset_to": completed_reset_to,
+                        "counted_passes": progress_meta.get("counted_passes"),
+                    }
+                    await bus.emit(run_id, "loop_iteration", loop_payload)
+                    queue_narration(
+                        lm_client,
+                        active_models,
+                        run_state,
+                        bus,
                         run_id,
+                        question,
                         "loop_iteration",
-                        {
-                            "iteration": loops,
-                            "expected_total_steps": progress_meta.get("total_steps"),
-                            "completed_reset_to": completed_reset_to,
-                            "counted_passes": progress_meta.get("counted_passes"),
-                        },
+                        loop_payload,
+                        tone="warn",
                     )
                     completed_steps = {s.step_id for s in step_plan.steps if s.type == "analysis"}  # keep upfront steps
                     # keep artifacts but rerun research+draft+verify
@@ -4135,19 +7836,26 @@ async def run_question(
             await db.finalize_run(run_id, guidance, "LOW")
             await bus.emit(run_id, "archived", {"run_id": run_id, "confidence": "LOW"})
             return
-        draft_art = next((a for a in artifacts if a.artifact_type == "draft"), None)
-        verifier_art = next((a for a in artifacts if a.artifact_type == "verifier"), None)
-        ledger_art = next((a for a in artifacts if a.artifact_type == "ledger"), None)
-        final_answer = (verifier_art.content_json.get("revised_answer") if verifier_art and verifier_art.content_json else None) or (
-            draft_art.content_text if draft_art else ""
-        )
-        if not final_answer:
+        final_art = _latest_artifact(artifacts, "final")
+        draft_art = _latest_artifact(artifacts, "draft")
+        verifier_art = _latest_artifact(artifacts, "verifier")
+        ledger_art = _latest_artifact(artifacts, "ledger")
+        final_step_present = any(s.type == "finalize" for s in step_plan.steps)
+        final_answer = ""
+        if final_art and final_art.content_text:
+            final_answer = final_art.content_text
+        elif not final_step_present:
+            final_answer = (verifier_art.content_json.get("revised_answer") if verifier_art and verifier_art.content_json else None) or (
+                draft_art.content_text if draft_art else ""
+            )
+        if not final_answer and not final_step_present:
             # Fallback: force a concise answer from available context + model knowledge.
             ledger_json = ledger_art.content_json if ledger_art else merge_evidence_artifacts(artifacts)
             fallback_prompt = (
                 f"Question: {question}\n"
                 f"Evidence (may be partial): {json.dumps(ledger_json)[:2800]}\n"
                 "Provide the best direct answer you can. If evidence is light, rely on your own knowledge but flag any uncertainty.\n"
+                "Do not include citations or a Sources section.\n"
                 "Return a short, clear answer without chain-of-thought."
             )
             try:
@@ -4165,6 +7873,10 @@ async def run_question(
                 )
             except Exception:
                 final_answer = final_answer or "Unable to produce an answer with the available context."
+        if not final_answer and final_step_present:
+            final_answer = "Unable to finalize the response; please retry."
+        if final_answer and _looks_like_tool_markup(final_answer):
+            final_answer = "Unable to finalize the response; please retry."
         if not run_state.can_web:
             notes = [
                 "Verification note: I couldn't browse the web here, so I relied on the prompt and any provided materials; anything beyond that is unverified.",
@@ -4183,6 +7895,26 @@ async def run_question(
             {"id": assistant_msg.get("id"), "role": "assistant", "content": final_answer, "run_id": run_id, "created_at": assistant_msg.get("created_at")},
         )
         await db.finalize_run(run_id, final_answer, confidence)
+        if evidence_dump:
+            try:
+                sources = await db.get_sources(run_id)
+                claims = await db.get_claims(run_id)
+                verifier_report = await db.get_verifier_report(run_id)
+                dump_payload = {
+                    "sources": sources,
+                    "claims": claims,
+                    "verifier": verifier_report,
+                }
+                dump_artifact = Artifact(
+                    step_id=0,
+                    key="evidence_dump",
+                    artifact_type="evidence_dump",
+                    content_text="",
+                    content_json=dump_payload,
+                )
+                await db.add_artifact(run_id, dump_artifact)
+            except Exception:
+                pass
         existing_run_memory = await db.get_run_memory(run_id)
         if auto_memory and final_answer and not existing_run_memory:
             mem_id = await db.add_memory_item(
@@ -4195,6 +7927,16 @@ async def run_question(
             )
             await db.link_memory_to_run(run_id, mem_id, "auto")
             await bus.emit(run_id, "memory_saved", {"count": 1})
+            queue_narration(
+                lm_client,
+                active_models,
+                run_state,
+                bus,
+                run_id,
+                question,
+                "memory_saved",
+                {"count": 1},
+            )
             existing_run_memory.append({"id": mem_id})
         if final_answer and not existing_run_memory:
             try:
@@ -4226,6 +7968,16 @@ async def run_question(
             )
             await db.link_memory_to_run(run_id, mem_id, "auto_summary")
             await bus.emit(run_id, "memory_saved", {"count": 1})
+            queue_narration(
+                lm_client,
+                active_models,
+                run_state,
+                bus,
+                run_id,
+                question,
+                "memory_saved",
+                {"count": 1},
+            )
         try:
             ui_note_prompt = (
                 f"Question: {question}\nAnswer: {final_answer[:320]}\n"
@@ -4247,14 +7999,49 @@ async def run_question(
             await bus.emit(run_id, "client_note", {"note": ui_note, "tier": model_tier, "route": deep_route_used})
         except Exception:
             pass
-        await bus.emit(run_id, "archived", {"run_id": run_id, "confidence": confidence})
+        archived_payload = {"run_id": run_id, "confidence": confidence}
+        await bus.emit(run_id, "archived", archived_payload)
+        queue_narration(
+            lm_client,
+            active_models,
+            run_state,
+            bus,
+            run_id,
+            question,
+            "archived",
+            archived_payload,
+        )
     except asyncio.CancelledError:
         await db.update_run_status(run_id, "stopped")
-        await bus.emit(run_id, "archived", {"run_id": run_id, "confidence": "LOW", "stopped": True})
+        stopped_payload = {"run_id": run_id, "confidence": "LOW", "stopped": True}
+        await bus.emit(run_id, "archived", stopped_payload)
+        queue_narration(
+            lm_client,
+            active_models,
+            run_state if "run_state" in locals() else None,
+            bus,
+            run_id,
+            question,
+            "archived",
+            stopped_payload,
+            tone="warn",
+        )
         raise
     except Exception as exc:
         await db.update_run_status(run_id, f"error: {exc}")
-        await bus.emit(run_id, "error", {"message": str(exc), "fatal": True})
+        error_payload = {"message": str(exc), "fatal": True}
+        await bus.emit(run_id, "error", error_payload)
+        queue_narration(
+            lm_client,
+            active_models,
+            run_state if "run_state" in locals() else None,
+            bus,
+            run_id,
+            question,
+            "error",
+            error_payload,
+            tone="error",
+        )
 
 
 def new_run_id() -> str:

@@ -8,6 +8,8 @@ from pydantic import BaseModel, Field
 
 
 CONFIG_PATH = Path("config.json")
+ENV_OVERRIDE_KEY = "LOCALPRO_ENV_OVERRIDES_CONFIG"
+ENV_OVERRIDE_TRUE = {"1", "true", "yes", "on"}
 
 
 class EndpointConfig(BaseModel):
@@ -20,14 +22,14 @@ class EndpointConfig(BaseModel):
 class AppSettings(BaseModel):
     # Legacy defaults (single endpoint)
     lm_studio_base_url: str = "http://127.0.0.1:1234/v1"
-    model_orch: str = "openai/gpt-oss-20b"
+    model_orch: str = "qwen/qwen3-vl-4b"
     oss_max_tokens: int = 131072
     model_qwen8: str = "qwen/qwen3-vl-8b"
     model_qwen4: str = "qwen/qwen3-vl-4b"
 
     # Per-role endpoints/models
     orch_endpoint: EndpointConfig = Field(
-        default_factory=lambda: EndpointConfig(base_url="http://127.0.0.1:1234/v1", model_id="openai/gpt-oss-20b")
+        default_factory=lambda: EndpointConfig(base_url="http://127.0.0.1:1234/v1", model_id="qwen/qwen3-vl-4b")
     )
     worker_a_endpoint: EndpointConfig = Field(
         default_factory=lambda: EndpointConfig(base_url="http://127.0.0.1:1234/v1", model_id="qwen/qwen3-vl-8b")
@@ -40,10 +42,10 @@ class AppSettings(BaseModel):
     )
     # Tier presets
     fast_endpoint: EndpointConfig = Field(
-        default_factory=lambda: EndpointConfig(base_url="http://127.0.0.1:1234/v1", model_id="qwen/qwen3-vl-8b")
+        default_factory=lambda: EndpointConfig(base_url="http://127.0.0.1:1234/v1", model_id="qwen/qwen3-vl-4b")
     )
     deep_planner_endpoint: EndpointConfig = Field(
-        default_factory=lambda: EndpointConfig(base_url="http://127.0.0.1:1234/v1", model_id="qwen/qwen3-vl-8b")
+        default_factory=lambda: EndpointConfig(base_url="http://127.0.0.1:1234/v1", model_id="qwen/qwen3-vl-4b")
     )
     deep_orchestrator_endpoint: EndpointConfig = Field(
         default_factory=lambda: EndpointConfig(base_url="http://127.0.0.1:1234/v1", model_id="qwen/qwen3-vl-4b")
@@ -118,10 +120,19 @@ def _load_from_env() -> dict:
     return cleaned
 
 
+def _env_overrides_config() -> bool:
+    return str(os.getenv(ENV_OVERRIDE_KEY, "")).strip().lower() in ENV_OVERRIDE_TRUE
+
+
 def _apply_legacy_endpoint_overrides(
-    merged: Dict[str, Any], file_data: Dict[str, Any], env_data: Dict[str, Any]
+    merged: Dict[str, Any],
+    file_data: Dict[str, Any],
+    env_data: Dict[str, Any],
+    allow_env_overrides: bool,
 ) -> None:
     """Backfill/override endpoint configs from legacy env vars when config.json still has defaults."""
+    if not allow_env_overrides:
+        return
     defaults = AppSettings()
     base_url_override = env_data.get("lm_studio_base_url")
     legacy_base_url = file_data.get("lm_studio_base_url", defaults.lm_studio_base_url)
@@ -159,22 +170,28 @@ def _apply_legacy_endpoint_overrides(
         override_endpoint(key, env_data.get("model_qwen4"), legacy_qwen4)
 
 
-def load_settings() -> AppSettings:
+def load_settings(config_path: Optional[Path] = None) -> AppSettings:
     env_data = _load_from_env()
+    path = config_path or CONFIG_PATH
     file_data: Dict[str, Any] = {}
-    if CONFIG_PATH.exists():
+    if path.exists():
         try:
-            file_data = json.loads(CONFIG_PATH.read_text())
+            file_data = json.loads(path.read_text())
         except Exception:
             file_data = {}
-    # File values are defaults; environment variables should win at runtime
-    merged = {**file_data, **env_data}
-    _apply_legacy_endpoint_overrides(merged, file_data, env_data)
+    allow_env_overrides = _env_overrides_config()
+    # Config wins by default; allow env overrides only when explicitly enabled.
+    if allow_env_overrides:
+        merged = {**file_data, **env_data}
+    else:
+        merged = {**env_data, **file_data}
+    _apply_legacy_endpoint_overrides(merged, file_data, env_data, allow_env_overrides)
     # Backfill endpoint fields from legacy
     if "orch_endpoint" not in merged and "lm_studio_base_url" in merged and "model_orch" in merged:
         merged["orch_endpoint"] = {"base_url": merged["lm_studio_base_url"], "model_id": merged["model_orch"]}
     return AppSettings(**merged)
 
 
-def save_settings(settings: AppSettings) -> None:
-    CONFIG_PATH.write_text(settings.model_dump_json(indent=2))
+def save_settings(settings: AppSettings, config_path: Optional[Path] = None) -> None:
+    path = config_path or CONFIG_PATH
+    path.write_text(settings.model_dump_json(indent=2))
