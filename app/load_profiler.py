@@ -257,6 +257,7 @@ class LoadProfiler:
         store: ModelResourceProfileStore,
         ram_headroom_pct: float = 10.0,
         vram_headroom_pct: float = 10.0,
+        enforce_headroom: bool = False,
         sample_interval_ms: int = DEFAULT_SAMPLE_INTERVAL_MS,
         repeats: int = 1,
         test_timeout_s: int = DEFAULT_TEST_TIMEOUT_S,
@@ -269,6 +270,7 @@ class LoadProfiler:
         self.store = store
         self.ram_headroom_pct = ram_headroom_pct
         self.vram_headroom_pct = vram_headroom_pct
+        self.enforce_headroom = enforce_headroom
         self.sample_interval_ms = sample_interval_ms
         self.repeats = max(1, repeats)
         self.test_timeout_s = test_timeout_s
@@ -286,6 +288,8 @@ class LoadProfiler:
         ram_need_bytes: float = 0.0,
         gpu_id: Optional[int] = None,
     ) -> bool:
+        if not self.enforce_headroom:
+            return True
         ram = snapshot.get("ram") or {}
         total_ram = _safe_float(ram.get("total_bytes"))
         used_ram = _safe_float(ram.get("used_bytes"))

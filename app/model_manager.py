@@ -469,6 +469,7 @@ class ModelManager:
             store=self.resource_profile_store,
             ram_headroom_pct=self.ram_headroom_pct,
             vram_headroom_pct=self.vram_headroom_pct,
+            enforce_headroom=bool(self.profiling_config.get("enforce_headroom", False)),
             sample_interval_ms=int(self.profiling_config.get("sample_interval_ms") or 250),
             repeats=int(self.profiling_config.get("repeats") or 1),
             test_timeout_s=int(self.profiling_config.get("test_timeout_s") or 120),

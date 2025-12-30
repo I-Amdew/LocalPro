@@ -73,6 +73,7 @@
   "profiling": {
     "enabled": true,
     "auto_profile": true,
+    "enforce_headroom": false,
     "repeats": 1,
     "sample_interval_ms": 250,
     "test_timeout_s": 120,
