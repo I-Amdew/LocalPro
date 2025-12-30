@@ -6,7 +6,9 @@ from httpx import ASGITransport, AsyncClient
 
 from app.config import AppSettings, EndpointConfig
 from app.main import create_app
-from tests.fakes import FakeLMStudioClient, FakeTavilyClient
+from app.model_manager import Autoscaler, ModelManager
+from app.resource_manager import ResourceManager
+from tests.fakes import FakeLMStudioClient, FakeModelBackend, FakeTavilyClient
 
 
 def make_settings(tmp_path: Path, **overrides) -> AppSettings:
@@ -39,12 +41,41 @@ def make_settings(tmp_path: Path, **overrides) -> AppSettings:
     return settings
 
 
+def build_fake_model_manager(settings: AppSettings, *, backend: FakeModelBackend | None = None) -> ModelManager:
+    fake_backend = backend or FakeModelBackend(model_keys=["test-model"])
+    autoscaler = Autoscaler(
+        enabled=True,
+        global_max_instances=None,
+        per_backend_max_instances={},
+        min_instances={"executor": 1},
+    )
+    resource_manager = ResourceManager(
+        vram_headroom_pct=settings.vram_headroom_pct,
+        max_concurrent_runs=settings.max_concurrent_runs,
+        per_model_class_limits=settings.per_model_class_limits,
+    )
+    return ModelManager(
+        db_path=settings.database_path,
+        backends={fake_backend.id: fake_backend},
+        resource_manager=resource_manager,
+        model_candidates_mode=settings.model_candidates.mode,
+        allow=settings.model_candidates.allow,
+        deny=settings.model_candidates.deny,
+        prefer=settings.model_candidates.prefer,
+        autoscaler=autoscaler,
+        routing_objective=settings.routing.objective,
+        tool_required_by_default=settings.routing.tool_required_by_default,
+    )
+
+
 @pytest.fixture
 def app_factory(tmp_path: Path):
     def _factory(
         *,
         fake_lm: FakeLMStudioClient | None = None,
         fake_tavily: FakeTavilyClient | None = None,
+        fake_backend: FakeModelBackend | None = None,
+        model_manager: ModelManager | None = None,
         config_path: Path | None = None,
         **settings_overrides,
     ):
@@ -52,7 +83,15 @@ def app_factory(tmp_path: Path):
         lm_client = fake_lm or FakeLMStudioClient()
         tavily_client = fake_tavily or FakeTavilyClient(api_key=settings.tavily_api_key)
         cfg_path = config_path or (tmp_path / "config.json")
-        app = create_app(settings, lm_client=lm_client, tavily_client=tavily_client, config_path=cfg_path)
+        manager = model_manager or build_fake_model_manager(settings, backend=fake_backend)
+        app = create_app(
+            settings,
+            lm_client=lm_client,
+            tavily_client=tavily_client,
+            config_path=cfg_path,
+            model_manager=manager,
+            model_manager_factory=lambda s, _: build_fake_model_manager(s, backend=fake_backend),
+        )
         return app, cfg_path, lm_client, tavily_client
 
     return _factory

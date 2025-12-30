@@ -152,6 +152,148 @@ class Database:
                     content_json TEXT,
                     created_at TEXT
                 );
+                CREATE TABLE IF NOT EXISTS plans(
+                    plan_id TEXT PRIMARY KEY,
+                    created_at TEXT,
+                    updated_at TEXT,
+                    metadata_json TEXT,
+                    revision INTEGER,
+                    partitions_json TEXT
+                );
+                CREATE TABLE IF NOT EXISTS plan_steps(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    step_id TEXT,
+                    plan_id TEXT,
+                    title TEXT,
+                    description TEXT,
+                    status TEXT,
+                    prereq_step_ids_json TEXT,
+                    tags_json TEXT,
+                    priority INTEGER,
+                    cost_hint_json TEXT,
+                    partition_key TEXT,
+                    attempt INTEGER,
+                    max_retries INTEGER,
+                    created_by_json TEXT,
+                    claimed_by TEXT,
+                    run_metadata_json TEXT,
+                    input_refs_json TEXT,
+                    output_refs_json TEXT,
+                    notes TEXT,
+                    error_json TEXT,
+                    created_at TEXT,
+                    updated_at TEXT
+                );
+                CREATE TABLE IF NOT EXISTS plan_step_changes(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    plan_id TEXT,
+                    revision INTEGER,
+                    step_id TEXT,
+                    changed_fields_json TEXT,
+                    old_json TEXT,
+                    new_json TEXT,
+                    created_at TEXT
+                );
+                CREATE TABLE IF NOT EXISTS plan_events(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    plan_id TEXT,
+                    event_type TEXT,
+                    payload_json TEXT,
+                    created_at TEXT
+                );
+                CREATE TABLE IF NOT EXISTS plan_findings(
+                    finding_id TEXT PRIMARY KEY,
+                    plan_id TEXT,
+                    source_step_id TEXT,
+                    created_at TEXT,
+                    updated_at TEXT,
+                    severity TEXT,
+                    category TEXT,
+                    summary TEXT,
+                    details TEXT,
+                    evidence_refs_json TEXT,
+                    suggested_actions_json TEXT,
+                    impacted_step_ids_json TEXT,
+                    status TEXT,
+                    linked_patch_id TEXT,
+                    resolution_note TEXT
+                );
+                CREATE TABLE IF NOT EXISTS plan_patches(
+                    patch_id TEXT PRIMARY KEY,
+                    plan_id TEXT,
+                    base_revision INTEGER,
+                    proposal_revision INTEGER,
+                    created_at TEXT,
+                    updated_at TEXT,
+                    created_by_json TEXT,
+                    rationale TEXT,
+                    linked_finding_ids_json TEXT,
+                    status TEXT,
+                    validation_report_ref_json TEXT,
+                    operations_json TEXT
+                );
+                CREATE TABLE IF NOT EXISTS plan_changes(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    plan_id TEXT,
+                    revision INTEGER,
+                    change_type TEXT,
+                    entity_id TEXT,
+                    payload_json TEXT,
+                    created_at TEXT
+                );
+                CREATE TABLE IF NOT EXISTS plan_requests(
+                    request_id TEXT PRIMARY KEY,
+                    plan_id TEXT,
+                    status TEXT,
+                    type TEXT,
+                    payload_json TEXT,
+                    expected_output_schema_json TEXT,
+                    result_refs_json TEXT,
+                    created_by TEXT,
+                    priority INTEGER,
+                    created_at TEXT,
+                    updated_at TEXT,
+                    error_text TEXT
+                );
+                CREATE TABLE IF NOT EXISTS artifact_refs(
+                    ref_id TEXT PRIMARY KEY,
+                    kind TEXT,
+                    uri TEXT,
+                    metadata_json TEXT,
+                    created_at TEXT,
+                    step_id TEXT
+                );
+                CREATE TABLE IF NOT EXISTS artifact_blobs(
+                    ref_id TEXT PRIMARY KEY,
+                    content_text TEXT,
+                    content_json TEXT,
+                    created_at TEXT
+                );
+                CREATE TABLE IF NOT EXISTS model_profiles(
+                    backend_id TEXT,
+                    model_key TEXT,
+                    display_name TEXT,
+                    metadata_json TEXT,
+                    capabilities_json TEXT,
+                    profile_json TEXT,
+                    updated_at TEXT,
+                    ttl_seconds INTEGER,
+                    PRIMARY KEY (backend_id, model_key)
+                );
+                CREATE TABLE IF NOT EXISTS model_resource_profiles(
+                    backend_id TEXT,
+                    model_key TEXT,
+                    config_signature TEXT,
+                    profile_json TEXT,
+                    updated_at TEXT,
+                    ttl_seconds INTEGER,
+                    PRIMARY KEY (backend_id, model_key, config_signature)
+                );
+                CREATE TABLE IF NOT EXISTS executor_states(
+                    plan_id TEXT PRIMARY KEY,
+                    state_json TEXT,
+                    updated_at TEXT
+                );
                 CREATE TABLE IF NOT EXISTS uploads(
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     run_id TEXT,
@@ -174,6 +316,7 @@ class Database:
                 );
                 CREATE TABLE IF NOT EXISTS memory_items(
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    conversation_id TEXT,
                     created_at TEXT,
                     updated_at TEXT,
                     kind TEXT,
@@ -202,6 +345,17 @@ class Database:
                     updated_at TEXT
                 );
                 INSERT OR IGNORE INTO prompt_state(id, prompt_text, run_id, updated_at) VALUES (1, NULL, NULL, NULL);
+                CREATE INDEX IF NOT EXISTS idx_plan_steps_plan_status ON plan_steps(plan_id, status);
+                CREATE INDEX IF NOT EXISTS idx_plan_steps_plan_priority ON plan_steps(plan_id, priority);
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_plan_steps_plan_step_id ON plan_steps(plan_id, step_id);
+                CREATE INDEX IF NOT EXISTS idx_plan_step_changes_plan_revision ON plan_step_changes(plan_id, revision);
+                CREATE INDEX IF NOT EXISTS idx_plan_findings_plan_status ON plan_findings(plan_id, status);
+                CREATE INDEX IF NOT EXISTS idx_plan_patches_plan_status ON plan_patches(plan_id, status);
+                CREATE INDEX IF NOT EXISTS idx_plan_changes_plan_revision ON plan_changes(plan_id, revision);
+                CREATE INDEX IF NOT EXISTS idx_plan_requests_plan_status ON plan_requests(plan_id, status);
+                CREATE INDEX IF NOT EXISTS idx_artifact_refs_step_id ON artifact_refs(step_id);
+                CREATE INDEX IF NOT EXISTS idx_model_profiles_updated ON model_profiles(updated_at);
+                CREATE INDEX IF NOT EXISTS idx_model_resource_profiles_updated ON model_resource_profiles(updated_at);
                 """
             )
             async def column_exists(table: str, column: str) -> bool:
@@ -217,6 +371,15 @@ class Database:
             await ensure_column("runs", "conversation_id", "TEXT")
             await ensure_column("messages", "conversation_id", "TEXT")
             await ensure_column("conversation_state", "default_conversation_id", "TEXT")
+            await ensure_column("memory_items", "conversation_id", "TEXT")
+            await ensure_column("plan_steps", "step_type", "TEXT")
+            await db.execute(
+                "UPDATE memory_items SET conversation_id = ("
+                "SELECT r.conversation_id FROM runs r "
+                "JOIN run_memory_links l ON l.run_id = r.run_id "
+                "WHERE l.memory_item_id = memory_items.id LIMIT 1"
+                ") WHERE conversation_id IS NULL"
+            )
 
             cursor = await db.execute("SELECT id FROM conversations LIMIT 1")
             existing = await cursor.fetchone()
@@ -680,12 +843,19 @@ class Database:
         )
 
     async def add_memory_item(
-        self, kind: str, title: str, content: str, tags: List[str], pinned: bool = False, relevance_score: float = 0.0
+        self,
+        conversation_id: str,
+        kind: str,
+        title: str,
+        content: str,
+        tags: List[str],
+        pinned: bool = False,
+        relevance_score: float = 0.0,
     ) -> int:
         async with aiosqlite.connect(self.path) as db:
             cursor = await db.execute(
-                "INSERT INTO memory_items(created_at, updated_at, kind, title, content, tags_json, pinned_bool, relevance_score) VALUES (?,?,?,?,?,?,?,?)",
-                (utc_now(), utc_now(), kind, title, content, json.dumps(tags), 1 if pinned else 0, relevance_score),
+                "INSERT INTO memory_items(conversation_id, created_at, updated_at, kind, title, content, tags_json, pinned_bool, relevance_score) VALUES (?,?,?,?,?,?,?,?,?)",
+                (conversation_id, utc_now(), utc_now(), kind, title, content, json.dumps(tags), 1 if pinned else 0, relevance_score),
             )
             await db.commit()
             return cursor.lastrowid
@@ -708,12 +878,15 @@ class Database:
         await self.execute("DELETE FROM memory_items WHERE id=?", (item_id,))
         await self.execute("DELETE FROM run_memory_links WHERE memory_item_id=?", (item_id,))
 
-    async def search_memory(self, query: str, limit: int = 10) -> List[dict]:
+    async def search_memory(self, query: str, conversation_id: Optional[str], limit: int = 10) -> List[dict]:
+        if not conversation_id:
+            return []
         pattern = f"%{query}%"
         rows = await self.fetchall(
             "SELECT id, kind, title, content, tags_json, pinned_bool, relevance_score, updated_at FROM memory_items "
-            "WHERE title LIKE ? OR content LIKE ? ORDER BY pinned_bool DESC, relevance_score DESC, updated_at DESC LIMIT ?",
-            (pattern, pattern, limit),
+            "WHERE conversation_id=? AND (title LIKE ? OR content LIKE ?) "
+            "ORDER BY pinned_bool DESC, relevance_score DESC, updated_at DESC LIMIT ?",
+            (conversation_id, pattern, pattern, limit),
         )
         return [
             {
@@ -729,11 +902,14 @@ class Database:
             for r in rows
         ]
 
-    async def list_memory(self, limit: int = 50) -> List[dict]:
+    async def list_memory(self, conversation_id: Optional[str], limit: int = 50) -> List[dict]:
+        if not conversation_id:
+            return []
         rows = await self.fetchall(
             "SELECT id, kind, title, content, tags_json, pinned_bool, relevance_score, updated_at FROM memory_items "
+            "WHERE conversation_id=? "
             "ORDER BY pinned_bool DESC, relevance_score DESC, updated_at DESC LIMIT ?",
-            (limit,),
+            (conversation_id, limit),
         )
         return [
             {
@@ -748,6 +924,38 @@ class Database:
             }
             for r in rows
         ]
+
+    async def get_memory_item(self, item_id: int) -> Optional[dict]:
+        row = await self.fetchone(
+            "SELECT id, conversation_id, kind, title, content, tags_json, pinned_bool, relevance_score, updated_at "
+            "FROM memory_items WHERE id=?",
+            (item_id,),
+        )
+        if not row:
+            return None
+        return {
+            "id": row["id"],
+            "conversation_id": row["conversation_id"],
+            "kind": row["kind"],
+            "title": row["title"],
+            "content": row["content"],
+            "tags": json.loads(row["tags_json"] or "[]"),
+            "pinned": bool(row["pinned_bool"]),
+            "relevance_score": row["relevance_score"],
+            "updated_at": row["updated_at"],
+        }
+
+    async def delete_memory_item_for_conversation(self, conversation_id: str, item_id: int) -> bool:
+        if not conversation_id:
+            return False
+        row = await self.fetchone(
+            "SELECT id FROM memory_items WHERE id=? AND conversation_id=?",
+            (item_id, conversation_id),
+        )
+        if not row:
+            return False
+        await self.delete_memory_item(item_id)
+        return True
 
     async def link_memory_to_run(self, run_id: str, memory_item_id: int, reason: str) -> None:
         await self.execute(
@@ -940,6 +1148,7 @@ class Database:
                 f"DELETE FROM {table} WHERE run_id IN (SELECT run_id FROM runs WHERE conversation_id=?)",
                 (conversation_id,),
             )
+        await self.execute("DELETE FROM memory_items WHERE conversation_id=?", (conversation_id,))
         await self.execute("DELETE FROM runs WHERE conversation_id=?", (conversation_id,))
         await self.execute("DELETE FROM conversations WHERE id=?", (conversation_id,))
 

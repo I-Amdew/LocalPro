@@ -1,6 +1,0 @@
-INFO:     127.0.0.1:60496 - "POST /api/run HTTP/1.1" 200 OK
-INFO:     127.0.0.1:60496 - "GET /runs/cf578e78-7682-42fd-8c13-f2e9749306c5/events HTTP/1.1" 200 OK
-INFO:     127.0.0.1:63121 - "GET /api/run/cf578e78-7682-42fd-8c13-f2e9749306c5 HTTP/1.1" 200 OK
-INFO:     127.0.0.1:53527 - "GET /api/run/cf578e78-7682-42fd-8c13-f2e9749306c5/events HTTP/1.1" 200 OK
-INFO:     127.0.0.1:64556 - "POST /api/run HTTP/1.1" 200 OK
-INFO:     127.0.0.1:64556 - "GET /runs/74de1e66-4360-4c41-8fb5-7b4e78f9bf24/events HTTP/1.1" 200 OK

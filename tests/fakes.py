@@ -1,6 +1,9 @@
 import asyncio
 import json
+import uuid
 from typing import Any, Dict, List, Optional
+
+from app.model_manager import ModelCandidate, ModelInstanceInfo, ResourceEstimate
 
 
 def _message_text(message: Dict[str, Any]) -> str:
@@ -175,3 +178,115 @@ class FakeTavilyClient:
 
     async def close(self) -> None:
         return None
+
+
+class FakeModelBackend:
+    id = "fake"
+
+    def __init__(
+        self,
+        model_keys: Optional[List[str]] = None,
+        delay_seconds: float = 0.0,
+    ) -> None:
+        self.model_keys = model_keys or ["test-model"]
+        self.delay_seconds = delay_seconds
+        self.fake_client = FakeLMStudioClient(model_ids=self.model_keys)
+        self._loaded: Dict[str, ModelInstanceInfo] = {}
+        self.load_calls: List[Dict[str, Any]] = []
+        self.unload_calls: List[str] = []
+
+    async def discover(self) -> List[ModelCandidate]:
+        return [
+            ModelCandidate(
+                backend_id=self.id,
+                model_key=key,
+                display_name=key,
+                metadata={},
+                capabilities={"tool_use": True, "structured_output": True},
+            )
+            for key in self.model_keys
+        ]
+
+    async def list_loaded(self) -> List[ModelInstanceInfo]:
+        return list(self._loaded.values())
+
+    async def ensure_server_running(self) -> None:
+        return None
+
+    async def load_instance(self, model_key: str, opts: Dict[str, Any]) -> ModelInstanceInfo:
+        identifier = opts.get("identifier") or f"{model_key}-{uuid.uuid4().hex[:8]}"
+        ttl = int(opts.get("ttl_seconds") or 0) or None
+        info = ModelInstanceInfo(
+            backend_id=self.id,
+            instance_id=str(identifier),
+            model_key=model_key,
+            api_identifier=str(identifier),
+            endpoint="http://fake.local/v1",
+            status="ready",
+            ttl_seconds=ttl,
+        )
+        self._loaded[info.instance_id] = info
+        self.load_calls.append({"model_key": model_key, "identifier": identifier})
+        return info
+
+    async def unload_instance(self, instance_id_or_identifier: str) -> None:
+        self.unload_calls.append(str(instance_id_or_identifier))
+        self._loaded.pop(str(instance_id_or_identifier), None)
+
+    async def estimate_resources(self, model_key: str, opts: Dict[str, Any]) -> Optional[ResourceEstimate]:
+        return ResourceEstimate(vram_mb=1200.0, ram_mb=2400.0, cpu_pct=10.0, gpu_id=0)
+
+    async def call_chat_completion(self, instance: ModelInstanceInfo, request: Dict[str, Any]) -> Dict[str, Any]:
+        if self.delay_seconds:
+            await asyncio.sleep(self.delay_seconds)
+        if request.get("tools") or request.get("tool_choice"):
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": "",
+                            "tool_calls": [
+                                {"function": {"arguments": "{\"value\": 7}"}, "type": "function"}
+                            ],
+                        }
+                    }
+                ]
+            }
+        if request.get("response_format"):
+            return {"choices": [{"message": {"content": "{\"ok\": true}"}}]}
+        messages = request.get("messages") or []
+        return await self.fake_client.chat_completion(
+            model=instance.api_identifier,
+            messages=messages,
+            temperature=request.get("temperature", 0.2),
+            max_tokens=request.get("max_tokens", 512),
+        )
+
+    async def call_responses(self, instance: ModelInstanceInfo, request: Dict[str, Any]) -> Dict[str, Any]:
+        return await self.call_chat_completion(instance, request)
+
+    def supports_tools(self) -> bool:
+        return True
+
+    async def close(self) -> None:
+        return None
+
+
+class FakeTelemetry:
+    def __init__(self, snapshots: Optional[List[Dict[str, Any]]] = None) -> None:
+        self.snapshots = snapshots or []
+        self.calls = 0
+
+    def snapshot(self) -> Dict[str, Any]:
+        if not self.snapshots:
+            return {"ram": {}, "gpus": [], "captured_at": "1970-01-01T00:00:00Z"}
+        idx = min(self.calls, len(self.snapshots) - 1)
+        self.calls += 1
+        return self.snapshots[idx]
+
+    def monitor_start(self, sample_interval_ms: int = 250) -> str:
+        return "monitor"
+
+    def monitor_stop(self, monitor_id: str) -> Dict[str, Any]:
+        snap = self.snapshot()
+        return {"peak_snapshot": snap, "samples_summary": {"count": 1, "duration_ms": 0}}

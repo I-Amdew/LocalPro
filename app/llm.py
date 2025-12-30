@@ -330,7 +330,11 @@ class LMStudioClient:
             "max_tokens": 1,
             "stream": False,
         }
-        payload = self._sanitize_payload(payload)
+        try:
+            payload = await self._prepare_payload(payload, target_base, run_state)
+        except Exception as exc:
+            _run_state_add_trace(run_state, "Minimal payload prep failed", {"detail": str(exc)})
+            return False, str(exc)
         try:
             resp = await self.client.post(url, json=payload, timeout=10.0)
             resp.raise_for_status()

@@ -4,7 +4,7 @@ import re
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from fastapi import APIRouter, Body, Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
@@ -13,10 +13,13 @@ from fastapi.staticfiles import StaticFiles
 from .config import AppSettings, CONFIG_PATH, load_settings, save_settings
 from .db import Database
 from .llm import LMStudioClient
+from .lmstudio_backend import LMStudioBackend
+from .model_manager import Autoscaler, ModelManager
 from .orchestrator import EventBus, new_run_id, run_question
 from .schemas import ControlCommand, StartRunRequest
 from .tavily import TavilyClient
-from .system_info import compute_worker_slots, get_resource_snapshot
+from .resource_manager import ResourceManager
+from .system_info import get_resource_snapshot
 
 
 _MODEL_SIZE_RE = re.compile(r"(\\d+(?:\\.\\d+)?b)", re.IGNORECASE)
@@ -121,42 +124,88 @@ def build_model_map(settings_obj: AppSettings, availability: Optional[Dict[str, 
     return model_map
 
 
-async def refresh_model_check(settings_obj: AppSettings, lm_client: LMStudioClient) -> Dict[str, Any]:
-    """Fetch available models per role and cache the results for routing fallbacks."""
-    checks: Dict[str, Any] = {}
-    raw_map = build_model_map(settings_obj)
-    base_cache: Dict[str, Dict[str, Any]] = {}
-    for role, cfg in raw_map.items():
-        base_url = cfg.get("base_url") or ""
-        if not base_url:
-            checks[role] = {"ok": False, "error": "missing_base_url"}
-            continue
-        if base_url not in base_cache:
+def build_model_manager(settings_obj: AppSettings, db_path: str) -> ModelManager:
+    backends: Dict[str, Any] = {}
+    lm_cfg = settings_obj.backends.get("lmstudio")
+    if getattr(lm_cfg, "enabled", True) if lm_cfg else True:
+        host = getattr(lm_cfg, "host", None) if lm_cfg else None
+        port = getattr(lm_cfg, "port", None) if lm_cfg else None
+        use_cli = getattr(lm_cfg, "use_cli", True) if lm_cfg else True
+        cli_path = getattr(lm_cfg, "cli_path", None) if lm_cfg else None
+        default_ttl_s = getattr(lm_cfg, "default_ttl_s", 600) if lm_cfg else 600
+        base_url = settings_obj.lm_studio_base_url
+        if host and port:
+            base_url = f"http://{host}:{port}/v1"
+        backends["lmstudio"] = LMStudioBackend(
+            base_url=base_url,
+            host=host or "127.0.0.1",
+            port=port or 1234,
+            use_cli=use_cli,
+            cli_path=cli_path,
+            default_ttl_s=default_ttl_s,
+        )
+    autoscaler_cfg = settings_obj.autoscaling
+    autoscaler = Autoscaler(
+        enabled=autoscaler_cfg.enabled,
+        global_max_instances=autoscaler_cfg.global_max_instances,
+        per_backend_max_instances=autoscaler_cfg.per_backend_max_instances,
+        min_instances=autoscaler_cfg.min_instances,
+    )
+    resource_manager = ResourceManager(
+        ram_headroom_pct=settings_obj.ram_headroom_pct,
+        vram_headroom_pct=settings_obj.vram_headroom_pct,
+        max_concurrent_runs=settings_obj.max_concurrent_runs,
+        per_model_class_limits=settings_obj.per_model_class_limits,
+    )
+    return ModelManager(
+        db_path=db_path,
+        backends=backends,
+        resource_manager=resource_manager,
+        ram_headroom_pct=settings_obj.ram_headroom_pct,
+        vram_headroom_pct=settings_obj.vram_headroom_pct,
+        model_candidates_mode=settings_obj.model_candidates.mode,
+        allow=settings_obj.model_candidates.allow,
+        deny=settings_obj.model_candidates.deny,
+        prefer=settings_obj.model_candidates.prefer,
+        autoscaler=autoscaler,
+        routing_objective=settings_obj.routing.objective,
+        tool_required_by_default=settings_obj.routing.tool_required_by_default,
+        profiling=settings_obj.profiling.model_dump(),
+        profile_ttl_s=settings_obj.profiling.profile_ttl_s,
+        max_concurrent_loads=autoscaler_cfg.max_concurrent_loads,
+    )
+
+
+async def close_backends(model_manager: Optional[ModelManager]) -> None:
+    if not model_manager:
+        return
+    for backend in model_manager.backends.values():
+        close_fn = getattr(backend, "close", None)
+        if callable(close_fn):
             try:
-                resp = await lm_client.list_models(base_url)
-                ids = [m.get("id") for m in resp.get("data", []) if m.get("id")]
-                base_cache[base_url] = {"ok": True, "available": ids}
-            except Exception as exc:
-                base_cache[base_url] = {"ok": False, "error": str(exc), "available": []}
-        base_info = base_cache[base_url]
-        if not base_info.get("ok"):
-            checks[role] = {"ok": False, "error": base_info.get("error") or "unreachable"}
-            continue
-        ids = base_info.get("available") or []
-        resolved = _match_model_id(cfg.get("model"), ids)
-        ok = resolved is not None
-        entry = {"ok": ok, "missing": [] if ok else [cfg.get("model")], "available": ids}
-        if ok and resolved and resolved != cfg.get("model"):
-            entry["resolved"] = resolved
-        checks[role] = entry
+                await close_fn()
+            except Exception:
+                continue
+
+
+async def refresh_model_check(settings_obj: AppSettings, model_manager: ModelManager) -> Dict[str, Any]:
+    await model_manager.refresh()
+    catalog = await model_manager.catalog()
     resources = get_resource_snapshot()
-    checks["resources"] = resources
-    try:
-        active_map = build_model_map(settings_obj, checks)
-        checks["worker_slots"] = compute_worker_slots(active_map, "pro", checks, resources)
-    except Exception:
-        pass
-    return checks
+    instances = catalog.get("instances") or []
+    ready = [inst for inst in instances if inst.get("status") != "busy"]
+    ready_variants = {inst.get("model_key") for inst in ready if inst.get("model_key")}
+    return {
+        "catalog": catalog,
+        "resources": resources,
+        "worker_slots": {
+            "max_parallel": max(1, len(ready)) if instances else 1,
+            "ready_workers": len(ready),
+            "ready_variants": len(ready_variants),
+            "configured": len(catalog.get("candidates") or []),
+            "variants": len(ready_variants),
+        },
+    }
 
 
 def normalize_reasoning_level(value: Optional[str]) -> Optional[str]:
@@ -222,6 +271,10 @@ def get_tavily_client(request: Request) -> TavilyClient:
 
 def get_model_check(request: Request) -> Dict[str, Any]:
     return request.app.state.model_check
+
+
+def get_model_manager(request: Request) -> ModelManager:
+    return request.app.state.model_manager
 
 
 def get_upload_dir(request: Request) -> Path:
@@ -303,11 +356,11 @@ async def index(request: Request):
 async def get_settings_route(
     request: Request,
     settings: AppSettings = Depends(get_settings),
-    lm_client: LMStudioClient = Depends(get_lm_client),
+    model_manager: ModelManager = Depends(get_model_manager),
     model_check: Dict[str, Any] = Depends(get_model_check),
 ):
     if not model_check:
-        request.app.state.model_check = await refresh_model_check(settings, lm_client)
+        request.app.state.model_check = await refresh_model_check(settings, model_manager)
     return {"settings": settings.to_safe_dict(), "model_check": request.app.state.model_check}
 
 
@@ -318,6 +371,7 @@ async def update_settings_route(
     db: Database = Depends(get_db),
     lm_client: LMStudioClient = Depends(get_lm_client),
     tavily_client: TavilyClient = Depends(get_tavily_client),
+    model_manager: ModelManager = Depends(get_model_manager),
     config_path: Path = Depends(get_config_path),
 ):
     body = await request.json()
@@ -328,11 +382,14 @@ async def update_settings_route(
     lm_client.base_url = new_settings.lm_studio_base_url
     lm_client.max_output_tokens = new_settings.oss_max_tokens
     tavily_client.api_key = new_settings.tavily_api_key
+    await close_backends(model_manager)
+    factory = getattr(request.app.state, "model_manager_factory", build_model_manager)
+    request.app.state.model_manager = factory(new_settings, db.path)
     upload_dir = Path(new_settings.upload_dir).resolve()
     upload_dir.mkdir(parents=True, exist_ok=True)
     request.app.state.upload_dir = upload_dir
     request.app.state.max_upload_bytes = new_settings.upload_max_mb * 1024 * 1024
-    request.app.state.model_check = await refresh_model_check(new_settings, lm_client)
+    request.app.state.model_check = await refresh_model_check(new_settings, request.app.state.model_manager)
     return {"ok": True, "model_check": request.app.state.model_check}
 
 
@@ -387,18 +444,41 @@ async def get_upload(upload_id: int, db: Database = Depends(get_db)):
 async def discover_models(
     payload: Dict[str, Any],
     settings: AppSettings = Depends(get_settings),
-    lm_client: LMStudioClient = Depends(get_lm_client),
+    model_manager: ModelManager = Depends(get_model_manager),
 ):
-    base_urls = payload.get("base_urls") or settings.discovery_base_urls
-    results = {}
-    for url in base_urls:
-        try:
-            resp = await lm_client.list_models(url)
-            ids = [m.get("id") for m in resp.get("data", [])]
-            results[url] = {"ok": True, "models": ids}
-        except Exception as exc:
-            results[url] = {"ok": False, "error": str(exc)}
-    return {"results": results}
+    await model_manager.refresh()
+    catalog = await model_manager.catalog()
+    candidates = catalog.get("candidates") or []
+    instances = catalog.get("instances") or []
+    results: Dict[str, Any] = {}
+    for backend_id in model_manager.backends.keys():
+        backend_candidates = [c for c in candidates if c.get("backend_id") == backend_id]
+        backend_instances = [i for i in instances if i.get("backend_id") == backend_id]
+        results[backend_id] = {
+            "ok": True,
+            "models": [entry.get("model_key") for entry in backend_candidates],
+            "candidates": backend_candidates,
+            "instances": backend_instances,
+        }
+    return {"results": results, "catalog": catalog}
+
+
+@router.post("/api/models/profile")
+async def profile_models(
+    payload: Dict[str, Any],
+    model_manager: ModelManager = Depends(get_model_manager),
+):
+    model_keys = payload.get("models") or payload.get("model_keys") or []
+    force = bool(payload.get("force"))
+    status = await model_manager.start_profiling(model_keys=model_keys, force=force)
+    return {"status": status}
+
+
+@router.get("/api/models/profile")
+async def profile_status(
+    model_manager: ModelManager = Depends(get_model_manager),
+):
+    return {"status": model_manager.profile_status()}
 
 
 @router.post("/api/run")
@@ -410,6 +490,7 @@ async def start_run(
     bus: EventBus = Depends(get_event_bus),
     lm_client: LMStudioClient = Depends(get_lm_client),
     tavily_client: TavilyClient = Depends(get_tavily_client),
+    model_manager: ModelManager = Depends(get_model_manager),
     model_check: Dict[str, Any] = Depends(get_model_check),
     upload_dir: Path = Depends(get_upload_dir),
     run_tasks: Dict[str, asyncio.Task] = Depends(get_run_tasks),
@@ -434,6 +515,12 @@ async def start_run(
     effective_manual_level = manual_level or default_level or payload.manual_level
     if reasoning_mode == "manual" and manual_level is None:
         manual_level = effective_manual_level
+
+    plan_reasoning_mode = payload.plan_reasoning_mode or settings.plan_reasoning_mode_default
+    planning_mode = payload.planning_mode or settings.planning_mode_default
+    reasoning_level = payload.reasoning_level
+    if reasoning_level is None and (plan_reasoning_mode != "auto" or planning_mode != "auto"):
+        reasoning_level = settings.reasoning_level_default
 
     conversation_id = payload.conversation_id or await db.get_default_conversation_id()
     conversation = None
@@ -483,6 +570,9 @@ async def start_run(
                 question=payload.question,
                 decision_mode=reasoning_mode,
                 manual_level=manual_level,
+                plan_reasoning_mode=plan_reasoning_mode,
+                planning_mode=planning_mode,
+                reasoning_level=reasoning_level,
                 default_reasoning_level=default_level,
                 model_tier=payload.model_tier,
                 deep_mode=payload.deep_mode,
@@ -494,6 +584,7 @@ async def start_run(
                 db=db,
                 bus=bus,
                 lm_client=lm_client,
+                model_manager=model_manager,
                 tavily=tavily_client,
                 settings_models=models,
                 model_availability=model_check,
@@ -501,6 +592,10 @@ async def start_run(
                 upload_dir=upload_dir,
                 stop_event=stop_event,
                 control_queue=control_queue,
+                ram_headroom_pct=settings.ram_headroom_pct,
+                vram_headroom_pct=settings.vram_headroom_pct,
+                max_concurrent_runs=settings.max_concurrent_runs,
+                per_model_class_limits=settings.per_model_class_limits,
             )
         finally:
             run_tasks.pop(run_id, None)
@@ -621,17 +716,30 @@ async def get_artifacts(run_id: str, db: Database = Depends(get_db)):
 
 
 @router.get("/api/memory")
-async def list_memory(q: Optional[str] = None, db: Database = Depends(get_db)):
+async def list_memory(
+    q: Optional[str] = None,
+    conversation_id: Optional[str] = None,
+    db: Database = Depends(get_db),
+):
+    if not conversation_id:
+        raise HTTPException(status_code=400, detail="conversation_id required")
     if q:
-        items = await db.search_memory(q, limit=50)
+        items = await db.search_memory(q, conversation_id=conversation_id, limit=50)
     else:
-        items = await db.list_memory(limit=50)
+        items = await db.list_memory(conversation_id=conversation_id, limit=50)
     return {"items": items}
 
 
 @router.post("/api/memory")
 async def create_memory(item: Dict[str, Any], db: Database = Depends(get_db)):
+    conversation_id = item.get("conversation_id")
+    if not conversation_id:
+        raise HTTPException(status_code=400, detail="conversation_id required")
+    convo = await db.get_conversation(conversation_id)
+    if not convo:
+        raise HTTPException(status_code=404, detail="Conversation not found")
     mem_id = await db.add_memory_item(
+        conversation_id,
         item.get("kind", "note"),
         item.get("title", ""),
         item.get("content", ""),
@@ -830,18 +938,29 @@ def create_app(
     lm_client: Optional[LMStudioClient] = None,
     tavily_client: Optional[TavilyClient] = None,
     config_path: Optional[Path] = None,
+    model_manager: Optional[ModelManager] = None,
+    model_manager_factory: Optional[Callable[[AppSettings, str], ModelManager]] = None,
 ) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         await app.state.db.init()
         await app.state.db.save_config(app.state.settings.model_dump())
         app.state.upload_dir.mkdir(parents=True, exist_ok=True)
-        app.state.model_check = await refresh_model_check(app.state.settings, app.state.lm_client)
+        async def _refresh_model_check() -> None:
+            try:
+                app.state.model_check = await refresh_model_check(app.state.settings, app.state.model_manager)
+            except Exception:
+                app.state.model_check = {}
+
+        refresh_task = asyncio.create_task(_refresh_model_check())
         try:
             yield
         finally:
+            if not refresh_task.done():
+                refresh_task.cancel()
             await app.state.lm_client.close()
             await app.state.tavily_client.close()
+            await close_backends(app.state.model_manager)
 
     app = FastAPI(title="LocalPro Chat Orchestrator", lifespan=lifespan)
     app.state.settings = settings
@@ -850,6 +969,9 @@ def create_app(
         settings.lm_studio_base_url, max_output_tokens=settings.oss_max_tokens
     )
     app.state.tavily_client = tavily_client or TavilyClient(settings.tavily_api_key)
+    factory = model_manager_factory or build_model_manager
+    app.state.model_manager_factory = factory
+    app.state.model_manager = model_manager or factory(settings, app.state.db.path)
     app.state.bus = EventBus(app.state.db)
     app.state.run_tasks = {}
     app.state.run_stop_events = {}

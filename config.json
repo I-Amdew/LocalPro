@@ -10,15 +10,15 @@
   },
   "worker_a_endpoint": {
     "base_url": "http://127.0.0.1:1234/v1",
-    "model_id": "qwen/qwen3-vl-8b"
+    "model_id": "qwen/qwen3-vl-4b"
   },
   "worker_b_endpoint": {
     "base_url": "http://127.0.0.1:1234/v1",
-    "model_id": "qwen/qwen3-vl-8b:2"
+    "model_id": "qwen/qwen3-vl-8b"
   },
   "worker_c_endpoint": {
     "base_url": "http://127.0.0.1:1234/v1",
-    "model_id": "qwen/qwen3-vl-8b:3"
+    "model_id": "qwen/qwen3-vl-8b:2"
   },
   "fast_endpoint": {
     "base_url": "http://127.0.0.1:1234/v1",
@@ -42,7 +42,7 @@
   },
   "verifier_endpoint": {
     "base_url": "http://127.0.0.1:1234/v1",
-    "model_id": "openai/gpt-oss-20b"
+    "model_id": "qwen/qwen3-vl-8b"
   },
   "tavily_api_key": "",
   "search_depth_mode": "auto",
@@ -54,6 +54,40 @@
   "port": 8000,
   "strict_mode": false,
   "reasoning_depth_default": "AUTO",
+  "ram_headroom_pct": 10,
+  "vram_headroom_pct": 10,
+  "autoscaling": {
+    "enabled": true,
+    "global_max_instances": null,
+    "per_backend_max_instances": {},
+    "min_instances": {
+      "executor": 1
+    },
+    "max_concurrent_loads": 1,
+    "headroom": {
+      "vram_free_mb_min": null,
+      "vram_headroom_pct": 10,
+      "ram_headroom_pct": 10
+    }
+  },
+  "profiling": {
+    "enabled": true,
+    "auto_profile": true,
+    "repeats": 1,
+    "sample_interval_ms": 250,
+    "test_timeout_s": 120,
+    "settle_timeout_s": 12,
+    "max_output_tokens": null,
+    "max_concurrent_profiles": 1,
+    "context_length": null,
+    "profile_ttl_s": 21600
+  },
+  "model_candidates": {
+    "mode": "auto",
+    "allow": [],
+    "deny": [],
+    "prefer": []
+  },
   "discovery_base_urls": [
     "http://127.0.0.1:1234/v1"
   ]

@@ -51,8 +51,15 @@ let settingsDefaults = {
   evidence_dump: false,
   max_results_override: 0,
   stt_lang: "en-US",
+  ram_headroom_pct: 10,
+  vram_headroom_pct: 10,
+  max_concurrent_loads: 1,
+  profiling: {},
 };
 let settingsSnapshot = null;
+let modelCatalog = [];
+let modelCandidateConfig = { mode: "auto", allow: [], deny: [], prefer: [] };
+let latestModelCheck = {};
 let bootInProgress = false;
 const LOCAL_PREFS_KEY = "localpro_prefs_v1";
 const API_BASE_STORAGE_KEY = "localpro_api_base_v1";
@@ -427,7 +434,7 @@ async function endPrompt() {
   }
 }
 
-function startNewConversation(opts = {}) {
+  function startNewConversation(opts = {}) {
   const keepQuestion = opts.keepQuestion || false;
   const keepUploads = opts.keepUploads || false;
   const silent = opts.silent || false;
@@ -447,10 +454,12 @@ function startNewConversation(opts = {}) {
   selectedRunId = null;
   thinkingPlaceholders = {};
   renderHistory();
-  {
-    const activity = el("activityFeed");
-    if (activity) activity.innerHTML = "";
-  }
+    {
+      const activity = el("activityFeed");
+      if (activity) activity.innerHTML = "";
+      const citations = el("citationFeed");
+      if (citations) citations.innerHTML = "";
+    }
   resetLiveStreamState("");
   updateLiveTicker("Idle");
   setStatus("Idle");
@@ -473,9 +482,7 @@ function startNewConversation(opts = {}) {
   }
   pendingLocalMessages = [];
   if (!preserveChat) {
-    renderedMessages = new Set();
-    pendingLocalMessages = [];
-    el("chatThread").innerHTML = "";
+    clearChatThread();
   }
   closeDrawer();
   updateEmptyState();
@@ -544,14 +551,19 @@ function renderConversationList() {
     return;
   }
   filtered.forEach((convo) => {
+    const handleSelect = () => selectConversation(convo.id);
     const item = document.createElement("div");
     item.className = "conversation-item";
+    item.addEventListener("click", handleSelect);
     if (convo.id === activeConversationId) item.classList.add("active");
     if (unreadConversations.has(convo.id)) item.classList.add("unread");
     const select = document.createElement("button");
     select.type = "button";
     select.className = "conversation-select";
-    select.onclick = () => selectConversation(convo.id);
+    select.addEventListener("click", (e) => {
+      e.stopPropagation();
+      handleSelect();
+    });
     const title = document.createElement("div");
     title.className = "conversation-title";
     title.textContent = convo.title || "New chat";
@@ -637,6 +649,13 @@ function getReasoningSettings() {
   return { reasoningMode, manualLevel, deepRoute };
 }
 
+function getPlanningModes(reasoningSettings) {
+  if (reasoningSettings.reasoningMode === "manual" && reasoningSettings.manualLevel === "ULTRA") {
+    return { planning_mode: "extensive", plan_reasoning_mode: "extensive", reasoning_level: 4 };
+  }
+  return { planning_mode: "auto", plan_reasoning_mode: "auto", reasoning_level: null };
+}
+
 function getConversationSettingsFromUI() {
   const settings = getReasoningSettings();
   return {
@@ -694,30 +713,42 @@ function applyConversationSettings(convo) {
   updateReasoningBadge();
 }
 
-async function loadConversationMessages(conversationId) {
+async function loadConversationMessages(conversationId, opts = {}) {
+  if (opts.replace) {
+    clearChatThread();
+  }
   try {
     const res = await fetch(resolveEndpoint(`/api/conversations/${conversationId}/messages`));
-    if (!res.ok) return;
+    if (!res.ok) {
+      appendActivity("Failed to load chat history.");
+      return;
+    }
     const data = await res.json();
     (data.messages || []).forEach((msg) => {
       appendChat(msg.role || "assistant", msg.content || "", { messageId: msg.id, runId: msg.run_id });
     });
   } catch (_) {
-    // ignore hydration errors
+    appendActivity("Failed to load chat history.");
   }
 }
 
 async function selectConversation(conversationId, opts = {}) {
   if (!conversationId) return;
-  if (activeConversationId === conversationId && !opts.force) return;
+  const isSame = activeConversationId === conversationId;
+  const thread = el("chatThread");
+  const hasMessages = thread && thread.children.length > 0;
+  if (isSame && !opts.force && hasMessages) return;
   activeConversationId = conversationId;
   storeActiveConversationId(conversationId);
   unreadConversations.delete(conversationId);
   const convo = opts.conversation || getConversationById(conversationId);
   updateConversationHeader(convo);
   applyConversationSettings(convo);
-  startNewConversation({ keepQuestion: false, keepUploads: false, silent: true, preserveChat: false });
-  await loadConversationMessages(conversationId);
+  const shouldReset = !isSame || opts.force;
+  if (shouldReset) {
+    startNewConversation({ keepQuestion: false, keepUploads: false, silent: true, preserveChat: false });
+  }
+  await loadConversationMessages(conversationId, { replace: !shouldReset });
   if (convo && convo.latest_run_id) {
     await switchToRun(convo.latest_run_id, { clearChat: false, resetState: false, skipThinking: true });
   }
@@ -847,6 +878,14 @@ function updateEmptyState() {
   if (!empty || !thread) return;
   const hasMessages = thread.children.length > 0;
   empty.classList.toggle("hidden", hasMessages);
+}
+
+function clearChatThread() {
+  renderedMessages = new Set();
+  pendingLocalMessages = [];
+  const thread = el("chatThread");
+  if (thread) thread.innerHTML = "";
+  updateEmptyState();
 }
 
 function appendChat(role, text, opts = {}) {
@@ -1330,7 +1369,7 @@ function normalizeNote(note) {
   if (match) {
     const tier = match[1].toUpperCase();
     const route = match[2];
-    return `Running in ${tier} mode (route ${route}).`;
+    return `Using ${tier} mode (${route} route).`;
   }
   return note;
 }
@@ -1343,7 +1382,7 @@ const LANE_LABELS = {
   adversarial: "Caveat checker",
   router: "Router",
   verifier: "Verifier",
-  memory: "Memory",
+  memory: "Chat facts",
   web: "Web",
   ui: "UI",
   worklog: "Status",
@@ -1397,27 +1436,27 @@ function stepAction(type, phase, detail = {}) {
   const topic = narrationTopic(detail);
   const actions = {
     analysis: {
-      start: topic ? `Analyzing ${topic}` : "Analyzing the details",
-      done: "Analysis complete",
+      start: topic ? `Digging into ${topic}` : "Digging into the details",
+      done: "Analysis done",
     },
     research: {
-      start: topic ? `Gathering sources on ${topic}` : "Gathering sources",
-      done: "Sources gathered",
+      start: topic ? `Hunting for sources on ${topic}` : "Hunting for sources",
+      done: "Sources in",
     },
     search: {
       start: topic ? `Searching for ${topic}` : "Searching for sources",
-      done: "Search pass complete",
+      done: "Search done",
     },
     tavily_search: {
       start: topic ? `Searching for ${topic}` : "Searching for sources",
-      done: "Search pass complete",
+      done: "Search done",
     },
-    extract: { start: "Reading sources", done: "Source notes captured" },
-    tavily_extract: { start: "Reading sources", done: "Source notes captured" },
-    merge: { start: "Combining notes", done: "Notes combined" },
-    draft: { start: "Drafting the response", done: "Draft ready" },
-    finalize: { start: "Finalizing the response", done: "Response finalized" },
-    verify: { start: "Double-checking the draft", done: "Checks complete" },
+    extract: { start: "Reading through sources", done: "Key notes captured" },
+    tavily_extract: { start: "Reading through sources", done: "Key notes captured" },
+    merge: { start: "Cross-checking notes", done: "Notes aligned" },
+    draft: { start: "Writing up the response", done: "Draft ready" },
+    finalize: { start: "Polishing the response", done: "Final response ready" },
+    verify: { start: "Giving the draft a quick check", done: "Checks done" },
   };
   const entry = actions[type];
   if (!entry) return "";
@@ -1562,19 +1601,19 @@ function formatExtractNarration(detail = {}) {
 
 function formatToolRequest(detail = {}) {
   const requests = Array.isArray(detail.requests) ? detail.requests : [];
-  if (!requests.length) return "Running a quick tool";
+  if (!requests.length) return "Trying a quick tool";
   const req = requests[0] || {};
   const tool = String(req.tool || req.type || req.name || "").toLowerCase();
   if (["calculator", "calc", "math"].includes(tool)) {
     const expr = String(req.expr || req.expression || req.input || "").trim();
     const cleanExpr = expr.replace(/\s+/g, " ");
-    return cleanExpr ? `Computing ${cleanExpr}` : "Running a quick calculation";
+    return cleanExpr ? `Crunching ${cleanExpr}` : "Doing a quick calculation";
   }
   if (["live_date", "time_now", "now", "date"].includes(tool)) {
-    return "Checking the current time";
+    return "Checking the time";
   }
   if (["code_eval", "code", "python", "execute_code", "exec_code", "code_exec", "execute", "python_exec", "local_code"].includes(tool)) {
-    return "Running the code tool";
+    return "Running some code";
   }
   if (["read_text", "read_file", "file_read", "text_read", "read_bytes", "file_bytes", "read_file_bytes"].includes(tool)) {
     const path = String(req.path || req.file || req.filename || "").trim();
@@ -1585,26 +1624,26 @@ function formatToolRequest(detail = {}) {
     return "Listing files";
   }
   if (["plot_chart", "plot_graph", "chart", "graph"].includes(tool)) {
-    return "Drawing a quick chart";
+    return "Sketching a quick chart";
   }
   if (["image_info", "image_metadata", "image_load", "image_open", "image_zoom", "image_crop", "image_eval"].includes(tool)) {
-    return "Inspecting an image";
+    return "Taking a look at an image";
   }
-  return "Running a quick tool";
+  return "Trying a quick tool";
 }
 
 function formatToolResult(detail = {}) {
   const results = Array.isArray(detail.results) ? detail.results : [];
-  if (!results.length) return "Tool results ready";
+  if (!results.length) return "Tool results are in";
   const res = results[0] || {};
   const tool = String(res.tool || res.type || res.name || "").toLowerCase();
-  if (["calculator", "calc", "math"].includes(tool)) return "Calculation complete";
-  if (["live_date", "time_now", "now", "date"].includes(tool)) return "Time check done";
+  if (["calculator", "calc", "math"].includes(tool)) return "Calculation done";
+  if (["live_date", "time_now", "now", "date"].includes(tool)) return "Time checked";
   if (["code_eval", "code", "python", "execute_code", "exec_code", "code_exec", "execute", "python_exec", "local_code"].includes(tool)) {
-    return "Code tool finished";
+    return "Code run finished";
   }
   if (["read_text", "read_file", "file_read", "text_read", "read_bytes", "file_bytes", "read_file_bytes"].includes(tool)) {
-    return "File read complete";
+    return "File read";
   }
   if (["list_files", "list_dir", "list_directory", "ls"].includes(tool)) {
     return "File list ready";
@@ -1613,9 +1652,9 @@ function formatToolResult(detail = {}) {
     return "Chart ready";
   }
   if (["image_info", "image_metadata", "image_load", "image_open", "image_zoom", "image_crop", "image_eval"].includes(tool)) {
-    return "Image check done";
+    return "Image check complete";
   }
-  return "Tool results ready";
+  return "Tool results are in";
 }
 
 function extractToolMedia(detail = {}) {
@@ -1678,7 +1717,7 @@ function traceLineForEvent(type, detail = {}) {
     case "run_started": {
       const question = shortenWords(String(safe.question || ""), 18);
       return {
-        text: question ? `Run started: ${question}` : "Run started",
+        text: question ? `Kicking things off: ${question}` : "Kicking things off",
         tone: "info",
         lane: "orch",
         urls: traceUrls(safe),
@@ -1687,26 +1726,26 @@ function traceLineForEvent(type, detail = {}) {
     case "router_decision": {
       const tier = safe.model_tier || safe.requested_tier || "";
       const level = safe.reasoning_level || "";
-      let text = "Router decision";
+      let text = "Route picked";
       if (tier) text += `: ${tierLabel(tier)}`;
       if (safe.deep_route) {
         text += ` (${deepRouteLabel(safe.deep_route)})`;
       } else if (level) {
-        text += ` (${level})`;
+        text += ` (Plan depth: ${level})`;
       }
       return { text, tone: "info", lane: "router", urls: traceUrls(safe) };
     }
     case "plan_created": {
       const steps = Number(safe.expected_total_steps || safe.steps || 0);
       const passes = Number(safe.expected_passes || 0);
-      let text = steps ? `Plan created: ${steps} steps` : "Plan created";
+      let text = steps ? `Plan sketched: ${steps} steps` : "Plan sketched";
       if (passes) text += `, ${passes} pass${passes === 1 ? "" : "es"}`;
       return { text, tone: "info", lane: "orch", urls: traceUrls(safe) };
     }
     case "plan_updated": {
       const steps = Number(safe.expected_total_steps || safe.steps || 0);
       const passes = Number(safe.expected_passes || 0);
-      let text = steps ? `Plan updated: ${steps} steps` : "Plan updated";
+      let text = steps ? `Plan refreshed: ${steps} steps` : "Plan refreshed";
       if (passes) text += `, ${passes} pass${passes === 1 ? "" : "es"}`;
       return { text, tone: "info", lane: "orch", urls: traceUrls(safe) };
     }
@@ -1730,18 +1769,18 @@ function traceLineForEvent(type, detail = {}) {
       const lane = laneFromProfile(safe.agent_profile || "") || laneFrom(safe.name || "", safe.step);
       const detail = String(safe.detail || "").trim();
       const suffix = detail ? ` (${shortenWords(detail, 16)})` : "";
-      return { text: `${label} error: ${msg}${suffix}`, tone: "warn", lane, urls: traceUrls(safe) };
+      return { text: `${label} ran into an error: ${msg}${suffix}`, tone: "warn", lane, urls: traceUrls(safe) };
     }
     case "tool_request": {
       const action = formatToolRequest(safe);
       const lane = laneFrom("", safe.step);
-      return { text: `Tool request: ${action}`, tone: "info", lane, urls: traceUrls(safe) };
+      return { text: action, tone: "info", lane, urls: traceUrls(safe) };
     }
     case "tool_result": {
       const action = formatToolResult(safe);
       const lane = laneFrom("", safe.step);
       const media = extractToolMedia(safe);
-      const text = action.startsWith("Chart") ? action : `Tool result: ${action}`;
+      const text = action;
       return { text, tone: "info", lane, urls: traceUrls(safe), media };
     }
     case "tavily_search": {
@@ -1749,7 +1788,7 @@ function traceLineForEvent(type, detail = {}) {
       const resultCount = Number(safe.result_count || 0);
       const newCount = Number(safe.new_sources || 0);
       const dupes = Number(safe.duplicate_sources || 0);
-      let line = query ? `Search: ${shortenWords(query, 14)}` : "Search pass complete";
+      let line = query ? `Searching for: ${shortenWords(query, 14)}` : "Search done";
       if (resultCount) {
         const parts = [];
         if (newCount) parts.push(`${newCount} new`);
@@ -1761,15 +1800,15 @@ function traceLineForEvent(type, detail = {}) {
     }
     case "tavily_extract": {
       const action = formatExtractNarration(safe);
-      return { text: `Extract: ${action}`, tone: "info", lane: laneFrom("", safe.step), urls: traceUrls(safe) };
+      return { text: action, tone: "info", lane: laneFrom("", safe.step), urls: traceUrls(safe) };
     }
     case "tavily_error": {
       const msg = safe.message || "Tavily unavailable";
-      return { text: `Search error: ${msg}`, tone: "warn", lane: laneFrom("", safe.step), urls: traceUrls(safe) };
+      return { text: `Search hiccup: ${msg}`, tone: "warn", lane: laneFrom("", safe.step), urls: traceUrls(safe) };
     }
     case "search_skipped": {
       const query = String(safe.query || "").trim();
-      const line = query ? `Skipped duplicate search: ${shortenWords(query, 12)}` : "Skipped a duplicate search";
+      const line = query ? `Skipping a duplicate search: ${shortenWords(query, 12)}` : "Skipping a duplicate search";
       return { text: line, tone: "info", lane: laneFrom("", safe.step), urls: traceUrls(safe) };
     }
     case "source_found": {
@@ -1780,29 +1819,29 @@ function traceLineForEvent(type, detail = {}) {
       if (title && publisher && publisher !== title) {
         label = `${title} (${publisher})`;
       }
-      const text = label ? `Source found: ${shortenWords(label, 16)}` : "Source found";
+      const text = label ? `Found source: ${shortenWords(label, 16)}` : "Found a source";
       const lane = laneFromProfile(safe.lane || safe.agent_profile || "");
       return { text, tone: "info", lane, urls: traceUrls(safe) };
     }
     case "claim_found": {
       const claim = String(safe.claim || "").trim();
-      const text = claim ? `Finding: ${shortenWords(claim, 18)}` : "Finding noted";
+      const text = claim ? `Noted: ${shortenWords(claim, 18)}` : "Finding noted";
       const lane = laneFromProfile(safe.lane || safe.agent_profile || "");
       return { text, tone: "info", lane, urls: traceUrls(safe) };
     }
     case "upload_processed": {
       const name = safe.name ? `: ${safe.name}` : "";
-      return { text: `Upload processed${name}`, tone: "info", lane: "orch", urls: traceUrls(safe) };
+      return { text: `Upload checked${name}`, tone: "info", lane: "orch", urls: traceUrls(safe) };
     }
     case "upload_failed": {
       const name = safe.name ? `: ${safe.name}` : "";
       const err = safe.error ? ` (${safe.error})` : "";
-      return { text: `Upload failed${name}${err}`, tone: "warn", lane: "orch", urls: traceUrls(safe) };
+      return { text: `Upload hit a snag${name}${err}`, tone: "warn", lane: "orch", urls: traceUrls(safe) };
     }
     case "memory_retrieved": {
       const count = Number(safe.count || 0);
       return {
-        text: count ? `Memory retrieved (${count})` : "Memory retrieved",
+        text: count ? `Pulled chat facts (${count})` : "Pulled chat facts",
         tone: "info",
         lane: "memory",
         urls: traceUrls(safe),
@@ -1811,7 +1850,7 @@ function traceLineForEvent(type, detail = {}) {
     case "memory_saved": {
       const count = Number(safe.count || 0);
       return {
-        text: count ? `Memory saved (${count})` : "Memory saved",
+        text: count ? `Saved chat facts (${count})` : "Saved chat facts",
         tone: "info",
         lane: "memory",
         urls: traceUrls(safe),
@@ -1819,13 +1858,13 @@ function traceLineForEvent(type, detail = {}) {
     }
     case "loop_iteration": {
       const iteration = Number(safe.iteration || 0);
-      const text = iteration ? `Verifier requested another pass (loop ${iteration})` : "Verifier requested another pass";
+      const text = iteration ? `Verifier wants another pass (loop ${iteration})` : "Verifier wants another pass";
       return { text, tone: "warn", lane: "verifier", urls: traceUrls(safe) };
     }
     case "control_action": {
       const origin = String(safe.origin || "").toLowerCase();
       const control = String(safe.control || safe.action_type || "").toUpperCase();
-      let text = origin === "user" ? "Live plan update applied" : "Quality check applied";
+      let text = origin === "user" ? "Plan tweak applied" : "Quality check applied";
       if (control && control !== "CONTINUE") text += ` (${control})`;
       return { text, tone: "info", lane: "orch", urls: traceUrls(safe) };
     }
@@ -1835,16 +1874,16 @@ function traceLineForEvent(type, detail = {}) {
     }
     case "model_error": {
       const model = safe.model || safe.profile || "model";
-      return { text: `Model error: ${model}`, tone: "warn", lane: "orch", urls: traceUrls(safe) };
+      return { text: `Model hiccup: ${model}`, tone: "warn", lane: "orch", urls: traceUrls(safe) };
     }
     case "archived": {
-      const base = safe.stopped ? "Run stopped" : "Run complete";
+      const base = safe.stopped ? "Run stopped" : "Wrapped up";
       const conf = safe.confidence ? ` (${safe.confidence})` : "";
       return { text: `${base}${conf}`, tone: "info", lane: "orch", urls: traceUrls(safe) };
     }
     case "error": {
       const msg = safe.message || "Run error";
-      return { text: `Run error: ${msg}`, tone: "error", lane: "orch", urls: traceUrls(safe) };
+      return { text: `Run hit an error: ${msg}`, tone: "error", lane: "orch", urls: traceUrls(safe) };
     }
     default:
       return null;
@@ -1858,26 +1897,26 @@ function narrationForEvent(ev) {
       if (d.question) pendingQuestion = d.question;
       {
         const topic = cleanNarrationTopic(d.question);
-        return topic ? `Starting on ${topic}` : "Starting the run";
+        return topic ? `Getting started on ${topic}` : "Getting started";
       }
     case "router_decision":
-      return "Choosing a route";
+      return "Picking a route";
     case "plan_created":
-      return "Sketching the plan";
+      return "Laying out a plan";
     case "allocator_decision":
       return "Handing out tasks";
     case "memory_retrieved":
       if (Number.isFinite(Number(d.count)) && Number(d.count) > 0) {
-        return `Checking memory (${Number(d.count)})`;
+        return `Pulling chat facts (${Number(d.count)})`;
       }
-      return "Checking memory";
+      return "Pulling chat facts";
     case "memory_saved":
       if (Number.isFinite(Number(d.count)) && Number(d.count) > 0) {
         return `Saving notes (${Number(d.count)})`;
       }
       return "Saving notes";
     case "upload_processed":
-      return "Reviewing the upload";
+      return "Checking the upload";
     case "upload_failed":
       return "Upload hit a snag";
     case "step_started":
@@ -1952,7 +1991,7 @@ function summarizeLiveEvents(events) {
       const question = String(d.question || pendingQuestion || "").trim();
       if (question && !questionShownInLive) {
         usedQuestion = true;
-        pushLine(`Plan: ${shortenWords(question, 18)}`, ev);
+        pushLine(`Starting with: ${shortenWords(question, 18)}`, ev);
         return;
       }
     }
@@ -1967,20 +2006,20 @@ function summarizeLiveEvents(events) {
       return;
     }
     if (ev.type === "tavily_search") {
-      pushLine(`Tool request: ${formatSearchNarration(d)}`, ev, "info", ev.urls);
+      pushLine(formatSearchNarration(d), ev, "info", ev.urls);
       return;
     }
     if (ev.type === "tavily_extract") {
-      pushLine(`Tool result: ${formatExtractNarration(d)}`, ev, "info", ev.urls);
+      pushLine(formatExtractNarration(d), ev, "info", ev.urls);
       return;
     }
     if (ev.type === "tool_request") {
-      pushLine(`Tool request: ${formatToolRequest(d)}`, ev);
+      pushLine(formatToolRequest(d), ev);
       return;
     }
     if (ev.type === "tool_result") {
       const action = formatToolResult(d);
-      const text = action.startsWith("Chart") ? action : `Tool result: ${action}`;
+      const text = action;
       pushLine(text, ev, "info", ev.urls, "", extractToolMedia(d));
       return;
     }
@@ -2106,6 +2145,7 @@ function buildCitationState({ log = [], sources = [], visited = [], claims = [] 
   const logSet = new Set();
   const claimUrls = [];
   const claimSet = new Set();
+  const usageCount = {};
   const addMeta = (entry) => {
     if (entry && entry.url && !sourceMeta[entry.url]) sourceMeta[entry.url] = entry;
   };
@@ -2119,11 +2159,19 @@ function buildCitationState({ log = [], sources = [], visited = [], claims = [] 
     claimSet.add(url);
     claimUrls.push(url);
   };
+  const bumpUsage = (url, weight = 1) => {
+    if (!url) return;
+    const key = String(url);
+    usageCount[key] = (usageCount[key] || 0) + weight;
+  };
   (sources || []).forEach(addMeta);
   (visited || []).forEach(addMeta);
   (log || []).forEach((entry) => {
     if (!entry || entry.text === "Sources cited") return;
-    (entry.urls || []).forEach(addLogUrl);
+    (entry.urls || []).forEach((url) => {
+      addLogUrl(url);
+      bumpUsage(url, 1);
+    });
   });
   (claims || []).forEach((claim) => {
     const urls = Array.isArray(claim.support_urls)
@@ -2131,7 +2179,10 @@ function buildCitationState({ log = [], sources = [], visited = [], claims = [] 
       : Array.isArray(claim.urls)
       ? claim.urls
       : [];
-    (urls || []).forEach(addClaimUrl);
+    (urls || []).forEach((url) => {
+      addClaimUrl(url);
+      bumpUsage(url, 3);
+    });
   });
   const usedUrls = claimUrls.length ? claimUrls : logUrls;
   const usedSet = new Set(usedUrls);
@@ -2143,7 +2194,7 @@ function buildCitationState({ log = [], sources = [], visited = [], claims = [] 
   usedUrls.forEach(register);
   (sources || []).forEach((entry) => register(entry && entry.url));
   (visited || []).forEach((entry) => register(entry && entry.url));
-  return { citationMap, sourceMeta, usedSet };
+  return { citationMap, sourceMeta, usedSet, usageCount };
 }
 
 function formatDuration(log = []) {
@@ -2172,7 +2223,7 @@ function renderInlineCitations(urls = [], citationMap, sourceMeta, usedSet) {
   return bits.length ? " " + bits.join(" ") : "";
 }
 
-function renderCitationList(container, citationMap, sourceMeta, usedSet = new Set()) {
+function renderCitationList(container, citationMap, sourceMeta, usedSet = new Set(), usageCount = {}) {
   if (!container || !citationMap.size) return;
   const block = document.createElement("div");
   block.className = "citations-block";
@@ -2182,9 +2233,17 @@ function renderCitationList(container, citationMap, sourceMeta, usedSet = new Se
   block.appendChild(title);
   const hasUsageSignal = usedSet && usedSet.size > 0;
   const entries = Array.from(citationMap.entries())
-    .map(([url, idx]) => ({ url, idx, used: hasUsageSignal ? usedSet.has(url) : true }))
+    .map(([url, idx]) => ({
+      url,
+      idx,
+      used: hasUsageSignal ? usedSet.has(url) : true,
+      weight: usageCount[url] || 0,
+    }))
     .sort((a, b) => {
-      if (a.used === b.used) return a.idx - b.idx;
+      if (a.used === b.used) {
+        if (b.weight !== a.weight) return b.weight - a.weight;
+        return a.idx - b.idx;
+      }
       return a.used ? -1 : 1;
     });
   const used = entries.filter((entry) => entry.used);
@@ -2265,23 +2324,30 @@ function renderSourcesRow(urls = [], sourceMeta = {}) {
   return `<div class="sources-row"><span class="label">Sources</span><div class="sources-list">${chips}</div></div>`;
 }
 
-function renderHistory(runId = selectedRunId || currentRunId, logOverride = null) {
-  const feed = el("activityFeed") || el("reasoningFeed");
-  if (!feed) return;
-  const envelope = (runId && runDetails[runId]) || {};
-  const log =
-    logOverride ||
-    (runId
-      ? (runEvents[runId] && runEvents[runId].length ? runEvents[runId] : envelope.activity_events || [])
-      : historyLog);
-  const sources = envelope.sources || [];
-  const visited = envelope.visited_sources || [];
-  const claims = envelope.claims || [];
-  const { citationMap, sourceMeta, usedSet } = buildCitationState({ log, sources, visited, claims });
-  feed.innerHTML = "";
-  if (feed.id === "reasoningFeed") {
-    const header = document.createElement("div");
-    header.className = "thinking-header";
+  function renderHistory(runId = selectedRunId || currentRunId, logOverride = null) {
+    const feed = el("activityFeed") || el("reasoningFeed");
+    if (!feed) return;
+    const citationFeed = el("citationFeed");
+    const envelope = (runId && runDetails[runId]) || {};
+    const log =
+      logOverride ||
+      (runId
+        ? (runEvents[runId] && runEvents[runId].length ? runEvents[runId] : envelope.activity_events || [])
+        : historyLog);
+    const sources = envelope.sources || [];
+    const visited = envelope.visited_sources || [];
+    const claims = envelope.claims || [];
+    const { citationMap, sourceMeta, usedSet, usageCount } = buildCitationState({
+      log,
+      sources,
+      visited,
+      claims,
+    });
+    feed.innerHTML = "";
+    if (citationFeed) citationFeed.innerHTML = "";
+    if (feed.id === "reasoningFeed") {
+      const header = document.createElement("div");
+      header.className = "thinking-header";
     header.textContent = "Thinking";
     feed.appendChild(header);
   }
@@ -2289,10 +2355,11 @@ function renderHistory(runId = selectedRunId || currentRunId, logOverride = null
     const row = document.createElement("div");
     row.className = `thought ${h.tone || "info"}`;
     const body = document.createElement("div");
-    const inlineCites = renderInlineCitations(h.urls || [], citationMap, sourceMeta, usedSet);
-    const lineText = withNarrationPrefix(h.text, h.lane);
-    body.innerHTML = escapeAndBreak(lineText) + inlineCites;
-    row.appendChild(body);
+      const inlineCites =
+        feed.id === "activityFeed" ? "" : renderInlineCitations(h.urls || [], citationMap, sourceMeta, usedSet);
+      const lineText = withNarrationPrefix(h.text, h.lane);
+      body.innerHTML = escapeAndBreak(lineText) + inlineCites;
+      row.appendChild(body);
     const mediaItems = Array.isArray(h.media) ? h.media : h.media ? [h.media] : [];
     if (mediaItems.length) {
       const mediaWrap = document.createElement("div");
@@ -2319,11 +2386,13 @@ function renderHistory(runId = selectedRunId || currentRunId, logOverride = null
         row.appendChild(mediaWrap);
       }
     }
-    feed.appendChild(row);
-  });
-  renderCitationList(feed, citationMap, sourceMeta, usedSet);
-  feed.scrollTop = feed.scrollHeight;
-}
+      feed.appendChild(row);
+    });
+    if (citationFeed) {
+      renderCitationList(citationFeed, citationMap, sourceMeta, usedSet, usageCount);
+    }
+    feed.scrollTop = feed.scrollHeight;
+  }
 function addHistory(text, lane = "orch", urls = [], tone = "info", runId = null, media = null) {
   const trimmed = String(text || "").trim();
   if (!trimmed) return;
@@ -2408,6 +2477,8 @@ async function loadSettings() {
   }
   const s = data.settings || {};
   settingsSnapshot = s || {};
+  modelCandidateConfig = normalizeCandidateConfig(s.model_candidates);
+  latestModelCheck = data.model_check || {};
   settingsDefaults = {
     search_depth_mode: s.search_depth_mode || "auto",
     strict_mode: !!s.strict_mode,
@@ -2415,6 +2486,10 @@ async function loadSettings() {
     evidence_dump: false,
     max_results_override: 0,
     stt_lang: "en-US",
+    ram_headroom_pct: typeof s.ram_headroom_pct === "number" ? s.ram_headroom_pct : 10,
+    vram_headroom_pct: typeof s.vram_headroom_pct === "number" ? s.vram_headroom_pct : 10,
+    max_concurrent_loads: s.autoscaling?.max_concurrent_loads ?? 1,
+    profiling: s.profiling || {},
   };
   const localPrefs = loadLocalPrefs();
   settingsDefaults = {
@@ -2446,24 +2521,36 @@ async function loadSettings() {
   if (maxOverrideInput) maxOverrideInput.value = settingsDefaults.max_results_override || 0;
   const sttLangInput = el("sttLang");
   if (sttLangInput) sttLangInput.value = settingsDefaults.stt_lang || "en-US";
+  const ramHeadroomInput = el("cfgRamHeadroom");
+  if (ramHeadroomInput) ramHeadroomInput.value = settingsDefaults.ram_headroom_pct ?? 10;
+  const vramHeadroomInput = el("cfgVramHeadroom");
+  if (vramHeadroomInput) vramHeadroomInput.value = settingsDefaults.vram_headroom_pct ?? 10;
+  const maxLoadsInput = el("cfgMaxConcurrentLoads");
+  if (maxLoadsInput) maxLoadsInput.value = settingsDefaults.max_concurrent_loads ?? 1;
+  const autoProfileToggle = el("cfgAutoProfile");
+  if (autoProfileToggle) autoProfileToggle.checked = settingsDefaults.profiling?.auto_profile ?? true;
+  const profileRepeatsInput = el("cfgProfileRepeats");
+  if (profileRepeatsInput) profileRepeatsInput.value = settingsDefaults.profiling?.repeats ?? 1;
+  const profileMaxTokensInput = el("cfgProfileMaxTokens");
+  if (profileMaxTokensInput) profileMaxTokensInput.value = settingsDefaults.profiling?.max_output_tokens ?? "";
+  const profileContextInput = el("cfgProfileContext");
+  if (profileContextInput) profileContextInput.value = settingsDefaults.profiling?.context_length ?? "";
   const modelWarning = el("modelWarning");
   if (modelWarning) {
     modelWarning.textContent = "";
     modelWarning.classList.add("hidden");
   }
   let missingRoles = [];
-  if (data.model_check) {
-    const bad = Object.entries(data.model_check).filter(([, v]) => v.ok === false);
-    if (bad.length) {
-      missingRoles = bad.map(([r, v]) => `${r}:${(v.missing || []).join(",") || v.error || ""}`);
-      if (modelWarning) {
-        modelWarning.textContent = `Model issues: ${missingRoles.join(", ")}`;
-        modelWarning.title = modelWarning.textContent;
-        modelWarning.classList.remove("hidden");
-      }
-    }
+  const candidates = latestModelCheck?.catalog?.candidates || [];
+  if (!candidates.length) {
+    missingRoles = ["No models discovered"];
   }
-  renderModelSelectors(s, data.model_check || {});
+  if (missingRoles.length && modelWarning) {
+    modelWarning.textContent = `Model issues: ${missingRoles.join(", ")}`;
+    modelWarning.title = modelWarning.textContent;
+    modelWarning.classList.remove("hidden");
+  }
+  renderModelCandidates(s, latestModelCheck || {});
   // Auto-discover if models are missing and we haven't tried yet.
   const baseUrls = discoveryInput ? discoveryInput.value.split(",").map((v) => v.trim()).filter(Boolean) : [];
   if (!triedAutoDiscover && baseUrls.length && missingRoles.length) {
@@ -2472,35 +2559,173 @@ async function loadSettings() {
     if (settingsStatus) settingsStatus.textContent = "Auto-discovering available models...";
     await autoDiscoverAndReport(baseUrls);
   }
-  renderResourceSnapshot(data.model_check || {});
+  renderResourceSnapshot(latestModelCheck || {});
+  loadProfileStatus();
   toggleModal(false);
   return true;
 }
 
-function renderModelSelectors(settings, modelCheck) {
-  MODEL_ENDPOINT_FIELDS.forEach((field) => {
-    const select = el(field.selectId);
-    if (!select) return;
-    const current = settings?.[field.key]?.model_id || "";
-    const available = modelCheck?.[field.role]?.available || [];
-    const options = Array.from(new Set([current, ...available].filter(Boolean)));
-    select.innerHTML = "";
-    if (!options.length) {
-      const opt = document.createElement("option");
-      opt.value = current || "";
-      opt.textContent = current || "No models detected";
-      select.appendChild(opt);
-      select.disabled = true;
-      return;
+function normalizeCandidateConfig(config) {
+  const raw = config || {};
+  return {
+    mode: raw.mode || "auto",
+    allow: Array.isArray(raw.allow) ? raw.allow : [],
+    deny: Array.isArray(raw.deny) ? raw.deny : [],
+    prefer: Array.isArray(raw.prefer) ? raw.prefer : [],
+  };
+}
+
+function fmtMetric(value, digits = 1) {
+  if (typeof value !== "number") return "?";
+  return value.toFixed(value >= 10 ? 0 : digits);
+}
+
+function formatMb(mb) {
+  if (typeof mb !== "number") return "";
+  return formatBytes(mb * 1024 * 1024);
+}
+
+function formatTimestamp(value) {
+  if (!value) return "";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "";
+  return date.toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+}
+
+function renderModelCandidates(settings, modelCheck) {
+  const list = el("modelCandidates");
+  if (!list) return;
+  const catalog = modelCheck?.catalog?.candidates || [];
+  modelCatalog = Array.isArray(catalog) ? catalog : [];
+  modelCandidateConfig = normalizeCandidateConfig(settings?.model_candidates);
+  const modeSelect = el("cfgCandidateMode");
+  if (modeSelect) {
+    modeSelect.value = modelCandidateConfig.mode || "auto";
+    if (!modeSelect.dataset.bound) {
+      modeSelect.dataset.bound = "true";
+      modeSelect.addEventListener("change", () => renderModelCandidates(settingsSnapshot, latestModelCheck));
     }
-    select.disabled = false;
-    options.forEach((id) => {
-      const opt = document.createElement("option");
-      opt.value = id;
-      opt.textContent = id;
-      select.appendChild(opt);
-    });
-    select.value = current || options[0];
+  }
+  list.innerHTML = "";
+  if (!modelCatalog.length) {
+    const empty = document.createElement("div");
+    empty.className = "status";
+    empty.textContent = "No models discovered yet. Load a model in LM Studio, then refresh.";
+    list.appendChild(empty);
+    return;
+  }
+  const mode = modelCandidateConfig.mode || "auto";
+  const allowSet = new Set(modelCandidateConfig.allow || []);
+  const denySet = new Set(modelCandidateConfig.deny || []);
+  const preferSet = new Set(modelCandidateConfig.prefer || []);
+  const enableDisabled = mode === "auto";
+  modelCatalog.forEach((candidate) => {
+    const modelKey = candidate.model_key || candidate.model || "";
+    if (!modelKey) return;
+    const caps = candidate.capabilities || {};
+    const profile = candidate.profile || {};
+    const enabled = mode === "allowlist"
+      ? allowSet.size
+        ? allowSet.has(modelKey)
+        : true
+      : mode === "denylist"
+        ? !denySet.has(modelKey)
+        : true;
+    const preferred = preferSet.has(modelKey);
+    const capsList = [];
+    if (caps.tool_use) capsList.push("tools");
+    if (caps.structured_output) capsList.push("json");
+    if (caps.vision) capsList.push("vision");
+    if (!capsList.length) capsList.push("capabilities pending");
+    const toolRate = typeof profile.tool_call_success_rate === "number"
+      ? `${Math.round(profile.tool_call_success_rate * 100)}% tools`
+      : null;
+    const jsonRate = typeof profile.json_schema_success_rate === "number"
+      ? `${Math.round(profile.json_schema_success_rate * 100)}% json`
+      : null;
+    const perfLine = `tps ${fmtMetric(profile.tps)} | ${fmtMetric(profile.latency_ms, 0)}ms`;
+    const scoreBits = [perfLine, toolRate, jsonRate].filter(Boolean).join(" | ");
+    const ramPeak = typeof profile.ram_instance_peak_bytes === "number"
+      ? `RAM peak ${formatBytes(profile.ram_instance_peak_bytes)}`
+      : null;
+    const vramMap = profile.vram_instance_peak_mb_by_gpu || {};
+    const vramPeakVal = Object.values(vramMap).reduce((acc, val) => {
+      const num = typeof val === "number" ? val : Number(val || 0);
+      return num > acc ? num : acc;
+    }, 0);
+    const vramPeak = vramPeakVal
+      ? `VRAM peak ${formatMb(vramPeakVal)}`
+      : typeof profile.vram_estimate_only_mb === "number"
+        ? `VRAM est ${formatMb(profile.vram_estimate_only_mb)}`
+        : null;
+    const capacity = profile.capacity || {};
+    let capacityLine = null;
+    if (typeof capacity.max_instances === "number") {
+      const perGpu = capacity.max_instances_by_gpu || {};
+      const gpuEntries = Object.entries(perGpu).map(([key, val]) => `${key}:${val}`);
+      capacityLine = gpuEntries.length
+        ? `max inst ${gpuEntries.join(", ")}`
+        : `max inst ${capacity.max_instances}`;
+    }
+    const profiledAt = formatTimestamp(profile.resource_profiled_at);
+    const profileStatus = profile.profile_status && profile.profile_status !== "ok"
+      ? `status ${profile.profile_status}`
+      : null;
+
+    const row = document.createElement("div");
+    row.className = `candidate-row${enabled ? "" : " disabled"}`;
+    const main = document.createElement("div");
+    main.className = "candidate-main";
+    const name = document.createElement("div");
+    name.className = "candidate-name mono";
+    name.textContent = modelKey;
+    const meta = document.createElement("div");
+    meta.className = "candidate-meta";
+    meta.textContent = `${capsList.join(" | ")}${scoreBits ? ` | ${scoreBits}` : ""}`;
+    const metaSecondary = document.createElement("div");
+    metaSecondary.className = "candidate-meta";
+    const secondaryBits = [
+      ramPeak,
+      vramPeak,
+      capacityLine,
+      profiledAt ? `profiled ${profiledAt}` : null,
+      profileStatus,
+    ].filter(Boolean).join(" | ");
+    if (secondaryBits) metaSecondary.textContent = secondaryBits;
+    main.appendChild(name);
+    main.appendChild(meta);
+    if (secondaryBits) main.appendChild(metaSecondary);
+
+    const actions = document.createElement("div");
+    actions.className = "candidate-actions";
+    const enableLabel = document.createElement("label");
+    enableLabel.className = "toggle compact";
+    const enableInput = document.createElement("input");
+    enableInput.type = "checkbox";
+    enableInput.checked = enabled;
+    enableInput.disabled = enableDisabled;
+    enableInput.dataset.candidateEnable = modelKey;
+    enableLabel.appendChild(enableInput);
+    const enableText = document.createElement("span");
+    enableText.textContent = "Enable";
+    enableLabel.appendChild(enableText);
+
+    const preferLabel = document.createElement("label");
+    preferLabel.className = "toggle compact";
+    const preferInput = document.createElement("input");
+    preferInput.type = "checkbox";
+    preferInput.checked = preferred;
+    preferInput.dataset.candidatePrefer = modelKey;
+    preferLabel.appendChild(preferInput);
+    const preferText = document.createElement("span");
+    preferText.textContent = "Prefer";
+    preferLabel.appendChild(preferText);
+
+    actions.appendChild(enableLabel);
+    actions.appendChild(preferLabel);
+    row.appendChild(main);
+    row.appendChild(actions);
+    list.appendChild(row);
   });
 }
 
@@ -2523,7 +2748,7 @@ function renderMemoryList(items = []) {
   if (!items.length) {
     const empty = document.createElement("div");
     empty.className = "conversation-empty";
-    empty.textContent = "No memory saved yet.";
+    empty.textContent = "No chat facts saved yet.";
     list.appendChild(empty);
     return;
   }
@@ -2531,7 +2756,7 @@ function renderMemoryList(items = []) {
     const card = document.createElement("div");
     card.className = "memory-card";
     const title = document.createElement("h4");
-    title.textContent = item.title || "Untitled memory";
+    title.textContent = item.title || "Untitled fact";
     const content = document.createElement("div");
     content.className = "memory-content";
     content.textContent = item.content || "";
@@ -2558,7 +2783,7 @@ function renderMemoryList(items = []) {
     delBtn.className = "pill-btn ghost";
     delBtn.textContent = "Delete";
     delBtn.onclick = async () => {
-      if (!confirm("Delete this memory item?")) return;
+      if (!confirm("Delete this chat fact?")) return;
       await fetch(resolveEndpoint(`/api/memory/${item.id}`), { method: "DELETE" });
       loadMemory(el("memorySearch")?.value || "");
     };
@@ -2574,8 +2799,14 @@ function renderMemoryList(items = []) {
 
 async function loadMemory(query = "") {
   try {
+    if (!activeConversationId) {
+      renderMemoryList([]);
+      return;
+    }
     const q = query.trim();
-    const endpoint = q ? `/api/memory?q=${encodeURIComponent(q)}` : "/api/memory";
+    const params = new URLSearchParams({ conversation_id: activeConversationId });
+    if (q) params.set("q", q);
+    const endpoint = `/api/memory?${params.toString()}`;
     const res = await fetch(resolveEndpoint(endpoint));
     if (!res.ok) return;
     const data = await res.json();
@@ -2613,7 +2844,6 @@ async function saveSettings() {
   const tavKey = el("cfgTavily").value;
   const baseUrl = el("cfgBaseUrl").value;
   const snapshot = settingsSnapshot || {};
-  const priorBaseUrl = snapshot.lm_studio_base_url || baseUrl;
   const payload = {
     lm_studio_base_url: baseUrl,
     tavily_api_key: tavKey === "********" ? undefined : tavKey,
@@ -2623,6 +2853,24 @@ async function saveSettings() {
     extract_depth: el("cfgExtract").value,
     discovery_base_urls: el("cfgDiscovery").value.split(",").map((v) => v.trim()).filter(Boolean),
   };
+  const ramHeadroomRaw = el("cfgRamHeadroom") ? Number(el("cfgRamHeadroom").value) : settingsDefaults.ram_headroom_pct;
+  if (Number.isFinite(ramHeadroomRaw)) payload.ram_headroom_pct = ramHeadroomRaw;
+  const vramHeadroomRaw = el("cfgVramHeadroom") ? Number(el("cfgVramHeadroom").value) : settingsDefaults.vram_headroom_pct;
+  if (Number.isFinite(vramHeadroomRaw)) payload.vram_headroom_pct = vramHeadroomRaw;
+  const maxLoadsRaw = el("cfgMaxConcurrentLoads") ? Number(el("cfgMaxConcurrentLoads").value) : settingsDefaults.max_concurrent_loads;
+  const autoscaling = { ...(settingsSnapshot?.autoscaling || {}) };
+  if (Number.isFinite(maxLoadsRaw)) autoscaling.max_concurrent_loads = maxLoadsRaw;
+  payload.autoscaling = autoscaling;
+  const profiling = { ...(settingsSnapshot?.profiling || {}) };
+  const autoProfile = el("cfgAutoProfile") ? el("cfgAutoProfile").checked : profiling.auto_profile;
+  profiling.auto_profile = autoProfile;
+  const repeatsRaw = el("cfgProfileRepeats") ? Number(el("cfgProfileRepeats").value) : profiling.repeats;
+  if (Number.isFinite(repeatsRaw)) profiling.repeats = Math.max(1, repeatsRaw);
+  const maxTokensRaw = el("cfgProfileMaxTokens")?.value;
+  profiling.max_output_tokens = maxTokensRaw ? Number(maxTokensRaw) : null;
+  const contextRaw = el("cfgProfileContext")?.value;
+  profiling.context_length = contextRaw ? Number(contextRaw) : null;
+  payload.profiling = profiling;
   const strictToggle = el("cfgStrictMode");
   if (strictToggle) payload.strict_mode = strictToggle.checked;
   const maxOverrideRaw = el("cfgMaxOverride") ? Number(el("cfgMaxOverride").value) : settingsDefaults.max_results_override;
@@ -2638,15 +2886,30 @@ async function saveSettings() {
     strict_mode: payload.strict_mode ?? settingsDefaults.strict_mode,
   };
   saveLocalPrefs(localPrefs);
-  MODEL_ENDPOINT_FIELDS.forEach((field) => {
-    const current = snapshot[field.key];
-    if (!current) return;
-    const select = el(field.selectId);
-    const selectedModel = select?.value || current.model_id;
-    if (!selectedModel) return;
-    const nextBaseUrl = current.base_url && current.base_url !== priorBaseUrl ? current.base_url : baseUrl;
-    payload[field.key] = { base_url: nextBaseUrl, model_id: selectedModel };
-  });
+  const modeSelect = el("cfgCandidateMode");
+  const candidateMode = modeSelect ? modeSelect.value : modelCandidateConfig.mode || "auto";
+  const enabledNodes = Array.from(document.querySelectorAll("input[data-candidate-enable]"));
+  const preferNodes = Array.from(document.querySelectorAll("input[data-candidate-prefer]"));
+  let allow = Array.isArray(modelCandidateConfig.allow) ? [...modelCandidateConfig.allow] : [];
+  let deny = Array.isArray(modelCandidateConfig.deny) ? [...modelCandidateConfig.deny] : [];
+  if (candidateMode === "allowlist") {
+    allow = enabledNodes
+      .filter((node) => node.checked && node.dataset.candidateEnable)
+      .map((node) => node.dataset.candidateEnable);
+  } else if (candidateMode === "denylist") {
+    deny = enabledNodes
+      .filter((node) => !node.checked && node.dataset.candidateEnable)
+      .map((node) => node.dataset.candidateEnable);
+  }
+  const prefer = preferNodes
+    .filter((node) => node.checked && node.dataset.candidatePrefer)
+    .map((node) => node.dataset.candidatePrefer);
+  payload.model_candidates = {
+    mode: candidateMode,
+    allow: Array.from(new Set(allow)),
+    deny: Array.from(new Set(deny)),
+    prefer: Array.from(new Set(prefer)),
+  };
   const res = await fetch(resolveEndpoint("/settings"), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -2664,7 +2927,11 @@ async function discoverModels() {
     body: JSON.stringify({ base_urls }),
   });
   const data = await res.json();
-  el("settingsStatus").textContent = JSON.stringify(data.results);
+  const summary = Object.entries(data.results || {})
+    .map(([key, val]) => `${key}: ${val.ok ? (val.models || []).slice(0, 3).join("|") : "error"}`)
+    .join(" | ");
+  el("settingsStatus").textContent = summary || "Discovery complete.";
+  await loadSettings();
 }
 
 async function autoDiscoverAndReport(base_urls) {
@@ -2682,8 +2949,71 @@ async function autoDiscoverAndReport(base_urls) {
     if (!el("cfgDiscovery").value) {
       el("cfgDiscovery").value = base_urls.join(", ");
     }
+    await loadSettings();
   } catch (err) {
     el("settingsStatus").textContent = "Discovery failed.";
+  }
+}
+
+async function loadProfileStatus() {
+  try {
+    const res = await fetch(resolveEndpoint("/api/models/profile"));
+    if (!res.ok) return;
+    const data = await res.json();
+    renderProfileStatus(data.status || {});
+  } catch (_) {}
+}
+
+function renderProfileStatus(status = {}) {
+  const target = el("profileStatus");
+  if (!target) return;
+  if (!status || typeof status !== "object") {
+    target.textContent = "";
+    return;
+  }
+  if (status.running) {
+    const current = status.current ? ` (${status.current})` : "";
+    target.textContent = `Profiling ${status.completed || 0}/${status.total || "?"}${current}`;
+    return;
+  }
+  if (status.total) {
+    target.textContent = `Profiling complete (${status.completed || 0}/${status.total}).`;
+  } else {
+    target.textContent = "";
+  }
+}
+
+async function profileModels(force = false) {
+  const btn = el(force ? "profileModelsForceBtn" : "profileModelsBtn");
+  if (btn) btn.disabled = true;
+  try {
+    const res = await fetch(resolveEndpoint("/api/models/profile"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ force }),
+    });
+    if (res.ok) {
+      const data = await res.json();
+      renderProfileStatus(data.status || {});
+      await pollProfileStatus();
+      await loadSettings();
+    } else {
+      const status = el("profileStatus");
+      if (status) status.textContent = "Profiling failed to start.";
+    }
+  } catch (_) {
+    const status = el("profileStatus");
+    if (status) status.textContent = "Profiling failed to start.";
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+async function pollProfileStatus() {
+  for (let i = 0; i < 60; i += 1) {
+    await loadProfileStatus();
+    if (!el("profileStatus")?.textContent?.includes("Profiling")) break;
+    await new Promise((resolve) => setTimeout(resolve, 1000));
   }
 }
 
@@ -2696,22 +3026,10 @@ const REASONING_BY_TIER = {
     { value: "LOW", label: "Quick" },
     { value: "MED", label: "Balanced" },
     { value: "HIGH", label: "Deep" },
-    { value: "ULTRA", label: "Ultra" },
+    { value: "ULTRA", label: "Exhaustive" },
   ],
 };
 
-const MODEL_ENDPOINT_FIELDS = [
-  { key: "orch_endpoint", role: "orch", selectId: "cfgModelOrch" },
-  { key: "worker_a_endpoint", role: "worker", selectId: "cfgModelWorker" },
-  { key: "worker_b_endpoint", role: "worker_b", selectId: "cfgModelWorkerB" },
-  { key: "worker_c_endpoint", role: "worker_c", selectId: "cfgModelWorkerC" },
-  { key: "fast_endpoint", role: "fast", selectId: "cfgModelFast" },
-  { key: "deep_planner_endpoint", role: "deep_planner", selectId: "cfgModelDeepPlanner" },
-  { key: "deep_orchestrator_endpoint", role: "deep_orch", selectId: "cfgModelDeepOrch" },
-  { key: "router_endpoint", role: "router", selectId: "cfgModelRouter" },
-  { key: "summarizer_endpoint", role: "summarizer", selectId: "cfgModelSummarizer" },
-  { key: "verifier_endpoint", role: "verifier", selectId: "cfgModelVerifier" },
-];
 
 function renderReasoningOptions(tier) {
   const select = el("reasoningLevel");
@@ -2824,10 +3142,12 @@ async function startRun(evt) {
   cachedArtifacts = null;
   historyLog = [];
   renderHistory();
-  resetLiveStreamState(question);
-  updateLiveTicker("Planning...");
-  const activity = el("activityFeed");
-  if (activity) activity.innerHTML = "";
+    resetLiveStreamState(question);
+    updateLiveTicker("Planning...");
+    const activity = el("activityFeed");
+    if (activity) activity.innerHTML = "";
+    const citations = el("citationFeed");
+    if (citations) citations.innerHTML = "";
   totalSteps = 0;
   completedSteps = 0;
   updateProgressUI();
@@ -2836,6 +3156,7 @@ async function startRun(evt) {
 
   const settings = getReasoningSettings();
   const reasoningAuto = settings.reasoningMode === "auto";
+  const planning = getPlanningModes(settings);
   const payload = {
     question,
     conversation_id: activeConversationId,
@@ -2843,6 +3164,9 @@ async function startRun(evt) {
     manual_level: settings.manualLevel,
     model_tier: currentTier,
     deep_mode: currentTier === "deep" ? settings.deepRoute : "auto",
+    plan_reasoning_mode: planning.plan_reasoning_mode,
+    planning_mode: planning.planning_mode,
+    reasoning_level: planning.reasoning_level,
     evidence_dump: settingsDefaults.evidence_dump,
     search_depth_mode: settingsDefaults.search_depth_mode,
     max_results: settingsDefaults.max_results_override || 0,
@@ -3405,7 +3729,7 @@ function extractFinalText(raw) {
 function buildReasoningSummary(run = {}, sources = [], claims = [], routerDecision = {}) {
   const items = [];
   const route = routerDecision.deep_route || routerDecision.route;
-  if (routerDecision.reasoning_level) items.push(`Reasoning: ${routerDecision.reasoning_level}`);
+    if (routerDecision.reasoning_level) items.push(`Plan depth: ${routerDecision.reasoning_level}`);
   if (route) items.push(`Route: ${deepRouteLabel(route)}`);
   if (sources.length) items.push(`Cited ${sources.length} source${sources.length === 1 ? "" : "s"}`);
   if (claims.length) items.push(`Claims recorded: ${claims.length}`);
@@ -3571,20 +3895,11 @@ async function fetchArtifacts(runId, opts = {}) {
     renderAssistantAnswer(run.run_id, envelope);
   }
   lastAssistantRunId = run.run_id;
-  el("confidence").textContent = run.confidence ? `Confidence: ${run.confidence}` : "";
-  if (sources.length) {
-    const citationState = buildCitationState({ log: runEvents[run.run_id] || [], sources, claims });
-    const sourceOrder = Array.from(citationState.citationMap.keys());
-    el("sources").innerHTML = renderSourcesRow(sourceOrder, citationState.sourceMeta);
-    if (!opts.liveOnly) {
-      addHistory("Sources cited", "web", sources.map((s) => s.url));
-    }
-  } else {
+    el("confidence").textContent = run.confidence ? `Confidence: ${run.confidence}` : "";
     el("sources").textContent = "";
-  }
   renderEvidence(claims);
   if (verifier && verifier.verdict) {
-    pushReasoning(`Verifier verdict: ${verifier.verdict} (${(verifier.issues || []).length} issues)`, "info", "verifier");
+    pushReasoning(`Verifier says: ${verifier.verdict} (${(verifier.issues || []).length} issues)`, "info", "verifier");
   }
   if (opts.liveOnly) {
     // Keep narration focused on execution steps; skip findings summaries here.
@@ -3594,7 +3909,7 @@ async function fetchArtifacts(runId, opts = {}) {
   }
 }
 
-async function switchToRun(runId, opts = {}) {
+  async function switchToRun(runId, opts = {}) {
   if (!runId) return;
   const clearChat = opts.clearChat === true;
   const fromPoll = opts.fromPoll || false;
@@ -3610,10 +3925,12 @@ async function switchToRun(runId, opts = {}) {
   } else {
     resetLiveAgentState();
   }
-  {
-    const activity = el("activityFeed");
-    if (activity) activity.innerHTML = "";
-  }
+    {
+      const activity = el("activityFeed");
+      if (activity) activity.innerHTML = "";
+      const citations = el("citationFeed");
+      if (citations) citations.innerHTML = "";
+    }
   currentRunId = runId;
   subscribeEvents(runId);
   if (!skipThinking) ensureThinkingPlaceholder(runId);
@@ -3758,6 +4075,10 @@ document.addEventListener("DOMContentLoaded", async () => {
   if (saveSettingsBtn) saveSettingsBtn.addEventListener("click", saveSettings);
   const discoverBtn = el("discoverBtn");
   if (discoverBtn) discoverBtn.addEventListener("click", discoverModels);
+  const profileBtn = el("profileModelsBtn");
+  if (profileBtn) profileBtn.addEventListener("click", () => profileModels(false));
+  const profileForceBtn = el("profileModelsForceBtn");
+  if (profileForceBtn) profileForceBtn.addEventListener("click", () => profileModels(true));
 
   const reasoningLevel = el("reasoningLevel");
   if (reasoningLevel)

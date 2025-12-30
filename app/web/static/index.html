@@ -39,10 +39,11 @@
 
       <div class="sidebar-section" id="reasoningControl">
         <div class="section-row">
-          <label class="label" for="reasoningLevel">Reasoning</label>
+          <label class="label" for="reasoningLevel">Plan depth</label>
           <div class="pill inline-pill">Tier: <span id="reasoningBadge">Auto</span></div>
         </div>
         <select id="reasoningLevel"></select>
+        <p class="sub">Plan depth controls initial plan detail only. Auto uses the least resources needed for a high-confidence answer and will keep iterating. Exhaustive expands the plan and enumerates every item.</p>
       </div>
 
       <div class="sidebar-section hidden" id="deepRouteWrap">
@@ -64,39 +65,41 @@
     </aside>
 
     <main class="chat-pane">
-      <header class="chat-header">
-        <div class="header-left">
-          <button id="sidebarToggleBtn" class="icon-btn ghost mobile-only" title="Chats">Chats</button>
-          <div class="header-title">
-            <button id="conversationTitle" class="title-btn" type="button" title="Rename chat">LocalPro Chat</button>
-            <span id="conversationMeta" class="header-meta"></span>
+      <div class="chat-topbar">
+        <header class="chat-header">
+          <div class="header-left">
+            <button id="sidebarToggleBtn" class="icon-btn ghost mobile-only" title="Chats">Chats</button>
+            <div class="header-title">
+              <button id="conversationTitle" class="title-btn" type="button" title="Rename chat">LocalPro Chat</button>
+              <span id="conversationMeta" class="header-meta"></span>
+            </div>
+            <span id="modelWarning" class="warning-pill hidden" aria-live="polite"></span>
           </div>
-          <span id="modelWarning" class="warning-pill hidden" aria-live="polite"></span>
-        </div>
-        <div class="header-actions">
-          <button id="activityToggleBtn" class="pill-btn ghost">Thinking</button>
-          <button id="memoryBtn" class="pill-btn ghost">Memory</button>
-          <button id="mobileNewConversationBtn" class="pill-btn ghost mobile-only">New chat</button>
-          <button id="mobileOpenSettingsHint" class="pill-btn ghost mobile-only" disabled>Settings on desktop</button>
-        </div>
-      </header>
+          <div class="header-actions">
+            <button id="activityToggleBtn" class="pill-btn ghost">Thinking</button>
+            <button id="memoryBtn" class="pill-btn ghost">Chat facts</button>
+            <button id="mobileNewConversationBtn" class="pill-btn ghost mobile-only">New chat</button>
+            <button id="mobileOpenSettingsHint" class="pill-btn ghost mobile-only" disabled>Settings on desktop</button>
+          </div>
+        </header>
 
-      <section class="runbar">
-        <div class="runbar-row">
-          <span class="status-chip" id="runStatus">Idle</span>
-          <span class="timer mono" id="runTimer">00:00</span>
-          <span class="meta-chip" id="progressText">Progress: 0%</span>
-          <span class="meta-chip" id="etaText">ETA: --</span>
-          <span class="meta-chip" id="liveAgentCount" title="Live agents">Live agents: 0</span>
-        </div>
-        <div class="runbar-progress">
-          <div id="runProgress" class="progress-bar"><div id="runProgressFill"></div></div>
-          <div class="live-preview">
-            <p class="label">Live thinking preview</p>
-            <div id="liveTicker" class="ticker-text" title="Click to toggle thinking">Idle</div>
+        <section class="runbar">
+          <div class="runbar-row">
+            <span class="status-chip" id="runStatus">Idle</span>
+            <span class="timer mono" id="runTimer">00:00</span>
+            <span class="meta-chip" id="progressText">Progress: 0%</span>
+            <span class="meta-chip" id="etaText">ETA: --</span>
+            <span class="meta-chip" id="liveAgentCount" title="Live agents">Live agents: 0</span>
           </div>
-        </div>
-      </section>
+          <div class="runbar-progress">
+            <div id="runProgress" class="progress-bar"><div id="runProgressFill"></div></div>
+            <div class="live-preview">
+              <p class="label">Live thinking preview</p>
+              <div id="liveTicker" class="ticker-text" title="Click to toggle thinking">Idle</div>
+            </div>
+          </div>
+        </section>
+      </div>
 
       <section class="chat-stage">
         <div id="emptyState" class="empty-state hidden">
@@ -174,9 +177,15 @@
         </div>
       </div>
       <div class="drawer-body">
-        <div class="panel-section">
-          <p class="label">Live log</p>
-          <div id="activityFeed" class="feed activity-feed thinking-feed"></div>
+        <div class="panel-grid two-up">
+          <div class="panel-section">
+            <p class="label">Live log</p>
+            <div id="activityFeed" class="feed activity-feed thinking-feed"></div>
+          </div>
+          <div class="panel-section">
+            <p class="label">Citations</p>
+            <div id="citationFeed" class="feed citation-feed"></div>
+          </div>
         </div>
       </div>
     </aside>
@@ -213,16 +222,31 @@
 
           <div class="settings-group">
             <p class="label">Models</p>
-            <label>Orchestrator <select id="cfgModelOrch"></select></label>
-            <label>Worker A <select id="cfgModelWorker"></select></label>
-            <label>Worker B <select id="cfgModelWorkerB"></select></label>
-            <label>Worker C <select id="cfgModelWorkerC"></select></label>
-            <label>Fast tier <select id="cfgModelFast"></select></label>
-            <label>Deep planner <select id="cfgModelDeepPlanner"></select></label>
-            <label>Deep orchestrator <select id="cfgModelDeepOrch"></select></label>
-            <label>Router <select id="cfgModelRouter"></select></label>
-            <label>Summarizer <select id="cfgModelSummarizer"></select></label>
-            <label>Verifier <select id="cfgModelVerifier"></select></label>
+            <label>Candidate mode
+              <select id="cfgCandidateMode">
+                <option value="auto" selected>Auto (use all discovered)</option>
+                <option value="allowlist">Allowlist</option>
+                <option value="denylist">Denylist</option>
+              </select>
+            </label>
+            <div id="modelCandidates" class="candidate-list"></div>
+            <div class="panel-actions">
+              <button type="button" id="profileModelsBtn" class="pill-btn ghost">Profile models</button>
+              <button type="button" id="profileModelsForceBtn" class="pill-btn ghost">Re-profile</button>
+            </div>
+            <p id="profileStatus" class="status"></p>
+            <p class="sub">Preferences steer routing. Disable filters only apply in allowlist/denylist modes.</p>
+          </div>
+
+          <div class="settings-group">
+            <p class="label">Profiling</p>
+            <label class="toggle">
+              <input id="cfgAutoProfile" type="checkbox">
+              <span>Auto-profile new models</span>
+            </label>
+            <label>Profile repeats <input id="cfgProfileRepeats" type="number" min="1"></label>
+            <label>Profile max output tokens <input id="cfgProfileMaxTokens" type="number" min="32"></label>
+            <label>Profile context length <input id="cfgProfileContext" type="number" min="0"></label>
           </div>
 
           <div class="settings-group">
@@ -242,7 +266,7 @@
             </label>
             <label class="toggle">
               <input id="cfgAutoMemory" type="checkbox">
-              <span>Auto memory (save useful notes)</span>
+              <span>Auto memory (save chat facts)</span>
             </label>
             <label class="toggle">
               <input id="cfgEvidenceDump" type="checkbox">
@@ -256,6 +280,9 @@
             <p class="label">System</p>
             <div id="resourceStats" class="status"></div>
             <div id="agentBudget" class="status"></div>
+            <label>RAM headroom % <input id="cfgRamHeadroom" type="number" min="0" max="50"></label>
+            <label>VRAM headroom % <input id="cfgVramHeadroom" type="number" min="0" max="50"></label>
+            <label>Max concurrent loads <input id="cfgMaxConcurrentLoads" type="number" min="1"></label>
           </div>
         </div>
 
@@ -271,13 +298,13 @@
       <div class="modal-content">
         <div class="modal-head">
           <div>
-            <p class="label">Cross-chat</p>
-            <h3>Memory</h3>
+            <p class="label">This chat</p>
+            <h3>Chat facts</h3>
           </div>
           <button id="closeMemory" type="button" class="icon-btn">Close</button>
         </div>
         <div class="memory-toolbar">
-          <input id="memorySearch" type="search" placeholder="Search memory">
+          <input id="memorySearch" type="search" placeholder="Search chat facts">
           <button id="refreshMemory" type="button" class="pill-btn ghost">Refresh</button>
         </div>
         <div id="memoryList" class="memory-list"></div>

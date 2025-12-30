@@ -1,13 +1,13 @@
 import re
-import shutil
-import subprocess
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional, Set
+
+from .resource_telemetry import ResourceTelemetry
 
 
 # No fixed minimum; parallelism adapts to live resource headroom.
 MIN_PARALLEL_SLOTS = 1
-_MODEL_SIZE_RE = re.compile(r"(\\d+(?:\\.\\d+)?)b", re.IGNORECASE)
+_MODEL_SIZE_RE = re.compile(r"(\d+(?:\.\d+)?)b", re.IGNORECASE)
 
 
 def _bytes_to_gb(val: float) -> float:
@@ -38,75 +38,68 @@ def _model_size_hint(model_id: str) -> Optional[float]:
 
 def get_resource_snapshot() -> Dict[str, Any]:
     """Return a lightweight snapshot of system RAM and GPU VRAM (if available)."""
+    telemetry = ResourceTelemetry()
+    snapshot = telemetry.snapshot()
     ram: Dict[str, Any] = {}
+    ram_raw = snapshot.get("ram") or {}
+    if ram_raw:
+        total_bytes = ram_raw.get("total_bytes") or 0
+        available_bytes = ram_raw.get("available_bytes") or 0
+        used_bytes = ram_raw.get("used_bytes") or 0
+        ram = {
+            "total_gb": _bytes_to_gb(total_bytes),
+            "available_gb": _bytes_to_gb(available_bytes),
+            "used_gb": _bytes_to_gb(used_bytes),
+            "percent": round(float(ram_raw.get("used_pct") or 0.0), 2),
+        }
+
     process_snapshot: Dict[str, Any] = {}
     try:
         import psutil  # type: ignore
 
-        mem = psutil.virtual_memory()
-        ram = {
-            "total_gb": _bytes_to_gb(mem.total),
-            "available_gb": _bytes_to_gb(mem.available),
-            "used_gb": _bytes_to_gb(mem.total - mem.available),
-            "percent": round(float(mem.percent), 2),
+        processes = []
+        total_rss = 0
+        for proc in psutil.process_iter(["pid", "name", "memory_info"]):
+            try:
+                info = proc.info
+                mem_info = info.get("memory_info")
+                rss = getattr(mem_info, "rss", 0) if mem_info else 0
+            except Exception:
+                continue
+            total_rss += rss or 0
+            processes.append(
+                {
+                    "pid": info.get("pid"),
+                    "name": info.get("name"),
+                    "rss_gb": _bytes_to_gb(rss or 0),
+                }
+            )
+        processes.sort(key=lambda item: item.get("rss_gb") or 0, reverse=True)
+        process_snapshot = {
+            "count": len(processes),
+            "rss_total_gb": _bytes_to_gb(total_rss),
+            "top": processes[:5],
         }
-        try:
-            processes = []
-            total_rss = 0
-            for proc in psutil.process_iter(["pid", "name", "memory_info"]):
-                try:
-                    info = proc.info
-                    mem_info = info.get("memory_info")
-                    rss = getattr(mem_info, "rss", 0) if mem_info else 0
-                except Exception:
-                    continue
-                total_rss += rss or 0
-                processes.append(
-                    {
-                        "pid": info.get("pid"),
-                        "name": info.get("name"),
-                        "rss_gb": _bytes_to_gb(rss or 0),
-                    }
-                )
-            processes.sort(key=lambda item: item.get("rss_gb") or 0, reverse=True)
-            process_snapshot = {
-                "count": len(processes),
-                "rss_total_gb": _bytes_to_gb(total_rss),
-                "top": processes[:5],
-            }
-        except Exception:
-            process_snapshot = {}
     except Exception:
-        ram = {}
         process_snapshot = {}
 
     gpus = []
-    smi_path = shutil.which("nvidia-smi")
-    if smi_path:
-        try:
-            cmd = [
-                smi_path,
-                "--query-gpu=name,memory.total,memory.used",
-                "--format=csv,noheader,nounits",
-            ]
-            raw = subprocess.check_output(cmd, text=True, stderr=subprocess.STDOUT, timeout=2)
-            for line in raw.strip().splitlines():
-                parts = [p.strip() for p in line.split(",") if p.strip()]
-                if len(parts) >= 3:
-                    total_mb = float(parts[1])
-                    used_mb = float(parts[2])
-                    total_gb = _mb_to_gb(total_mb)
-                    used_gb = _mb_to_gb(used_mb)
-                    gpus.append(
-                        {
-                            "name": parts[0],
-                            "total_gb": total_gb,
-                            "used_gb": used_gb,
-                            "free_gb": max(total_gb - used_gb, 0.0),
-                        }
-                    )
-        except Exception as exc:
-            gpus.append({"error": str(exc)})
+    for gpu in snapshot.get("gpus") or []:
+        total_mb = gpu.get("vram_total_mb") or 0.0
+        used_mb = gpu.get("vram_used_mb") or 0.0
+        total_gb = _mb_to_gb(total_mb)
+        used_gb = _mb_to_gb(used_mb)
+        gpus.append(
+            {
+                "name": gpu.get("name"),
+                "total_gb": total_gb,
+                "used_gb": used_gb,
+                "free_gb": max(total_gb - used_gb, 0.0),
+                "gpu_id": gpu.get("gpu_id"),
+                "vram_total_mb": total_mb,
+                "vram_used_mb": used_mb,
+            }
+        )
 
     return {
         "ram": ram,
@@ -181,11 +174,11 @@ def compute_worker_slots(
     if size_hints:
         max_size = max(size_hints)
         if max_size <= 4:
-            ram_headroom = min(ram_headroom, 2.5)
-            vram_headroom = min(vram_headroom, 3.0)
+            ram_headroom = min(ram_headroom, 2.0)
+            vram_headroom = min(vram_headroom, 2.5)
         elif max_size <= 8:
-            ram_headroom = min(ram_headroom, 3.0)
-            vram_headroom = min(vram_headroom, 3.5)
+            ram_headroom = min(ram_headroom, 2.8)
+            vram_headroom = min(vram_headroom, 3.25)
 
     if resources:
         ram_info = resources.get("ram") or {}

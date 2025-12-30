@@ -27,6 +27,7 @@ except Exception:
 from . import agents
 from .db import Database
 from .llm import LMStudioClient, resolve_model_id
+from .model_manager import ModelManager
 from .schemas import (
     Artifact,
     ControlCommand,
@@ -35,17 +36,207 @@ from .schemas import (
     StepPlan,
     VerifierReport,
 )
+from .plan_runner import run_plan_pipeline
 from .tavily import TavilyClient
-from .system_info import compute_worker_slots, get_resource_snapshot
+from .system_info import get_resource_snapshot
 
 
-# Reasoning depth mapping
+# Plan depth defaults (initial plan granularity).
 REASONING_DEPTHS = {
     "LOW": {"max_steps": 6, "research_rounds": 1, "tool_budget": {"tavily_search": 4, "tavily_extract": 6}},
     "MED": {"max_steps": 10, "research_rounds": 2, "tool_budget": {"tavily_search": 8, "tavily_extract": 10}},
     "HIGH": {"max_steps": 14, "research_rounds": 3, "tool_budget": {"tavily_search": 12, "tavily_extract": 16}, "advanced": True},
     "ULTRA": {"max_steps": 20, "research_rounds": 3, "tool_budget": {"tavily_search": 18, "tavily_extract": 24}, "advanced": True, "strict_verify": True},
 }
+
+PLAN_GRANULARITY_LEVELS = {"LOW": 1, "MED": 2, "HIGH": 3, "ULTRA": 4}
+PLAN_GRANULARITY_NAMES = {v: k for k, v in PLAN_GRANULARITY_LEVELS.items()}
+EXHAUSTIVE_TERMS = (
+    "all ",
+    "every ",
+    "each ",
+    "entire",
+    "exhaustive",
+    "complete list",
+    "full list",
+    "list all",
+    "list every",
+    "enumerate",
+    "comprehensive",
+)
+COMPLEXITY_TERMS = (
+    "compare",
+    "comparison",
+    "vs ",
+    "versus",
+    "tradeoff",
+    "trade-off",
+    "pros and cons",
+    "advantages",
+    "disadvantages",
+    "strategy",
+    "roadmap",
+    "plan",
+    "architecture",
+    "design",
+    "implementation",
+    "migration",
+    "audit",
+    "security",
+    "threat model",
+    "debug",
+    "root cause",
+    "postmortem",
+    "optimize",
+    "optimization",
+    "benchmark",
+    "performance",
+    "requirements",
+    "policy",
+    "governance",
+    "compliance",
+    "analysis",
+    "analyze",
+    "synthesize",
+    "recommend",
+    "prioritize",
+    "rank",
+    "investigate",
+)
+
+
+def granularity_level_from_router(value: Optional[str], fallback: int = 2) -> int:
+    if not value:
+        return fallback
+    return PLAN_GRANULARITY_LEVELS.get(str(value).upper(), fallback)
+
+
+def _question_complexity(question: str) -> Dict[str, Any]:
+    text = (question or "").strip()
+    lowered = text.lower()
+    words = re.findall(r"[a-z0-9]+", lowered)
+    word_count = len(words)
+    sentence_count = len([s for s in re.split(r"[.!?]+", lowered) if s.strip()])
+    bullet_count = len(re.findall(r"(?m)^\s*(?:[-*]|\d+\.)\s+", text))
+    multi_part = sentence_count > 1 or lowered.count("?") > 1 or bullet_count >= 2
+    multi_part = multi_part or lowered.count(" and ") >= 2 or lowered.count(";") >= 1
+    complex_hit = any(term in lowered for term in COMPLEXITY_TERMS)
+    exhaustive_hit = any(term in lowered for term in EXHAUSTIVE_TERMS)
+    return {
+        "word_count": word_count,
+        "multi_part": multi_part,
+        "complex_hit": complex_hit,
+        "exhaustive_hit": exhaustive_hit,
+    }
+
+
+def auto_reasoning_level(question: str, decision: RouterDecision) -> Tuple[str, bool]:
+    if looks_like_math_expression(question):
+        return "LOW", True
+    info = _question_complexity(question)
+    if info["exhaustive_hit"]:
+        return "ULTRA", True
+    needs_web = bool(decision.needs_web or needs_freshness(question) or guess_needs_web(question))
+    score = 2
+    if info["word_count"] <= 10 and not needs_web and not info["complex_hit"] and not info["multi_part"]:
+        score = 1
+    elif info["complex_hit"] or info["multi_part"] or info["word_count"] >= 28:
+        score = 3
+    if needs_web and score < 2:
+        score = 2
+    return PLAN_GRANULARITY_NAMES.get(max(1, min(score, 4)), "MED"), False
+
+
+def choose_auto_reasoning_level(question: str, decision: RouterDecision) -> str:
+    heuristic_level, force = auto_reasoning_level(question, decision)
+    if force:
+        return heuristic_level
+    router_level = decision.reasoning_level or heuristic_level
+    router_score = PLAN_GRANULARITY_LEVELS.get(str(router_level).upper(), 2)
+    heuristic_score = PLAN_GRANULARITY_LEVELS.get(str(heuristic_level).upper(), router_score)
+    if router_score < heuristic_score:
+        return heuristic_level
+    if router_score - heuristic_score >= 2:
+        return heuristic_level
+    return router_level
+
+
+PLANNING_MODE_SYSTEM = """
+SYSTEM (PLANNING MODE SELECTOR)
+You decide planning_mode and plan_reasoning_mode.
+- planning_mode controls whether to scaffold + expand into many steps.
+- plan_reasoning_mode controls exhaustive interpretation (all/every/each must be enumerated).
+Return JSON only: {"planning_mode":"normal|extensive","plan_reasoning_mode":"normal|extensive"}.
+Use "extensive" when the question demands exhaustive coverage or when plan granularity is high.
+""".strip()
+
+
+def _heuristic_planning_modes(question: str, reasoning_level: int) -> Dict[str, str]:
+    text = (question or "").lower()
+    exhaustive = any(term in text for term in EXHAUSTIVE_TERMS) or reasoning_level >= 4
+    mode = "extensive" if exhaustive else "normal"
+    return {"planning_mode": mode, "plan_reasoning_mode": mode}
+
+
+async def decide_planning_modes(
+    lm_client: LMStudioClient,
+    planner_endpoint: Optional[Dict[str, str]],
+    question: str,
+    reasoning_level: int,
+    run_state: Optional["RunState"] = None,
+) -> Dict[str, str]:
+    fallback = _heuristic_planning_modes(question, reasoning_level)
+    if not (run_state and run_state.model_manager) and (
+        not planner_endpoint or not planner_endpoint.get("model") or not planner_endpoint.get("base_url")
+    ):
+        return fallback
+    prompt = (
+        f"Question: {question}\n"
+        f"Plan granularity level: {reasoning_level}\n"
+        "Return JSON only."
+    )
+    try:
+        if run_state and run_state.model_manager:
+            content = await run_worker(
+                lm_client,
+                "Planner",
+                {},
+                prompt,
+                temperature=0.1,
+                max_tokens=120,
+                run_state=run_state,
+                model_manager=run_state.model_manager,
+                system_prompt_override=PLANNING_MODE_SYSTEM,
+                context="plan_mode",
+            )
+        else:
+            resp = await lm_client.chat_completion(
+                model=planner_endpoint["model"],
+                messages=[{"role": "system", "content": PLANNING_MODE_SYSTEM}, {"role": "user", "content": prompt}],
+                temperature=0.1,
+                max_tokens=120,
+                base_url=planner_endpoint["base_url"],
+                run_state=run_state,
+            )
+            content = resp["choices"][0]["message"]["content"]
+        parsed = await safe_json_parse(
+            content,
+            lm_client,
+            planner_endpoint["model"] if planner_endpoint else "",
+            run_state=run_state,
+            model_manager=run_state.model_manager if run_state else None,
+        )
+        if not isinstance(parsed, dict):
+            return fallback
+        planning_mode = str(parsed.get("planning_mode") or "").strip().lower()
+        plan_reasoning_mode = str(parsed.get("plan_reasoning_mode") or "").strip().lower()
+        if planning_mode not in ("normal", "extensive"):
+            planning_mode = fallback["planning_mode"]
+        if plan_reasoning_mode not in ("normal", "extensive"):
+            plan_reasoning_mode = fallback["plan_reasoning_mode"]
+        return {"planning_mode": planning_mode, "plan_reasoning_mode": plan_reasoning_mode}
+    except Exception:
+        return fallback
 
 
 def utc_iso() -> str:
@@ -70,6 +261,7 @@ class RunState:
     narration_recent: Deque[str] = field(default_factory=lambda: deque(maxlen=6))
     narration_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     dev_trace_cb: Optional[Callable[[str, Optional[dict]], None]] = None
+    model_manager: Optional[ModelManager] = None
 
     def mark_chat_unavailable(self, reason: str) -> None:
         self.can_chat = False
@@ -327,10 +519,9 @@ async def emit_narration(
 ) -> None:
     if not run_state or not run_state.can_chat:
         return
-    endpoint = _narration_endpoint(model_map)
+    model_manager = run_state.model_manager
+    endpoint = _narration_endpoint(model_map) if model_map else {}
     model = endpoint.get("model") if isinstance(endpoint, dict) else None
-    if not model:
-        return
     context = _build_narration_context(question, event_type, detail)
     if run_state.narration_recent:
         context["recent_lines"] = list(run_state.narration_recent)
@@ -348,15 +539,32 @@ async def emit_narration(
         f"Context: {json.dumps(context, ensure_ascii=True)}"
     )
     try:
-        resp = await lm_client.chat_completion(
-            model=model,
-            messages=[{"role": "system", "content": agents.NARRATOR_SYSTEM}, {"role": "user", "content": prompt}],
-            temperature=0.4,
-            max_tokens=60,
-            base_url=endpoint.get("base_url") or lm_client.base_url,
-            run_state=run_state,
-        )
-        line = _clean_narration_line(resp["choices"][0]["message"]["content"])
+        if model_manager:
+            raw = await run_worker(
+                lm_client,
+                "Summarizer",
+                model_map or {},
+                prompt,
+                temperature=0.4,
+                max_tokens=60,
+                run_state=run_state,
+                model_manager=model_manager,
+                system_prompt_override=agents.NARRATOR_SYSTEM,
+                context="narration",
+            )
+            line = _clean_narration_line(raw)
+        else:
+            if not model:
+                return
+            resp = await lm_client.chat_completion(
+                model=model,
+                messages=[{"role": "system", "content": agents.NARRATOR_SYSTEM}, {"role": "user", "content": prompt}],
+                temperature=0.4,
+                max_tokens=60,
+                base_url=endpoint.get("base_url") or lm_client.base_url,
+                run_state=run_state,
+            )
+            line = _clean_narration_line(resp["choices"][0]["message"]["content"])
         if not line:
             return
         async with run_state.narration_lock:
@@ -517,12 +725,32 @@ async def safe_json_parse(
     lm_client: LMStudioClient,
     fixer_model: str,
     run_state: Optional[RunState] = None,
+    model_manager: Optional[ModelManager] = None,
 ) -> Optional[dict]:
     """Try to parse JSON, and fallback to the JSONRepair profile to fix."""
     try:
         return json.loads(raw)
     except Exception:
         pass
+    if model_manager is not None:
+        try:
+            resp = await model_manager.call(
+                required_capabilities=["structured_output"],
+                objective=model_manager.routing_objective,
+                request={
+                    "messages": [
+                        {"role": "system", "content": agents.JSON_REPAIR_SYSTEM},
+                        {"role": "user", "content": raw},
+                    ],
+                    "temperature": 0.0,
+                    "max_tokens": 400,
+                    "use_responses": True,
+                },
+            )
+            fixed = resp["choices"][0]["message"]["content"]
+            return json.loads(fixed)
+        except Exception:
+            return None
     if not fixer_model:
         return None
     try:
@@ -944,6 +1172,34 @@ def looks_like_math_expression(text: str) -> bool:
     return is_safe_math_expression(expr)
 
 
+_CODING_BLOCK_RE = re.compile(r"(?m)^\s{4,}\S")
+_CODING_EXT_RE = re.compile(
+    r"\b[\w./-]+\.(py|js|ts|jsx|tsx|java|cpp|c|h|hpp|rs|go|rb|php|cs|swift|kt|sql|html|css|sh|ps1|bat|cmd|yml|yaml|json|toml|ini|md)\b",
+    re.IGNORECASE,
+)
+_CODING_HINT_RE = re.compile(
+    r"\b("
+    r"code|coding|script|program|function|api|endpoint|refactor|debug|compile|build|runtime|syntax|"
+    r"stack trace|traceback|exception|regex|regular expression|sql|query|database|schema|json|yaml|toml|ini|"
+    r"python|javascript|typescript|java|rust|golang|ruby|php|swift|kotlin|bash|powershell|shell|"
+    r"dockerfile|makefile|pip|npm|yarn|pnpm|gradle|maven|cargo|dotnet|node"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def looks_like_coding_task(text: str) -> bool:
+    if not text:
+        return False
+    if "```" in text:
+        return True
+    if _CODING_BLOCK_RE.search(text):
+        return True
+    if _CODING_EXT_RE.search(text):
+        return True
+    return bool(_CODING_HINT_RE.search(text))
+
+
 def build_math_tool_request(question: str) -> Optional[dict]:
     if not looks_like_math_expression(question):
         return None
@@ -959,6 +1215,7 @@ TOOL_IMAGE_MAX_LIMIT = 2048
 TOOL_MODEL_DEFAULT_TOKENS = 400
 TOOL_MODEL_MAX_TOKENS = 1200
 TOOL_MODEL_MAX_CHARS = 4000
+TOOL_MODEL_TIMEOUT_SECS = 45
 RESOURCE_REFRESH_SECS = 3.0
 ALLOCATOR_MAX_READY = 20
 ALLOCATOR_MAX_RUNNING = 12
@@ -1888,6 +2145,7 @@ async def _tool_model_call(
         step_id=step_id,
         context="tool_model_call",
         run_state=run_state,
+        model_manager=run_state.model_manager if run_state else None,
     )
     trimmed_prompt, prompt_truncated = _trim_tool_text(prompt, TOOL_TEXT_MAX_CHARS)
     trimmed_output, output_truncated = _trim_tool_text(output, max_chars)
@@ -1919,6 +2177,8 @@ async def resolve_tool_requests(
     tool_requests: List[dict],
     upload_dir: Optional[Path] = None,
     *,
+    db: Optional[Database] = None,
+    conversation_id: Optional[str] = None,
     lm_client: Optional[LMStudioClient] = None,
     model_map: Optional[Dict[str, Dict[str, str]]] = None,
     run_id: Optional[str] = None,
@@ -1948,14 +2208,17 @@ async def resolve_tool_requests(
                 entry["error"] = "model_call requires lm_client and model_map"
             else:
                 task = asyncio.create_task(
-                    _tool_model_call(
-                        req,
-                        lm_client,
-                        model_map,
-                        run_id=run_id,
-                        bus=bus,
-                        step_id=step_id,
-                        run_state=run_state,
+                    asyncio.wait_for(
+                        _tool_model_call(
+                            req,
+                            lm_client,
+                            model_map,
+                            run_id=run_id,
+                            bus=bus,
+                            step_id=step_id,
+                            run_state=run_state,
+                        ),
+                        timeout=TOOL_MODEL_TIMEOUT_SECS,
                     )
                 )
                 model_tasks.append((entry, task))
@@ -2004,6 +2267,120 @@ async def resolve_tool_requests(
                 if _looks_like_tool_markup(final_text):
                     raise ValueError("Final text looks like tool markup")
                 entry["result"] = _sanitize_tool_result(final_text)
+                entry["status"] = "ok"
+            elif tool in ("memory_search", "memory_query", "memory_lookup", "memory_list", "memory_recall"):
+                if db is None:
+                    raise ValueError("memory_search requires db")
+                if not conversation_id:
+                    raise ValueError("memory_search requires conversation_id")
+                query = str(req.get("query") or req.get("q") or req.get("text") or "").strip()
+                limit = _coerce_int(req.get("limit") or req.get("top") or req.get("max_results")) or 10
+                limit = max(1, min(50, limit))
+                entry["query"] = query
+                entry["limit"] = limit
+                if query:
+                    items = await db.search_memory(query, conversation_id=conversation_id, limit=limit)
+                else:
+                    items = await db.list_memory(conversation_id=conversation_id, limit=limit)
+                entry["result"] = _sanitize_tool_result(items)
+                entry["status"] = "ok"
+            elif tool in ("memory_save", "memory_store", "memory_add", "memory_fact"):
+                if db is None:
+                    raise ValueError("memory_save requires db")
+                if not conversation_id:
+                    raise ValueError("memory_save requires conversation_id")
+                raw_items = req.get("items") or req.get("facts") or req.get("memory_notes")
+                normalized: List[Dict[str, Any]] = []
+
+                def _push_item(content_val: Any, title_val: Any = None, tags_val: Any = None) -> None:
+                    text_val = str(content_val or "").strip()
+                    if not text_val:
+                        return
+                    title_text = str(title_val or "").strip() or text_val[:80]
+                    tags_list: List[str] = []
+                    if isinstance(tags_val, list):
+                        tags_list = [str(t).strip() for t in tags_val if str(t).strip()]
+                    elif isinstance(tags_val, str) and tags_val.strip():
+                        tags_list = [t.strip() for t in tags_val.split(",") if t.strip()]
+                    normalized.append({"title": title_text, "content": text_val, "tags": tags_list})
+
+                if isinstance(raw_items, list):
+                    for item in raw_items:
+                        if isinstance(item, dict):
+                            _push_item(
+                                item.get("content") or item.get("text") or item.get("fact"),
+                                item.get("title"),
+                                item.get("tags"),
+                            )
+                        else:
+                            _push_item(item)
+                elif isinstance(raw_items, dict):
+                    _push_item(
+                        raw_items.get("content") or raw_items.get("text") or raw_items.get("fact"),
+                        raw_items.get("title"),
+                        raw_items.get("tags"),
+                    )
+                elif raw_items:
+                    _push_item(raw_items)
+                else:
+                    _push_item(
+                        req.get("content") or req.get("text") or req.get("fact"),
+                        req.get("title"),
+                        req.get("tags"),
+                    )
+                if not normalized:
+                    raise ValueError("No memory items to save")
+                saved_ids: List[int] = []
+                for item in normalized[:10]:
+                    content = str(item.get("content") or "").strip()
+                    if not content:
+                        continue
+                    title = str(item.get("title") or "").strip() or content[:80]
+                    if len(content) > 400:
+                        content = content[:400].rstrip() + "..."
+                    tags = [t for t in (item.get("tags") or []) if t]
+                    if "fact" not in [t.lower() for t in tags]:
+                        tags.insert(0, "fact")
+                    mem_id = await db.add_memory_item(
+                        conversation_id,
+                        kind="fact",
+                        title=title[:80],
+                        content=content,
+                        tags=tags,
+                        pinned=False,
+                        relevance_score=1.0,
+                    )
+                    if run_id:
+                        await db.link_memory_to_run(run_id, mem_id, "tool")
+                    saved_ids.append(mem_id)
+                entry["result"] = _sanitize_tool_result({"saved": len(saved_ids), "ids": saved_ids})
+                entry["status"] = "ok"
+            elif tool in ("memory_delete", "memory_remove", "memory_forget"):
+                if db is None:
+                    raise ValueError("memory_delete requires db")
+                if not conversation_id:
+                    raise ValueError("memory_delete requires conversation_id")
+                raw_ids = req.get("ids") or req.get("items") or req.get("id")
+                ids: List[int] = []
+                if isinstance(raw_ids, list):
+                    for item in raw_ids:
+                        try:
+                            ids.append(int(item))
+                        except Exception:
+                            continue
+                elif raw_ids is not None:
+                    try:
+                        ids.append(int(raw_ids))
+                    except Exception:
+                        ids = []
+                if not ids:
+                    raise ValueError("No memory ids provided")
+                deleted_ids: List[int] = []
+                for mem_id in ids:
+                    deleted = await db.delete_memory_item_for_conversation(conversation_id, mem_id)
+                    if deleted:
+                        deleted_ids.append(mem_id)
+                entry["result"] = _sanitize_tool_result({"deleted": len(deleted_ids), "ids": deleted_ids})
                 entry["status"] = "ok"
             elif tool in ("read_text", "read_file", "file_read", "text_read"):
                 path = str(req.get("path") or req.get("file") or req.get("filename") or "").strip()
@@ -2115,7 +2492,10 @@ async def resolve_tool_requests(
         for (entry, _task), result in zip(model_tasks, results):
             if isinstance(result, Exception):
                 entry["status"] = "error"
-                entry["error"] = str(result)
+                if isinstance(result, asyncio.TimeoutError):
+                    entry["error"] = f"timeout after {TOOL_MODEL_TIMEOUT_SECS}s"
+                else:
+                    entry["error"] = str(result)
             else:
                 entry.update(result)
     return resolved
@@ -2422,14 +2802,18 @@ def _model_size_hint(model_id: str) -> Optional[int]:
         return None
 
 
+def _is_coder_model(model_id: str) -> bool:
+    return "coder" in (model_id or "").lower()
+
+
 def _is_heavy_coder_model(model_id: str) -> bool:
-    lowered = (model_id or "").lower()
-    if "coder" not in lowered:
+    if not _is_coder_model(model_id):
         return False
     size = _model_size_hint(model_id)
     if size is not None:
         return size >= 20
-    return "30b" in lowered or "34b" in lowered
+    lowered = (model_id or "").lower()
+    return any(token in lowered for token in ("30b", "32b", "33b", "34b"))
 
 
 def _sort_models_by_size(models: List[str], prefer_large: bool = False) -> List[str]:
@@ -2445,10 +2829,14 @@ def _sort_models_by_size(models: List[str], prefer_large: bool = False) -> List[
 
 def _role_size_preference(role: str) -> str:
     role_key = (role or "").lower()
-    if role_key in {"orch", "deep_orch", "deep_planner", "verifier"}:
+    if role_key in {"orch", "deep_orch", "deep_planner"}:
         return "large"
-    if role_key in {"router", "summarizer", "executor", "fast", "worker", "worker_b", "worker_c"}:
+    if role_key == "worker":
         return "small"
+    if role_key in {"worker_b", "worker_c", "verifier"}:
+        return "medium"
+    if role_key in {"router", "summarizer", "executor", "fast"}:
+        return "medium"
     return "medium"
 
 
@@ -2459,6 +2847,8 @@ def _should_override_role_model(role_pref: str, model_id: str) -> bool:
     if size is None:
         return True
     if role_pref == "small":
+        return size >= 8
+    if role_pref == "medium":
         return size >= 16
     if role_pref == "large":
         return size <= 8
@@ -2485,6 +2875,9 @@ async def apply_runtime_model_overrides(
 
     check_cache: Dict[Tuple[str, str], Optional[bool]] = {}
     available_cache: Dict[str, List[str]] = {}
+    prefer_non_coder = False
+    if run_state and run_state.question:
+        prefer_non_coder = not looks_like_coding_task(run_state.question)
 
     async def _check_model(base_url: str, model: str) -> bool:
         key = (base_url, model)
@@ -2530,13 +2923,19 @@ async def apply_runtime_model_overrides(
                 ok = await _check_model(base_url, model)
             if ok is True:
                 role_pref = _role_size_preference(role)
-                if _is_heavy_coder_model(model) and role_pref in ("small", "medium"):
+                if (_is_heavy_coder_model(model) and role_pref in ("small", "medium")) or (
+                    prefer_non_coder and _is_coder_model(model)
+                ):
                     ok = False
                 else:
                     status = "ok"
             if ok is not True:
                 available = available_cache.get(base_url, [])
                 available = [m for m in available if (base_url, m) not in UNAVAILABLE_MODELS]
+                if prefer_non_coder:
+                    without_coder = [m for m in available if not _is_coder_model(m)]
+                    if without_coder:
+                        available = without_coder
                 role_pref = _role_size_preference(role)
                 if role_pref in ("small", "medium"):
                     without_heavy = [m for m in available if not _is_heavy_coder_model(m)]
@@ -2545,7 +2944,7 @@ async def apply_runtime_model_overrides(
                 prefer_large = role_pref == "large"
                 ordered = _sort_models_by_size(available, prefer_large=prefer_large)
                 if role_pref == "small":
-                    ordered = [m for m in ordered if (_model_size_hint(m) or 0) <= 12] or ordered
+                    ordered = [m for m in ordered if (_model_size_hint(m) or 0) <= 6] or ordered
                 elif role_pref == "large":
                     ordered = [m for m in ordered if (_model_size_hint(m) or 99) >= 16] or ordered
                 if model in ordered and not _should_override_role_model(role_pref, model):
@@ -2572,11 +2971,21 @@ async def apply_runtime_model_overrides(
     return updated, {"roles": role_report, "check_cache": check_cache}
 
 
+WEB_PROBE_TIMEOUT_S = 5
+TAVILY_TIMEOUT_S = 20
+
+
 async def check_web_access(tavily: TavilyClient) -> Tuple[bool, Optional[str]]:
     """Return (can_web, error). Non-auth errors are reported but do not disable web."""
     if not tavily.enabled:
         return False, "missing_api_key"
-    resp = await tavily.search(query="ping", search_depth="basic", max_results=1)
+    try:
+        resp = await asyncio.wait_for(
+            tavily.search(query="ping", search_depth="basic", max_results=1),
+            timeout=WEB_PROBE_TIMEOUT_S,
+        )
+    except asyncio.TimeoutError:
+        return False, "timeout"
     resp = coerce_tavily_response(resp)
     if resp.get("error"):
         status = resp.get("status_code")
@@ -2754,6 +3163,57 @@ def desired_parallelism(
     if max_parallel <= 1:
         return 1
     return max_parallel
+
+
+def compute_pool_budget(
+    resource_snapshot: Dict[str, Any],
+    model_tier: str,
+    ready_count: int,
+    candidate_count: int,
+) -> Dict[str, Any]:
+    ram_headroom = 2.0 if model_tier == "fast" else 2.5 if model_tier == "deep" else 3.5
+    vram_headroom = 2.0 if model_tier == "fast" else 3.0 if model_tier == "deep" else 4.5
+    ram_slots: Optional[int] = None
+    vram_slots: Optional[int] = None
+    ram_pressure = False
+    vram_pressure = False
+    ram_info = resource_snapshot.get("ram") or {}
+    if ram_info.get("available_gb") is not None:
+        available_gb = float(ram_info.get("available_gb") or 0.0)
+        ram_slots = max(1, int(available_gb // ram_headroom))
+        percent = ram_info.get("percent")
+        if percent is not None and float(percent) >= 90.0:
+            ram_pressure = True
+        if available_gb < ram_headroom:
+            ram_pressure = True
+    gpu_list = [
+        g for g in resource_snapshot.get("gpus") or [] if isinstance(g, dict) and g.get("free_gb") is not None
+    ]
+    if gpu_list:
+        free_gpu = max((g.get("free_gb") or 0.0 for g in gpu_list), default=0.0)
+        vram_slots = max(1, int(float(free_gpu) // vram_headroom))
+        if float(free_gpu) < vram_headroom:
+            vram_pressure = True
+    base_slots = max(1, ready_count)
+    if ram_slots is None and vram_slots is None:
+        max_parallel = base_slots
+    else:
+        if ram_slots is None:
+            ram_slots = base_slots
+        if vram_slots is None:
+            vram_slots = ram_slots
+        max_parallel = max(1, min(ram_slots, vram_slots))
+    return {
+        "max_parallel": max_parallel,
+        "configured": max(1, candidate_count),
+        "variants": max(1, candidate_count),
+        "ram_slots": ram_slots or base_slots,
+        "vram_slots": vram_slots or base_slots,
+        "ram_headroom_gb": ram_headroom,
+        "vram_headroom_gb": vram_headroom,
+        "ram_pressure": ram_pressure,
+        "vram_pressure": vram_pressure,
+    }
 
 
 def ensure_parallel_research(
@@ -3053,6 +3513,51 @@ def profile_system(profile: str) -> str:
     }.get(profile, agents.RESEARCH_PRIMARY_SYSTEM)
 
 
+_PROFILE_CAPABILITIES = {
+    "Orchestrator": ["structured_output"],
+    "Executor": ["structured_output", "tool_use"],
+    "Router": ["structured_output"],
+    "Planner": ["structured_output"],
+    "Summarizer": [],
+    "Writer": [],
+    "Finalizer": ["structured_output"],
+    "Verifier": ["structured_output"],
+    "Critic": ["structured_output"],
+    "Math": ["structured_output"],
+    "EvidenceSynth": ["structured_output"],
+    "JSONRepair": ["structured_output"],
+    "ResearchPrimary": [],
+    "ResearchRecency": [],
+    "ResearchAdversarial": [],
+    "VisionAnalyst": ["vision"],
+    "UploadSecretary": ["vision", "structured_output"],
+}
+
+_PROFILE_TIMEOUTS = {
+    "Router": 30,
+    "Planner": 60,
+    "Orchestrator": 60,
+    "Summarizer": 45,
+    "JSONRepair": 25,
+    "Critic": 60,
+    "Verifier": 90,
+    "EvidenceSynth": 60,
+    "ResearchPrimary": 90,
+    "ResearchRecency": 90,
+    "ResearchAdversarial": 90,
+}
+
+_LATENCY_OBJECTIVE_PROFILES = {"Router", "Planner", "Summarizer", "JSONRepair"}
+
+
+def profile_requirements(profile: str, tool_required_default: bool = True) -> List[str]:
+    caps = list(_PROFILE_CAPABILITIES.get(profile, []))
+    if tool_required_default and "tool_use" not in caps:
+        if profile in {"Executor", "Planner"}:
+            caps.append("tool_use")
+    return caps
+
+
 def profile_model(profile: str, model_map: Dict[str, Dict[str, str]]) -> Tuple[str, str]:
     """Return (base_url, model_id) for a given profile."""
     if profile == "Orchestrator":
@@ -3194,17 +3699,19 @@ def select_model_suite(
 
 
 def resolve_auto_tier(decision: RouterDecision) -> str:
-    """Map the router's reasoning depth to the most suitable tier."""
-    level = decision.reasoning_level
-    if decision.needs_web or decision.extract_depth == "advanced":
-        return "deep"
-    if level in ("HIGH", "ULTRA") or (decision.expected_passes or 0) > 1:
-        return "pro"
-    if level == "MED":
-        return "pro"
+    """Choose the lightest tier that can still satisfy routing needs."""
     tool_budget = decision.tool_budget or {}
-    if tool_budget.get("tavily_search", 0) > 8:
+    heavy_web = tool_budget.get("tavily_search", 0) > 8 or tool_budget.get("tavily_extract", 0) > 12
+    if decision.extract_depth == "advanced":
         return "deep"
+    if decision.needs_web:
+        return "deep" if heavy_web else "pro"
+    if (decision.expected_passes or 0) > 1:
+        return "pro"
+    if decision.reasoning_level in ("MED", "HIGH", "ULTRA"):
+        return "pro"
+    if tool_budget.get("tavily_search", 0) > 0 or tool_budget.get("tavily_extract", 0) > 0:
+        return "pro"
     return "fast"
 
 
@@ -3568,6 +4075,7 @@ async def choose_deep_route(
     """Router for LocalDeep between OSS linear vs. mini-cluster."""
     if preference in ("oss", "cluster"):
         return preference
+    coding_task = looks_like_coding_task(question)
     if router_decision:
         try:
             needs_web = bool(router_decision.needs_web)
@@ -3578,6 +4086,8 @@ async def choose_deep_route(
                 return "cluster"
             if needs_web or extract_depth == "advanced" or heavy_web:
                 return "cluster"
+            if not coding_task:
+                return "oss"
             if not needs_web and router_decision.reasoning_level in ("LOW", "MED"):
                 return "oss"
         except Exception:
@@ -3585,21 +4095,42 @@ async def choose_deep_route(
     prompt = (
         "Choose the best execution lane for this question.\n"
         "- Use route 'oss' when the OSS model's internal knowledge should be enough (fact lookup, summarization, no current-events or web search needed).\n"
+        "- Prefer 'oss' for non-coding tasks; coder-focused models are resource heavy and best reserved for coding.\n"
         "- Use route 'cluster' when current data, web search, multi-source research, or cross-checking is likely required.\n"
         "Return JSON only: {\"route\": \"oss\" | \"cluster\"}."
         f"\nQuestion: {question}"
     )
     try:
-        resp = await lm_client.chat_completion(
-            model=router_endpoint["model"],
-            messages=[{"role": "system", "content": agents.SUMMARIZER_SYSTEM}, {"role": "user", "content": prompt}],
-            temperature=0.0,
-            max_tokens=80,
-            base_url=router_endpoint["base_url"],
+        if run_state and run_state.model_manager:
+            content = await run_worker(
+                lm_client,
+                "Router",
+                {},
+                prompt,
+                temperature=0.0,
+                max_tokens=80,
+                run_state=run_state,
+                model_manager=run_state.model_manager,
+                system_prompt_override=agents.SUMMARIZER_SYSTEM,
+                context="deep_route",
+            )
+        else:
+            resp = await lm_client.chat_completion(
+                model=router_endpoint["model"],
+                messages=[{"role": "system", "content": agents.SUMMARIZER_SYSTEM}, {"role": "user", "content": prompt}],
+                temperature=0.0,
+                max_tokens=80,
+                base_url=router_endpoint["base_url"],
+                run_state=run_state,
+            )
+            content = resp["choices"][0]["message"]["content"]
+        parsed = await safe_json_parse(
+            content,
+            lm_client,
+            router_endpoint["model"],
             run_state=run_state,
+            model_manager=run_state.model_manager if run_state else None,
         )
-        content = resp["choices"][0]["message"]["content"]
-        parsed = await safe_json_parse(content, lm_client, router_endpoint["model"], run_state=run_state)
         if parsed and parsed.get("route") in ("oss", "cluster"):
             return parsed["route"]
     except Exception:
@@ -3619,21 +4150,43 @@ async def call_router(
 ) -> RouterDecision:
     user_msg = f"User question: {question}\nReturn JSON only."
     parsed = None
+    fallback_used = False
     needs_web_guess = guess_needs_web(question)
     try:
-        resp = await lm_client.chat_completion(
-            model=endpoint["model"],
-            messages=[{"role": "system", "content": agents.ROUTER_SYSTEM}, {"role": "user", "content": user_msg}],
-            temperature=0.1,
-            max_tokens=300,
-            base_url=endpoint["base_url"],
+        if run_state and run_state.model_manager:
+            content = await run_worker(
+                lm_client,
+                "Router",
+                {},
+                user_msg,
+                temperature=0.1,
+                max_tokens=300,
+                run_state=run_state,
+                model_manager=run_state.model_manager,
+                system_prompt_override=agents.ROUTER_SYSTEM,
+                context="router",
+            )
+        else:
+            resp = await lm_client.chat_completion(
+                model=endpoint["model"],
+                messages=[{"role": "system", "content": agents.ROUTER_SYSTEM}, {"role": "user", "content": user_msg}],
+                temperature=0.1,
+                max_tokens=300,
+                base_url=endpoint["base_url"],
+                run_state=run_state,
+            )
+            content = resp["choices"][0]["message"]["content"]
+        parsed = await safe_json_parse(
+            content,
+            lm_client,
+            endpoint["model"],
             run_state=run_state,
+            model_manager=run_state.model_manager if run_state else None,
         )
-        content = resp["choices"][0]["message"]["content"]
-        parsed = await safe_json_parse(content, lm_client, endpoint["model"], run_state=run_state)
     except Exception:
         parsed = None
     if not parsed:
+        fallback_used = True
         expected_passes = 2 if strict_mode else 1
         parsed = {
             "needs_web": needs_web_guess,
@@ -3650,6 +4203,8 @@ async def call_router(
     # If the router was unsure, lean toward web for data-heavy questions.
     decision.needs_web = decision.needs_web or needs_web_guess
     decision.expected_passes = max(1, decision.expected_passes or 1)
+    if manual_level is None and not fallback_used:
+        decision.reasoning_level = choose_auto_reasoning_level(question, decision)
     return decision
 
 
@@ -3674,25 +4229,45 @@ async def build_step_plan(
     user_content = (
         f"Question: {question}\nNeeds web: {decision.needs_web}\nReasoning level: {decision.reasoning_level}\nExpected passes: {decision.expected_passes}\n"
         f"Available worker slots: {max(desired_parallel, 1)} (aim to keep them busy in parallel)\n"
-        f"Memory context: {memory_context}\n"
+        f"Chat facts (this conversation): {memory_context}\n"
         "Return JSON only as {\"plan_id\": \"...\", \"goal\": \"...\", \"global_constraints\": {...}, \"steps\": [...]}"
     )
     parsed = None
     plan_ep = planner_endpoint or orch_endpoint
     try:
-        resp = await lm_client.chat_completion(
-            model=plan_ep["model"],
-            messages=[
-                {"role": "system", "content": agents.MICROMANAGER_SYSTEM + plan_prompt},
-                {"role": "user", "content": user_content},
-            ],
-            temperature=0.25,
-            max_tokens=900,
-            base_url=plan_ep["base_url"],
+        if run_state and run_state.model_manager:
+            content = await run_worker(
+                lm_client,
+                "Orchestrator",
+                {},
+                user_content,
+                temperature=0.25,
+                max_tokens=900,
+                run_state=run_state,
+                model_manager=run_state.model_manager,
+                system_prompt_override=agents.MICROMANAGER_SYSTEM + plan_prompt,
+                context="step_plan",
+            )
+        else:
+            resp = await lm_client.chat_completion(
+                model=plan_ep["model"],
+                messages=[
+                    {"role": "system", "content": agents.MICROMANAGER_SYSTEM + plan_prompt},
+                    {"role": "user", "content": user_content},
+                ],
+                temperature=0.25,
+                max_tokens=900,
+                base_url=plan_ep["base_url"],
+                run_state=run_state,
+            )
+            content = resp["choices"][0]["message"]["content"]
+        parsed = await safe_json_parse(
+            content,
+            lm_client,
+            plan_ep["model"],
             run_state=run_state,
+            model_manager=run_state.model_manager if run_state else None,
         )
-        content = resp["choices"][0]["message"]["content"]
-        parsed = await safe_json_parse(content, lm_client, plan_ep["model"], run_state=run_state)
     except Exception:
         parsed = None
     if not isinstance(parsed, dict):
@@ -3747,10 +4322,70 @@ async def run_worker(
     step_id: Optional[int] = None,
     context: str = "",
     run_state: Optional[RunState] = None,
+    model_manager: Optional[ModelManager] = None,
+    system_prompt_override: Optional[str] = None,
+    timeout_s: Optional[float] = None,
 ) -> str:
     if run_state and not run_state.can_chat:
         raise RuntimeError("Local model unavailable.")
-    system_prompt = profile_system(profile)
+    system_prompt = system_prompt_override or profile_system(profile)
+    avoid_coder = False
+    if run_state and run_state.question:
+        avoid_coder = not looks_like_coding_task(run_state.question)
+    if model_manager is not None:
+        required = profile_requirements(profile, model_manager.tool_required_by_default)
+        request = {
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": prompt},
+            ],
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "use_responses": True,
+        }
+        effective_objective = model_manager.routing_objective
+        if profile in _LATENCY_OBJECTIVE_PROFILES:
+            effective_objective = "best_latency"
+        call_timeout = timeout_s if timeout_s is not None else _PROFILE_TIMEOUTS.get(profile)
+        try:
+            if call_timeout:
+                resp, instance = await asyncio.wait_for(
+                    model_manager.call_with_instance(
+                        required_capabilities=required,
+                        objective=effective_objective,
+                        request=request,
+                        avoid_coder=avoid_coder,
+                    ),
+                    timeout=call_timeout,
+                )
+            else:
+                resp, instance = await model_manager.call_with_instance(
+                    required_capabilities=required,
+                    objective=effective_objective,
+                    request=request,
+                    avoid_coder=avoid_coder,
+                )
+        except asyncio.TimeoutError as exc:
+            if run_state:
+                run_state.add_dev_trace(
+                    "Model call timed out.",
+                    {"profile": profile, "timeout_s": call_timeout or 0},
+                )
+            raise RuntimeError("Model call timed out.") from exc
+        if run_id and bus:
+            await bus.emit(
+                run_id,
+                "model_selected",
+                {
+                    "profile": profile,
+                    "model": instance.model_key,
+                    "instance": instance.api_identifier,
+                    "backend_id": instance.backend_id,
+                    "step_id": step_id,
+                    "context": context,
+                },
+            )
+        return resp["choices"][0]["message"]["content"]
     last_error: Optional[Exception] = None
     last_base_url: Optional[str] = None
     last_detail: str = ""
@@ -4018,16 +4653,36 @@ async def seed_research_prompts(
     )
     parsed = None
     try:
-        resp = await lm_client.chat_completion(
-            model=model,
-            messages=[{"role": "system", "content": agents.EXECUTOR_SYSTEM}, {"role": "user", "content": prompt}],
-            temperature=0.2,
-            max_tokens=350,
-            base_url=base_url,
+        if run_state and run_state.model_manager:
+            content = await run_worker(
+                lm_client,
+                "Executor",
+                {},
+                prompt,
+                temperature=0.2,
+                max_tokens=350,
+                run_state=run_state,
+                model_manager=run_state.model_manager,
+                system_prompt_override=agents.EXECUTOR_SYSTEM,
+                context="seed_research",
+            )
+        else:
+            resp = await lm_client.chat_completion(
+                model=model,
+                messages=[{"role": "system", "content": agents.EXECUTOR_SYSTEM}, {"role": "user", "content": prompt}],
+                temperature=0.2,
+                max_tokens=350,
+                base_url=base_url,
+                run_state=run_state,
+            )
+            content = resp["choices"][0]["message"]["content"]
+        parsed = await safe_json_parse(
+            content,
+            lm_client,
+            model,
             run_state=run_state,
+            model_manager=run_state.model_manager if run_state else None,
         )
-        content = resp["choices"][0]["message"]["content"]
-        parsed = await safe_json_parse(content, lm_client, model, run_state=run_state)
     except Exception:
         parsed = None
 
@@ -4085,8 +4740,15 @@ async def warm_worker_pool(
     run_state: Optional[RunState] = None,
     run_id: Optional[str] = None,
     bus: Optional["EventBus"] = None,
+    model_manager: Optional[ModelManager] = None,
 ) -> None:
     if max_workers <= 0:
+        return
+    if model_manager:
+        for _ in range(max_workers):
+            instance = await model_manager.acquire_instance(required_capabilities=["tool_use"], backlog=max_workers)
+            if instance:
+                await model_manager.release_instance(instance.instance_id)
         return
     seen: Set[Tuple[str, str]] = set()
     targets: List[Tuple[str, str]] = []
@@ -4539,6 +5201,8 @@ async def run_step_double_checks(
     strict_mode: bool,
     run_id: str,
     bus: "EventBus",
+    db: Optional[Database] = None,
+    conversation_id: Optional[str] = None,
     upload_dir: Optional[Path] = None,
     run_state: Optional[RunState] = None,
 ) -> Tuple[List[dict], List[dict], str]:
@@ -4564,6 +5228,8 @@ async def run_step_double_checks(
     tool_results = await resolve_tool_requests(
         tool_requests,
         upload_dir=upload_dir,
+        db=db,
+        conversation_id=conversation_id,
         lm_client=lm_client,
         model_map=model_map,
         run_id=run_id,
@@ -4622,16 +5288,36 @@ async def evaluate_control(
     if validation_summary:
         prompt += f"\nDouble-check notes: {validation_summary[:600]}"
     try:
-        resp = await lm_client.chat_completion(
-            model=orch_endpoint["model"],
-            messages=[{"role": "system", "content": agents.MICROMANAGER_SYSTEM}, {"role": "user", "content": prompt}],
-            temperature=0.1,
-            max_tokens=300,
-            base_url=orch_endpoint["base_url"],
+        if run_state and run_state.model_manager:
+            content = await run_worker(
+                lm_client,
+                "Orchestrator",
+                {},
+                prompt,
+                temperature=0.1,
+                max_tokens=300,
+                run_state=run_state,
+                model_manager=run_state.model_manager,
+                system_prompt_override=agents.MICROMANAGER_SYSTEM,
+                context="evaluate_control",
+            )
+        else:
+            resp = await lm_client.chat_completion(
+                model=orch_endpoint["model"],
+                messages=[{"role": "system", "content": agents.MICROMANAGER_SYSTEM}, {"role": "user", "content": prompt}],
+                temperature=0.1,
+                max_tokens=300,
+                base_url=orch_endpoint["base_url"],
+                run_state=run_state,
+            )
+            content = resp["choices"][0]["message"]["content"]
+        parsed = await safe_json_parse(
+            content,
+            lm_client,
+            orch_endpoint["model"],
             run_state=run_state,
+            model_manager=run_state.model_manager if run_state else None,
         )
-        content = resp["choices"][0]["message"]["content"]
-        parsed = await safe_json_parse(content, lm_client, orch_endpoint["model"], run_state=run_state)
     except Exception:
         parsed = None
     if not isinstance(parsed, dict):
@@ -4684,16 +5370,36 @@ async def evaluate_control_fast(
     if validation_summary:
         prompt += f"\nDouble-check notes: {validation_summary[:400]}"
     try:
-        resp = await lm_client.chat_completion(
-            model=fast_endpoint["model"],
-            messages=[{"role": "system", "content": agents.EXECUTOR_SYSTEM}, {"role": "user", "content": prompt}],
-            temperature=0.0,
-            max_tokens=200,
-            base_url=fast_endpoint["base_url"],
+        if run_state and run_state.model_manager:
+            content = await run_worker(
+                lm_client,
+                "Executor",
+                {},
+                prompt,
+                temperature=0.0,
+                max_tokens=200,
+                run_state=run_state,
+                model_manager=run_state.model_manager,
+                system_prompt_override=agents.EXECUTOR_SYSTEM,
+                context="evaluate_control_fast",
+            )
+        else:
+            resp = await lm_client.chat_completion(
+                model=fast_endpoint["model"],
+                messages=[{"role": "system", "content": agents.EXECUTOR_SYSTEM}, {"role": "user", "content": prompt}],
+                temperature=0.0,
+                max_tokens=200,
+                base_url=fast_endpoint["base_url"],
+                run_state=run_state,
+            )
+            content = resp["choices"][0]["message"]["content"]
+        parsed = await safe_json_parse(
+            content,
+            lm_client,
+            fast_endpoint["model"],
             run_state=run_state,
+            model_manager=run_state.model_manager if run_state else None,
         )
-        content = resp["choices"][0]["message"]["content"]
-        parsed = await safe_json_parse(content, lm_client, fast_endpoint["model"], run_state=run_state)
     except Exception:
         parsed = None
     if not parsed:
@@ -4762,7 +5468,8 @@ async def allocate_ready_steps(
         "You are the executor. Decide which ready steps to start now to keep parallel work moving and avoid bottlenecks. "
         "Return JSON only: {\"start_ids\": [...], \"target_slots\": N, \"queue_ids\": [...], \"note\": \"...\"}. "
         "The note is user-facing: keep it short, plainspoken, and free of internal jargon. "
-        "Use only IDs from ready_ids. Keep start_ids length <= capacity.\n"
+        "Use only IDs from ready_ids. Keep start_ids length <= capacity. "
+        "If resource_budget.elastic_parallel is true and there is headroom, you may raise target_slots to add parallel workers.\n"
         f"Question: {question}\nCapacity: {capacity}\nCurrent target slots: {target_slots}\n"
         f"Ready steps: {json.dumps(ready_summary, ensure_ascii=True)}\n"
         f"Running steps: {json.dumps(running_summary, ensure_ascii=True)}\n"
@@ -4770,16 +5477,36 @@ async def allocate_ready_steps(
         f"Ready ids: {ready_ids}"
     )
     try:
-        resp = await lm_client.chat_completion(
-            model=executor_endpoint["model"],
-            messages=[{"role": "system", "content": agents.EXECUTOR_SYSTEM}, {"role": "user", "content": prompt}],
-            temperature=0.0,
-            max_tokens=220,
-            base_url=executor_endpoint.get("base_url"),
+        if run_state and run_state.model_manager:
+            content = await run_worker(
+                lm_client,
+                "Executor",
+                {},
+                prompt,
+                temperature=0.0,
+                max_tokens=220,
+                run_state=run_state,
+                model_manager=run_state.model_manager,
+                system_prompt_override=agents.EXECUTOR_SYSTEM,
+                context="allocator",
+            )
+        else:
+            resp = await lm_client.chat_completion(
+                model=executor_endpoint["model"],
+                messages=[{"role": "system", "content": agents.EXECUTOR_SYSTEM}, {"role": "user", "content": prompt}],
+                temperature=0.0,
+                max_tokens=220,
+                base_url=executor_endpoint.get("base_url"),
+                run_state=run_state,
+            )
+            content = resp["choices"][0]["message"]["content"]
+        parsed = await safe_json_parse(
+            content,
+            lm_client,
+            executor_endpoint["model"],
             run_state=run_state,
+            model_manager=run_state.model_manager if run_state else None,
         )
-        content = resp["choices"][0]["message"]["content"]
-        parsed = await safe_json_parse(content, lm_client, executor_endpoint["model"], run_state=run_state)
     except Exception:
         parsed = None
     if not isinstance(parsed, dict):
@@ -4863,16 +5590,36 @@ async def build_executor_brief(
         f"\nQuestion: {question}\nParallel slots: {target_slots}\nSteps: {json.dumps(steps_summary)[:1500]}"
     )
     try:
-        resp = await lm_client.chat_completion(
-            model=executor_endpoint["model"],
-            messages=[{"role": "system", "content": agents.EXECUTOR_SYSTEM}, {"role": "user", "content": prompt}],
-            temperature=0.0,
-            max_tokens=220,
-            base_url=executor_endpoint["base_url"],
+        if run_state and run_state.model_manager:
+            content = await run_worker(
+                lm_client,
+                "Executor",
+                {},
+                prompt,
+                temperature=0.0,
+                max_tokens=220,
+                run_state=run_state,
+                model_manager=run_state.model_manager,
+                system_prompt_override=agents.EXECUTOR_SYSTEM,
+                context="executor_brief",
+            )
+        else:
+            resp = await lm_client.chat_completion(
+                model=executor_endpoint["model"],
+                messages=[{"role": "system", "content": agents.EXECUTOR_SYSTEM}, {"role": "user", "content": prompt}],
+                temperature=0.0,
+                max_tokens=220,
+                base_url=executor_endpoint["base_url"],
+                run_state=run_state,
+            )
+            content = resp["choices"][0]["message"]["content"]
+        parsed = await safe_json_parse(
+            content,
+            lm_client,
+            executor_endpoint["model"],
             run_state=run_state,
+            model_manager=run_state.model_manager if run_state else None,
         )
-        content = resp["choices"][0]["message"]["content"]
-        parsed = await safe_json_parse(content, lm_client, executor_endpoint["model"], run_state=run_state)
         if isinstance(parsed, dict):
             return parsed
     except Exception:
@@ -4943,6 +5690,7 @@ async def synthesize_evidence_from_sources(
             step_id=step_id,
             context="evidence_synth",
             run_state=run_state,
+            model_manager=run_state.model_manager if run_state else None,
         )
     except Exception:
         return {
@@ -4956,7 +5704,13 @@ async def synthesize_evidence_from_sources(
         or (model_map.get("orch") or {}).get("model")
         or ""
     )
-    parsed = await safe_json_parse(raw, lm_client, fixer_model, run_state=run_state)
+    parsed = await safe_json_parse(
+        raw,
+        lm_client,
+        fixer_model,
+        run_state=run_state,
+        model_manager=run_state.model_manager if run_state else None,
+    )
     if not isinstance(parsed, dict):
         return {"claims": [], "gaps": [], "conflicts_found": False}
     claims = parsed.get("claims")
@@ -5076,13 +5830,19 @@ async def run_tavily_queries(
         payload = {"step": step.step_id, "query": q}
         if mode:
             payload["mode"] = mode
-        search_resp = await tavily.search(
-            query=q,
-            search_depth=search_depth,
-            max_results=per_query_max,
-            topic=topic,
-            time_range=time_range,
-        )
+        try:
+            search_resp = await asyncio.wait_for(
+                tavily.search(
+                    query=q,
+                    search_depth=search_depth,
+                    max_results=per_query_max,
+                    topic=topic,
+                    time_range=time_range,
+                ),
+                timeout=TAVILY_TIMEOUT_S,
+            )
+        except asyncio.TimeoutError:
+            search_resp = {"error": "timeout"}
         search_resp = coerce_tavily_response(search_resp)
         results = search_resp.get("results") or []
         if not isinstance(results, list):
@@ -5180,6 +5940,7 @@ async def execute_research_step(
     db: Database,
     bus: EventBus,
     model_map: Dict[str, Dict[str, str]],
+    conversation_id: Optional[str] = None,
     upload_dir: Optional[Path] = None,
     run_state: Optional[RunState] = None,
 ) -> Tuple[Dict[str, Any], List[Artifact], str]:
@@ -5198,6 +5959,7 @@ async def execute_research_step(
             step_id=step.step_id,
             context="research",
             run_state=run_state,
+            model_manager=run_state.model_manager if run_state else None,
         )
     except Exception as exc:
         await bus.emit(
@@ -5211,7 +5973,17 @@ async def execute_research_step(
         or (model_map.get("orch") or {}).get("model")
         or ""
     )
-    parsed_raw = await safe_json_parse(raw, lm_client, fixer_model, run_state=run_state) if raw else None
+    parsed_raw = (
+        await safe_json_parse(
+            raw,
+            lm_client,
+            fixer_model,
+            run_state=run_state,
+            model_manager=run_state.model_manager if run_state else None,
+        )
+        if raw
+        else None
+    )
     parsed, coerced = normalize_research_payload(parsed_raw)
     if coerced and run_state:
         run_state.add_dev_trace(
@@ -5403,7 +6175,13 @@ async def execute_research_step(
                     "tavily_extract",
                     {"step": step.step_id, "urls": url_slice},
                 )
-                extract_resp = await tavily.extract(url_slice, extract_depth=extract_depth)
+                try:
+                    extract_resp = await asyncio.wait_for(
+                        tavily.extract(url_slice, extract_depth=extract_depth),
+                        timeout=TAVILY_TIMEOUT_S,
+                    )
+                except asyncio.TimeoutError:
+                    extract_resp = {"error": "timeout"}
                 extract_resp = coerce_tavily_response(extract_resp)
                 await db.add_extract(run_id, f"Step{step.step_id}", ",".join(url_slice), extract_depth, extract_resp)
                 if extract_resp.get("error"):
@@ -5495,6 +6273,8 @@ async def execute_research_step(
     tool_results = await resolve_tool_requests(
         tool_requests,
         upload_dir=upload_dir,
+        db=db,
+        conversation_id=conversation_id,
         lm_client=lm_client,
         model_map=model_map,
         run_id=run_id,
@@ -5878,7 +6658,13 @@ async def execute_tavily_extract_step(
             "tavily_extract",
             {"step": step.step_id, "urls": urls},
         )
-        extract_resp = await tavily.extract(urls, extract_depth=extract_depth)
+        try:
+            extract_resp = await asyncio.wait_for(
+                tavily.extract(urls, extract_depth=extract_depth),
+                timeout=TAVILY_TIMEOUT_S,
+            )
+        except asyncio.TimeoutError:
+            extract_resp = {"error": "timeout"}
         extract_resp = coerce_tavily_response(extract_resp)
         await db.add_extract(run_id, f"Step{step.step_id}", ",".join(urls), extract_depth, extract_resp)
         if extract_resp.get("error"):
@@ -5977,6 +6763,7 @@ async def execute_step(
     db: Database,
     bus: EventBus,
     model_map: Dict[str, Dict[str, str]],
+    conversation_id: Optional[str] = None,
     upload_dir: Optional[Path] = None,
     run_state: Optional[RunState] = None,
 ) -> Tuple[Dict[str, Any], List[Artifact], str]:
@@ -6013,6 +6800,7 @@ async def execute_step(
             db,
             bus,
             model_map,
+            conversation_id=conversation_id,
             upload_dir=upload_dir,
             run_state=run_state,
         )
@@ -6073,6 +6861,7 @@ async def execute_step(
             step_id=step.step_id,
             context="draft",
             run_state=run_state,
+            model_manager=run_state.model_manager if run_state else None,
         )
         artifact = Artifact(
             step_id=step.step_id,
@@ -6106,6 +6895,7 @@ async def execute_step(
                 step_id=step.step_id,
                 context="verify",
                 run_state=run_state,
+                model_manager=run_state.model_manager if run_state else None,
             )
         except Exception as exc:
             if run_state:
@@ -6120,30 +6910,56 @@ async def execute_step(
             or (model_map.get("orch") or {}).get("model")
             or ""
         )
-        parsed = await safe_json_parse(report, lm_client, verifier_model, run_state=run_state)
+        parsed = await safe_json_parse(
+            report,
+            lm_client,
+            verifier_model,
+            run_state=run_state,
+            model_manager=run_state.model_manager if run_state else None,
+        )
         if not isinstance(parsed, dict):
             parsed = {}
         if not parsed:
             parsed = {"issues": [], "verdict": "PASS", "extra_steps": []}
         parsed = normalize_verifier_payload(parsed)
-        if decision.reasoning_level in ("HIGH", "ULTRA") or decision.expected_passes > 1 or decision.needs_web:
+        if decision.expected_passes > 1 or decision.needs_web:
             planner_model = (model_map.get("orch") or {}).get("model")
             planner_url = (model_map.get("orch") or {}).get("base_url")
             if planner_model and planner_url and planner_model != verifier_model:
                 try:
-                    planner_resp = await lm_client.chat_completion(
-                        model=planner_model,
-                        messages=[
-                            {"role": "system", "content": agents.VERIFIER_SYSTEM},
-                            {"role": "user", "content": verifier_prompt},
-                        ],
-                        temperature=0.0,
-                        max_tokens=700,
-                        base_url=planner_url,
+                    if run_state and run_state.model_manager:
+                        planner_content = await run_worker(
+                            lm_client,
+                            "Verifier",
+                            {},
+                            verifier_prompt,
+                            temperature=0.0,
+                            max_tokens=700,
+                            run_state=run_state,
+                            model_manager=run_state.model_manager,
+                            system_prompt_override=agents.VERIFIER_SYSTEM,
+                            context="planner_verify",
+                        )
+                    else:
+                        planner_resp = await lm_client.chat_completion(
+                            model=planner_model,
+                            messages=[
+                                {"role": "system", "content": agents.VERIFIER_SYSTEM},
+                                {"role": "user", "content": verifier_prompt},
+                            ],
+                            temperature=0.0,
+                            max_tokens=700,
+                            base_url=planner_url,
+                            run_state=run_state,
+                        )
+                        planner_content = planner_resp["choices"][0]["message"]["content"]
+                    planner_parsed = await safe_json_parse(
+                        planner_content,
+                        lm_client,
+                        planner_model,
                         run_state=run_state,
+                        model_manager=run_state.model_manager if run_state else None,
                     )
-                    planner_content = planner_resp["choices"][0]["message"]["content"]
-                    planner_parsed = await safe_json_parse(planner_content, lm_client, planner_model, run_state=run_state)
                     if planner_parsed:
                         if not isinstance(planner_parsed, dict):
                             planner_parsed = {}
@@ -6204,13 +7020,20 @@ async def execute_step(
             step_id=step.step_id,
             context="finalize",
             run_state=run_state,
+            model_manager=run_state.model_manager if run_state else None,
         )
         fixer_model = (
             (model_map.get("summarizer") or {}).get("model")
             or (model_map.get("orch") or {}).get("model")
             or ""
         )
-        parsed = await safe_json_parse(final_raw, lm_client, fixer_model, run_state=run_state)
+        parsed = await safe_json_parse(
+            final_raw,
+            lm_client,
+            fixer_model,
+            run_state=run_state,
+            model_manager=run_state.model_manager if run_state else None,
+        )
         if not isinstance(parsed, dict):
             await bus.emit(
                 run_id,
@@ -6259,6 +7082,8 @@ async def execute_step(
         tool_results = await resolve_tool_requests(
             tool_requests,
             upload_dir=upload_dir,
+            db=db,
+            conversation_id=conversation_id,
             lm_client=lm_client,
             model_map=model_map,
             run_id=run_id,
@@ -6311,6 +7136,7 @@ async def execute_step(
             step_id=step.step_id,
             context="analysis",
             run_state=run_state,
+            model_manager=run_state.model_manager if run_state else None,
         )
         summary_text = summary_raw
         tool_requests = []
@@ -6320,7 +7146,13 @@ async def execute_step(
             or (model_map.get("orch") or {}).get("model")
             or ""
         )
-        parsed = await safe_json_parse(summary_raw, lm_client, fixer_model, run_state=run_state)
+        parsed = await safe_json_parse(
+            summary_raw,
+            lm_client,
+            fixer_model,
+            run_state=run_state,
+            model_manager=run_state.model_manager if run_state else None,
+        )
         if isinstance(parsed, dict):
             lines = parsed.get("activity_lines") or parsed.get("memory_notes") or parsed.get("criteria")
             if isinstance(lines, list):
@@ -6351,6 +7183,8 @@ async def execute_step(
             tool_results = await resolve_tool_requests(
                 tool_requests,
                 upload_dir=upload_dir,
+                db=db,
+                conversation_id=conversation_id,
                 lm_client=lm_client,
                 model_map=model_map,
                 run_id=run_id,
@@ -6428,6 +7262,7 @@ async def execute_step(
             step_id=step.step_id,
             context=step.type,
             run_state=run_state,
+            model_manager=run_state.model_manager if run_state else None,
         )
         artifact = Artifact(
             step_id=step.step_id,
@@ -6456,6 +7291,9 @@ async def process_uploads(
     summaries: List[str] = []
     vision_endpoint = model_map.get("worker") or model_map.get("worker_a") or model_map.get("orch")
     secretary_endpoint = model_map.get("summarizer") or model_map.get("router") or model_map.get("worker")
+    avoid_coder = False
+    if question:
+        avoid_coder = not looks_like_coding_task(question)
     for uid in upload_ids:
         record = await db.get_upload(uid)
         if not record:
@@ -6481,20 +7319,54 @@ async def process_uploads(
                     },
                     {"type": "image_url", "image_url": {"url": data_url_from_file(path, record["mime"])}},
                 ]
-                resp = await lm_client.chat_completion(
-                    model=vision_endpoint["model"],
-                    messages=[
-                        {"role": "system", "content": agents.VISION_ANALYST_SYSTEM},
-                        {"role": "user", "content": image_block},
-                    ],
-                    temperature=0.2,
-                    max_tokens=600,
-                    base_url=vision_endpoint["base_url"],
-                    run_state=run_state,
-                )
-                content = resp["choices"][0]["message"]["content"]
+                if run_state and run_state.model_manager:
+                    resp, instance = await run_state.model_manager.call_with_instance(
+                        required_capabilities=["vision"],
+                        objective=run_state.model_manager.routing_objective,
+                        request={
+                            "messages": [
+                                {"role": "system", "content": agents.VISION_ANALYST_SYSTEM},
+                                {"role": "user", "content": image_block},
+                            ],
+                            "temperature": 0.2,
+                            "max_tokens": 600,
+                            "use_responses": True,
+                        },
+                        avoid_coder=avoid_coder,
+                    )
+                    content = resp["choices"][0]["message"]["content"]
+                    await bus.emit(
+                        run_id,
+                        "model_selected",
+                        {
+                            "profile": "VisionAnalyst",
+                            "model": instance.model_key,
+                            "instance": instance.api_identifier,
+                            "backend_id": instance.backend_id,
+                            "context": "vision",
+                        },
+                    )
+                else:
+                    resp = await lm_client.chat_completion(
+                        model=vision_endpoint["model"],
+                        messages=[
+                            {"role": "system", "content": agents.VISION_ANALYST_SYSTEM},
+                            {"role": "user", "content": image_block},
+                        ],
+                        temperature=0.2,
+                        max_tokens=600,
+                        base_url=vision_endpoint["base_url"],
+                        run_state=run_state,
+                    )
+                    content = resp["choices"][0]["message"]["content"]
                 vision_json = (
-                    await safe_json_parse(content, lm_client, vision_endpoint["model"], run_state=run_state)
+                    await safe_json_parse(
+                        content,
+                        lm_client,
+                        vision_endpoint["model"],
+                        run_state=run_state,
+                        model_manager=run_state.model_manager if run_state else None,
+                    )
                     or {"caption": content}
                 )
             elif record["mime"] == "application/pdf":
@@ -6508,20 +7380,54 @@ async def process_uploads(
                 f"Upload: {record['original_name']} ({record['mime']}, {record['size_bytes']} bytes)\n"
                 f"Vision analysis: {json.dumps(vision_json)[:3500]}"
             )
-            sec_resp = await lm_client.chat_completion(
-                model=secretary_endpoint["model"],
-                messages=[
-                    {"role": "system", "content": agents.UPLOAD_SECRETARY_SYSTEM},
-                    {"role": "user", "content": secretary_prompt},
-                ],
-                temperature=0.2,
-                max_tokens=320,
-                base_url=secretary_endpoint["base_url"],
-                run_state=run_state,
-            )
-            sec_content = sec_resp["choices"][0]["message"]["content"]
+            if run_state and run_state.model_manager:
+                sec_resp, instance = await run_state.model_manager.call_with_instance(
+                    required_capabilities=["structured_output"],
+                    objective=run_state.model_manager.routing_objective,
+                    request={
+                        "messages": [
+                            {"role": "system", "content": agents.UPLOAD_SECRETARY_SYSTEM},
+                            {"role": "user", "content": secretary_prompt},
+                        ],
+                        "temperature": 0.2,
+                        "max_tokens": 320,
+                        "use_responses": True,
+                    },
+                    avoid_coder=avoid_coder,
+                )
+                sec_content = sec_resp["choices"][0]["message"]["content"]
+                await bus.emit(
+                    run_id,
+                    "model_selected",
+                    {
+                        "profile": "UploadSecretary",
+                        "model": instance.model_key,
+                        "instance": instance.api_identifier,
+                        "backend_id": instance.backend_id,
+                        "context": "upload_secretary",
+                    },
+                )
+            else:
+                sec_resp = await lm_client.chat_completion(
+                    model=secretary_endpoint["model"],
+                    messages=[
+                        {"role": "system", "content": agents.UPLOAD_SECRETARY_SYSTEM},
+                        {"role": "user", "content": secretary_prompt},
+                    ],
+                    temperature=0.2,
+                    max_tokens=320,
+                    base_url=secretary_endpoint["base_url"],
+                    run_state=run_state,
+                )
+                sec_content = sec_resp["choices"][0]["message"]["content"]
             sec_json = (
-                await safe_json_parse(sec_content, lm_client, secretary_endpoint["model"], run_state=run_state)
+                await safe_json_parse(
+                    sec_content,
+                    lm_client,
+                    secretary_endpoint["model"],
+                    run_state=run_state,
+                    model_manager=run_state.model_manager if run_state else None,
+                )
                 or {"summary": sec_content}
             )
             summary_text = sec_json.get("summary") or sec_content
@@ -6600,6 +7506,7 @@ async def run_question(
     db: Database,
     bus: EventBus,
     lm_client: LMStudioClient,
+    model_manager: Optional[ModelManager],
     tavily: TavilyClient,
     settings_models: Dict[str, Dict[str, str]],
     model_availability: Optional[Dict[str, Any]] = None,
@@ -6609,6 +7516,13 @@ async def run_question(
     control_queue: Optional[asyncio.Queue] = None,
     default_reasoning_level: Optional[str] = None,
     evidence_dump: bool = False,
+    plan_reasoning_mode: str = "normal",
+    planning_mode: str = "normal",
+    reasoning_level: Optional[int] = None,
+    ram_headroom_pct: float = 10.0,
+    vram_headroom_pct: float = 10.0,
+    max_concurrent_runs: Optional[int] = None,
+    per_model_class_limits: Optional[Dict[str, int]] = None,
 ) -> None:
     """Main orchestration loop for a single run (now with parallel step execution)."""
     active_models: Dict[str, Dict[str, str]] = settings_models
@@ -6628,8 +7542,97 @@ async def run_question(
         run_state.question = question
         run_state.freshness_required = needs_freshness(question)
         run_state.dev_trace_cb = make_dev_trace_cb(bus, run_id)
-        await maybe_emit_work_log(run_state, bus, run_id, "goal", f"Goal: {question}")
-        await maybe_emit_work_log(run_state, bus, run_id, "access_check", "Checking what sources are available.")
+        run_state.model_manager = model_manager
+        if model_manager:
+            await maybe_emit_work_log(
+                run_state,
+                bus,
+                run_id,
+                "model_discovery",
+                "Discovering available local models.",
+            )
+            await model_manager.refresh()
+            bootstrap_instance = await model_manager.bootstrap()
+            candidates = await model_manager.get_candidates()
+            if not candidates:
+                server_down = False
+                backend = model_manager.backends.get("lmstudio")
+                if backend and hasattr(backend, "is_server_reachable"):
+                    try:
+                        server_down = not await backend.is_server_reachable()  # type: ignore[call-arg]
+                    except Exception:
+                        server_down = False
+                run_state.mark_chat_unavailable("No local models discovered")
+                await maybe_emit_work_log(
+                    run_state,
+                    bus,
+                    run_id,
+                    "no_models",
+                    (
+                        "LM Studio server is not running. Open LM Studio and start the local server, then retry."
+                        if server_down
+                        else "No local models are available yet. Load a tool-capable model in LM Studio and retry."
+                    ),
+                    tone="warn",
+                )
+                guidance = (
+                    "I couldn't find any local models to run this request.\n\n"
+                    "Open LM Studio, start the local API server, and load at least one tool-capable model "
+                    "(default http://127.0.0.1:1234). Then retry this prompt."
+                )
+                assistant_msg = await db.add_message(run_id, conversation_id, "assistant", guidance)
+                await bus.emit(
+                    run_id,
+                    "message_added",
+                    {
+                        "id": assistant_msg.get("id"),
+                        "role": "assistant",
+                        "content": guidance,
+                        "run_id": run_id,
+                        "created_at": assistant_msg.get("created_at"),
+                    },
+                )
+                await db.finalize_run(run_id, guidance, "LOW")
+                await bus.emit(run_id, "archived", {"run_id": run_id, "confidence": "LOW"})
+                return
+            if not bootstrap_instance:
+                run_state.mark_chat_unavailable("Unable to load a local model")
+                await maybe_emit_work_log(
+                    run_state,
+                    bus,
+                    run_id,
+                    "model_bootstrap",
+                    "Unable to load a local model instance. Check LM Studio resources and retry.",
+                    tone="warn",
+                )
+                guidance = (
+                    "I found local models but couldn't load an instance to run the request.\n\n"
+                    "Please confirm LM Studio has enough resources to load a model instance, then retry."
+                )
+                assistant_msg = await db.add_message(run_id, conversation_id, "assistant", guidance)
+                await bus.emit(
+                    run_id,
+                    "message_added",
+                    {
+                        "id": assistant_msg.get("id"),
+                        "role": "assistant",
+                        "content": guidance,
+                        "run_id": run_id,
+                        "created_at": assistant_msg.get("created_at"),
+                    },
+                )
+                await db.finalize_run(run_id, guidance, "LOW")
+                await bus.emit(run_id, "archived", {"run_id": run_id, "confidence": "LOW"})
+                return
+        plan_reasoning_mode = (plan_reasoning_mode or "auto").lower()
+        planning_mode = (planning_mode or "auto").lower()
+        valid_plan_modes = {"auto", "normal", "extensive"}
+        if plan_reasoning_mode not in valid_plan_modes:
+            plan_reasoning_mode = "auto"
+        if planning_mode not in valid_plan_modes:
+            planning_mode = "auto"
+        await maybe_emit_work_log(run_state, bus, run_id, "goal", f"Here's the ask: {question}")
+        await maybe_emit_work_log(run_state, bus, run_id, "access_check", "Quick check on available sources.")
 
         run_state.can_web, run_state.web_error = await check_web_access(tavily)
         if run_state.web_error and run_state.can_web:
@@ -6639,7 +7642,7 @@ async def run_question(
                 bus,
                 run_id,
                 "web_warning",
-                f"Web search looks flaky ({run_state.web_error}); I'll still try to pull sources.",
+                f"Web search looks a bit flaky ({run_state.web_error}); I'll still try to pull sources.",
                 tone="warn",
             )
         if not run_state.can_web:
@@ -6648,7 +7651,7 @@ async def run_question(
                 bus,
                 run_id,
                 "no_web",
-                "Web browsing is off here, so I'll use what's provided and flag assumptions.",
+                "Web browsing is off here, so I'll lean on what you provided and flag assumptions.",
                 tone="warn",
             )
             if run_state.freshness_required:
@@ -6657,7 +7660,7 @@ async def run_question(
                     bus,
                     run_id,
                     "freshness",
-                    "If you need up-to-date verification, share links or use a browsing-enabled lane.",
+                    "If you need up-to-date verification, share links or switch to a browsing-enabled lane.",
                     tone="warn",
                 )
 
@@ -6666,70 +7669,71 @@ async def run_question(
         force_parallel_requested = MIN_PARALLEL_SLOTS > 1
         if force_parallel_requested and requested_tier == "fast":
             requested_tier = "pro"
-        if requested_tier == "fast":
-            base_check = (
-                settings_models.get("fast")
-                or settings_models.get("worker")
-                or settings_models.get("summarizer")
-                or settings_models.get("orch")
-                or {}
-            )
-        else:
-            base_check = settings_models.get("orch") or settings_models.get("router") or settings_models.get("summarizer") or {}
-        check_url = base_check.get("base_url") or lm_client.base_url
-        check_model = base_check.get("model") or ""
         chat_fallback_model: Optional[str] = None
-        can_chat, chat_detail = await lm_client.check_chat(base_url=check_url, model=check_model, run_state=run_state)
-        if not can_chat:
-            try:
-                available = await lm_client.list_models_cached(check_url)
-                for candidate in available:
-                    if not candidate:
-                        continue
-                    lowered = candidate.lower()
-                    if "embed" in lowered:
-                        continue
-                    ok, _ = await lm_client.check_chat(base_url=check_url, model=candidate, run_state=run_state)
-                    if ok:
-                        can_chat = True
-                        chat_fallback_model = candidate
-                        if run_state:
-                            run_state.add_dev_trace(
-                                "Chat preflight fallback succeeded.",
-                                {"model": candidate, "base_url": check_url},
-                            )
-                        break
-            except Exception:
-                pass
-        if not can_chat:
-            run_state.mark_chat_unavailable(chat_detail or "Local model unavailable")
-            await maybe_emit_work_log(
-                run_state,
-                bus,
-                run_id,
-                "no_chat",
-                "Local model isn't reachable right now, so I'll stop and explain how to fix it.",
-                tone="warn",
-            )
-            guidance = (
-                "I can't reach the local model right now, so I can't complete this request.\n\n"
-                "Please check that the configured model name exists in `/v1/models`, and that the request payload only "
-                "includes standard fields (model, messages, temperature, max_tokens, stream). "
-                "If you're using LM Studio, verify the model is loaded and reachable at the configured base URL."
-            )
-            assistant_msg = await db.add_message(run_id, conversation_id, "assistant", guidance)
-            await bus.emit(
-                run_id,
-                "message_added",
-                {"id": assistant_msg.get("id"), "role": "assistant", "content": guidance, "run_id": run_id, "created_at": assistant_msg.get("created_at")},
-            )
-            await db.finalize_run(run_id, guidance, "LOW")
-            await bus.emit(run_id, "archived", {"run_id": run_id, "confidence": "LOW"})
-            return
+        if not model_manager:
+            if requested_tier == "fast":
+                base_check = (
+                    settings_models.get("fast")
+                    or settings_models.get("worker")
+                    or settings_models.get("summarizer")
+                    or settings_models.get("orch")
+                    or {}
+                )
+            else:
+                base_check = settings_models.get("orch") or settings_models.get("router") or settings_models.get("summarizer") or {}
+            check_url = base_check.get("base_url") or lm_client.base_url
+            check_model = base_check.get("model") or ""
+            can_chat, chat_detail = await lm_client.check_chat(base_url=check_url, model=check_model, run_state=run_state)
+            if not can_chat:
+                try:
+                    available = await lm_client.list_models_cached(check_url)
+                    for candidate in available:
+                        if not candidate:
+                            continue
+                        lowered = candidate.lower()
+                        if "embed" in lowered:
+                            continue
+                        ok, _ = await lm_client.check_chat(base_url=check_url, model=candidate, run_state=run_state)
+                        if ok:
+                            can_chat = True
+                            chat_fallback_model = candidate
+                            if run_state:
+                                run_state.add_dev_trace(
+                                    "Chat preflight fallback succeeded.",
+                                    {"model": candidate, "base_url": check_url},
+                                )
+                            break
+                except Exception:
+                    pass
+            if not can_chat:
+                run_state.mark_chat_unavailable(chat_detail or "Local model unavailable")
+                await maybe_emit_work_log(
+                    run_state,
+                    bus,
+                    run_id,
+                    "no_chat",
+                    "Local model isn't reachable right now, so I'll stop and explain how to fix it.",
+                    tone="warn",
+                )
+                guidance = (
+                    "I can't reach the local model right now, so I can't complete this request.\n\n"
+                    "Please check that the configured model name exists in `/v1/models`, and that the request payload only "
+                    "includes standard fields (model, messages, temperature, max_tokens, stream). "
+                    "If you're using LM Studio, verify the model is loaded and reachable at the configured base URL."
+                )
+                assistant_msg = await db.add_message(run_id, conversation_id, "assistant", guidance)
+                await bus.emit(
+                    run_id,
+                    "message_added",
+                    {"id": assistant_msg.get("id"), "role": "assistant", "content": guidance, "run_id": run_id, "created_at": assistant_msg.get("created_at")},
+                )
+                await db.finalize_run(run_id, guidance, "LOW")
+                await bus.emit(run_id, "archived", {"run_id": run_id, "confidence": "LOW"})
+                return
 
-        settings_models = await resolve_model_map(settings_models, lm_client, run_state=run_state)
+            settings_models = await resolve_model_map(settings_models, lm_client, run_state=run_state)
 
-        if requested_tier == "deep":
+        if requested_tier == "deep" and not model_manager:
             missing_roles: List[str] = []
             missing_models: List[str] = []
             if isinstance(model_availability, dict):
@@ -6762,25 +7766,37 @@ async def run_question(
                 await bus.emit(run_id, "archived", {"run_id": run_id, "confidence": "LOW"})
                 return
 
-        settings_models, runtime_models = await apply_runtime_model_overrides(
-            settings_models,
-            lm_client,
-            run_state=run_state,
-            run_id=run_id,
-            bus=bus,
-        )
+        if model_manager:
+            runtime_models = {"check_cache": {}}
+        else:
+            settings_models, runtime_models = await apply_runtime_model_overrides(
+                settings_models,
+                lm_client,
+                run_state=run_state,
+                run_id=run_id,
+                bus=bus,
+            )
         ready_worker_models: Set[Tuple[str, str]] = set()
-        ready_worker_roles: List[str] = []
-        for role in ("worker", "worker_b", "worker_c"):
-            cfg = settings_models.get(role) or {}
-            base_url = cfg.get("base_url")
-            model = cfg.get("model")
-            if not base_url or not model:
-                continue
-            if runtime_models.get("check_cache", {}).get((base_url, model)) is True:
-                ready_worker_models.add((base_url, model))
-                ready_worker_roles.append(role)
-        ready_worker_count = len(ready_worker_roles) or len(ready_worker_models)
+        ready_worker_count = 0
+        candidate_count = 0
+        if model_manager:
+            instances = await model_manager.worker_pool.list_instances()
+            ready_instances = [inst for inst in instances if inst.status != "busy"]
+            ready_worker_count = len(ready_instances)
+            ready_worker_models = {(inst.endpoint, inst.model_key) for inst in ready_instances}
+            candidate_count = len(await model_manager.get_candidates())
+        else:
+            ready_worker_roles: List[str] = []
+            for role in ("worker", "worker_b", "worker_c"):
+                cfg = settings_models.get(role) or {}
+                base_url = cfg.get("base_url")
+                model = cfg.get("model")
+                if not base_url or not model:
+                    continue
+                if runtime_models.get("check_cache", {}).get((base_url, model)) is True:
+                    ready_worker_models.add((base_url, model))
+                    ready_worker_roles.append(role)
+            ready_worker_count = len(ready_worker_roles) or len(ready_worker_models)
         min_parallel_slots = 1
         force_parallel = False
 
@@ -6843,7 +7859,7 @@ async def run_question(
                 router_decision.reasoning_level = "HIGH" if router_decision.reasoning_level in ("LOW", "MED") else router_decision.reasoning_level
                 router_decision.extract_depth = "advanced"
                 router_decision.max_results = max(router_decision.max_results, 10)
-            if strict_mode or router_decision.reasoning_level in ("HIGH", "ULTRA"):
+            if strict_mode:
                 router_decision.expected_passes = max(router_decision.expected_passes or 1, 2)
             if run_state.can_web and (guess_needs_web(question) or run_state.freshness_required):
                 router_decision.needs_web = True
@@ -6865,6 +7881,15 @@ async def run_question(
             router_decision.needs_web = False
             router_decision.tool_budget = {"tavily_search": 0, "tavily_extract": 0}
             router_decision.max_results = 0
+        plan_granularity_level = (
+            int(reasoning_level) if reasoning_level is not None else granularity_level_from_router(router_decision.reasoning_level)
+        )
+        if plan_granularity_level >= 4:
+            plan_reasoning_mode = "extensive"
+            planning_mode = "extensive"
+        else:
+            plan_reasoning_mode = "auto"
+            planning_mode = "auto"
         depth_profile = REASONING_DEPTHS.get(router_decision.reasoning_level, REASONING_DEPTHS["MED"])
         if model_tier == "fast":
             depth_profile = REASONING_DEPTHS["LOW"]
@@ -6893,6 +7918,19 @@ async def run_question(
             executor_endpoint = active_models.get("summarizer") or active_models.get("router") or active_models.get("orch") or {}
         if executor_endpoint:
             active_models["executor"] = executor_endpoint
+        if plan_reasoning_mode == "auto" or planning_mode == "auto":
+            planner_decider = planner_endpoint or active_models.get("orch") or active_models.get("summarizer") or {}
+            auto_modes = await decide_planning_modes(
+                lm_client,
+                planner_decider,
+                question,
+                plan_granularity_level,
+                run_state=run_state,
+            )
+            if plan_reasoning_mode == "auto":
+                plan_reasoning_mode = auto_modes.get("plan_reasoning_mode", "normal")
+            if planning_mode == "auto":
+                planning_mode = auto_modes.get("planning_mode", "normal")
         queue_narration(
             lm_client,
             active_models,
@@ -6912,17 +7950,19 @@ async def run_question(
                 "execution_mode": execution_mode,
                 "web_available": run_state.can_web,
                 "freshness_required": run_state.freshness_required,
+                "plan_reasoning_mode": plan_reasoning_mode,
+                "planning_mode": planning_mode,
+                "plan_reasoning_level": plan_granularity_level,
             }
         )
         try:
             resource_snapshot = get_resource_snapshot()
-            worker_budget = compute_worker_slots(active_models, model_tier, model_availability, resource_snapshot)
-            max_parallel_slots = worker_budget.get("max_parallel", 1)
         except Exception:
             resource_snapshot = {}
-            worker_budget = {"max_parallel": 1, "configured": 1, "variants": 1, "ram_slots": 1, "vram_slots": 1}
-            max_parallel_slots = 1
+        worker_budget = compute_pool_budget(resource_snapshot, model_tier, ready_worker_count, candidate_count)
+        max_parallel_slots = worker_budget.get("max_parallel", 1)
         pressure_limit = bool(worker_budget.get("ram_pressure") or worker_budget.get("vram_pressure"))
+        elastic_parallel = not pressure_limit
         if pressure_limit:
             min_parallel_slots = 1
             force_parallel = False
@@ -6938,7 +7978,8 @@ async def run_question(
         worker_budget["ready_workers"] = ready_worker_count
         worker_budget["ready_variants"] = len(ready_worker_models)
         worker_budget["min_parallel"] = min_parallel_slots
-        if ready_worker_count <= 0:
+        worker_budget["elastic_parallel"] = elastic_parallel
+        if ready_worker_count <= 0 and not model_manager:
             max_parallel_slots = 1
             worker_budget["max_parallel"] = 1
             allow_parallel = False
@@ -6949,7 +7990,10 @@ async def run_question(
             worker_budget["max_parallel"] = max_parallel_slots
         desired_slots = desired_parallelism(router_decision, worker_budget, strict_mode=strict_mode)
         desired_slots = max(min_parallel_slots, desired_slots) if force_parallel else desired_slots
-        desired_slots = max(1, min(max_parallel_slots, desired_slots))
+        if pressure_limit:
+            desired_slots = max(1, min(max_parallel_slots, desired_slots))
+        else:
+            desired_slots = max(1, desired_slots)
         if chat_fallback_model:
             max_parallel_slots = 1
             desired_slots = 1
@@ -6961,7 +8005,13 @@ async def run_question(
                     {"model": chat_fallback_model},
                 )
         worker_budget["desired_parallel"] = desired_slots
-        if max_parallel_slots > 1 and not allow_parallel and model_tier != "fast" and ready_worker_count > 0 and not pressure_limit:
+        if (
+            max_parallel_slots > 1
+            and not allow_parallel
+            and model_tier != "fast"
+            and (ready_worker_count > 0 or model_manager)
+            and not pressure_limit
+        ):
             allow_parallel = True
         if not allow_parallel:
             if force_parallel:
@@ -6969,7 +8019,10 @@ async def run_question(
             else:
                 max_parallel_slots = 1
                 desired_slots = 1
-        target_parallel_slots = max(1, min(max_parallel_slots, desired_slots))
+        if pressure_limit:
+            target_parallel_slots = max(1, min(max_parallel_slots, desired_slots))
+        else:
+            target_parallel_slots = max(1, desired_slots)
         if force_parallel:
             target_parallel_slots = max(min_parallel_slots, target_parallel_slots)
         loop = asyncio.get_running_loop()
@@ -6991,19 +8044,45 @@ async def run_question(
                     run_state=run_state,
                     run_id=run_id,
                     bus=bus,
+                    model_manager=model_manager,
                 )
             )
         decision_payload["resource_budget"] = worker_budget
         decision_payload["desired_parallel"] = target_parallel_slots
+        worker_pool_models: List[str] = []
+        worker_pool_instances = 0
+        if model_manager:
+            instances = await model_manager.worker_pool.list_instances()
+            worker_pool_instances = len(instances)
+            worker_pool_models = sorted(
+                {inst.model_key for inst in instances if inst.model_key}
+            )
+        else:
+            worker_pool_models = [
+                m
+                for m in [
+                    (active_models.get("worker") or {}).get("model"),
+                    (active_models.get("worker_b") or {}).get("model"),
+                    (active_models.get("worker_c") or {}).get("model"),
+                ]
+                if m
+            ]
+            worker_pool_instances = len(worker_pool_models)
+        planner_label = (planner_endpoint or {}).get("model")
+        executor_label = (executor_endpoint or {}).get("model")
+        verifier_label = (active_models.get("verifier") or {}).get("model")
+        if model_manager:
+            planner_label = "AUTO"
+            executor_label = "AUTO"
+            verifier_label = "AUTO"
         team_roster = {
-            "planner": (planner_endpoint or {}).get("model"),
-            "executor": (executor_endpoint or {}).get("model"),
-            "workers": [
-                (active_models.get("worker") or {}).get("model"),
-                (active_models.get("worker_b") or {}).get("model"),
-                (active_models.get("worker_c") or {}).get("model"),
-            ],
-            "verifier": (active_models.get("verifier") or {}).get("model"),
+            "planner": planner_label,
+            "executor": executor_label,
+            "worker_pool": {
+                "models": worker_pool_models,
+                "instances": worker_pool_instances,
+            },
+            "verifier": verifier_label,
         }
         decision_payload["team"] = team_roster
         await db.update_run_router(run_id, decision_payload)
@@ -7044,9 +8123,19 @@ async def run_question(
             tier_note = f"{requested_tier_original.upper()}->{model_tier.upper()}"
         await bus.emit(run_id, "client_note", {"note": f"{tier_note} mode: {execution_mode} (route {deep_route_used})"})
 
-        # Memory retrieval
-        mem_hits = await db.search_memory(question, limit=5)
-        memory_context = "; ".join([f"{m['title']}: {m['content']}" for m in mem_hits])
+        # Conversation memory retrieval (facts only within this chat).
+        mem_hits = await db.search_memory(question, conversation_id=conversation_id, limit=5)
+        memory_lines: List[str] = []
+        for item in mem_hits:
+            title = str(item.get("title") or "").strip()
+            content = str(item.get("content") or "").strip()
+            if not content and title:
+                memory_lines.append(title)
+            elif content and (not title or title.lower() == content.lower()):
+                memory_lines.append(content)
+            elif content:
+                memory_lines.append(f"{title}: {content}")
+        memory_context = "; ".join([line for line in memory_lines if line])
         artifacts: List[Artifact] = []
         if mem_hits:
             mem_art = Artifact(step_id=0, key="memory_context", artifact_type="memory", content_text=memory_context, content_json={"items": mem_hits})
@@ -7079,6 +8168,40 @@ async def run_question(
                         "uploads",
                         "Reviewed your uploads and noted key details.",
                     )
+
+        use_plan_pipeline = planning_mode == "extensive" or plan_reasoning_mode == "extensive"
+        if use_plan_pipeline:
+            plan_result = await run_plan_pipeline(
+                db_path=db.path,
+                question=question,
+                reasoning_mode=plan_reasoning_mode,
+                planning_mode=planning_mode,
+                reasoning_level=plan_granularity_level,
+                max_parallel=target_parallel_slots,
+                ram_headroom_pct=ram_headroom_pct,
+                vram_headroom_pct=vram_headroom_pct,
+                max_concurrent_runs=max_concurrent_runs,
+                per_model_class_limits=per_model_class_limits or {},
+                model_manager=model_manager,
+                bus=bus,
+                run_id=run_id,
+            )
+            final_answer = plan_result.get("final_text") or "Plan completed without a final draft."
+            assistant_msg = await db.add_message(run_id, conversation_id, "assistant", final_answer)
+            await bus.emit(
+                run_id,
+                "message_added",
+                {
+                    "id": assistant_msg.get("id"),
+                    "role": "assistant",
+                    "content": final_answer,
+                    "run_id": run_id,
+                    "created_at": assistant_msg.get("created_at"),
+                },
+            )
+            await db.finalize_run(run_id, final_answer, "MED")
+            await bus.emit(run_id, "archived", {"run_id": run_id, "confidence": "MED"})
+            return
 
         is_math_only = build_math_tool_request(question) is not None
         if is_math_only:
@@ -7198,15 +8321,15 @@ async def run_question(
             plan_payload,
         )
         if is_math_only:
-            plan_note = "Plan: Compute locally, then answer directly."
+            plan_note = "Game plan: compute locally, then answer directly."
         elif run_state.can_web and router_decision.needs_web:
-            plan_note = "Plan: Gather sources, compare findings, then draft a clear answer."
+            plan_note = "Game plan: gather sources, compare findings, then draft a clear answer."
         elif run_state.can_web:
-            plan_note = "Plan: Use local knowledge/tools, then draft a clear answer."
+            plan_note = "Game plan: use local knowledge/tools, then draft a clear answer."
         else:
-            plan_note = "Plan: Use what you provided (plus local context), then draft a best-effort answer and flag uncertainties."
+            plan_note = "Game plan: use what you provided (plus local context), then draft a best-effort answer and flag uncertainties."
         if upload_id_list:
-            plan_note = "Plan: Review your uploads first, then " + plan_note.split("Plan: ", 1)[-1]
+            plan_note = "Game plan: review your uploads first, then " + plan_note.split("Game plan: ", 1)[-1]
         await maybe_emit_work_log(run_state, bus, run_id, "plan", plan_note)
         executor_brief = None
         if model_tier != "fast":
@@ -7219,8 +8342,29 @@ async def run_question(
         step_lookup: Dict[int, PlanStep] = {s.step_id: s for s in step_plan.steps}
         completed_steps: Set[int] = set()
         running_tasks: Dict[int, asyncio.Task] = {}
-        max_loops = max(step_plan.global_constraints.get("max_loops", 1), progress_meta["counted_passes"] - 1)
+        infinite_retries = step_plan.global_constraints.get("infinite_retries")
+        if infinite_retries is None:
+            infinite_retries = True
+        if infinite_retries:
+            max_loops = float("inf")
+        else:
+            max_loops = max(step_plan.global_constraints.get("max_loops", 1), progress_meta["counted_passes"] - 1)
         loops = 0
+        backtrack_counts: Dict[int, int] = {}
+        max_backtracks_per_step = (
+            0
+            if infinite_retries
+            else int(step_plan.global_constraints.get("max_backtracks_per_step", 2) or 2)
+        )
+        max_backtracks_total = (
+            0
+            if infinite_retries
+            else int(
+                step_plan.global_constraints.get("max_backtracks_total", max_backtracks_per_step * 2)
+                or max_backtracks_per_step * 2
+            )
+        )
+        backtrack_total = 0
         stop_requested = False
         user_stop_requested = False
         fast_endpoint = executor_endpoint or active_models.get("summarizer") or active_models.get("router") or active_models["orch"]
@@ -7308,6 +8452,38 @@ async def run_question(
                         step_lookup[ps.step_id] = ps
                     plan_changed = True
             elif control.control == "BACKTRACK" and control.to_step:
+                nonlocal backtrack_total
+                if origin == "system" and max_backtracks_per_step and max_backtracks_total:
+                    count = backtrack_counts.get(control.to_step, 0) + 1
+                    backtrack_counts[control.to_step] = count
+                    backtrack_total += 1
+                    if count > max_backtracks_per_step or backtrack_total > max_backtracks_total:
+                        if run_state:
+                            await maybe_emit_work_log(
+                                run_state,
+                                bus,
+                                run_id,
+                                "backtrack_limit",
+                                "Backtrack limit reached; continuing with the best available evidence.",
+                                tone="warn",
+                            )
+                        control = ControlCommand(control="CONTINUE", reason="backtrack_limit")
+                        plan_changed = False
+                        await db.add_control_action(run_id, control.model_dump())
+                        control_payload = control.model_dump()
+                        control_payload["origin"] = origin
+                        await bus.emit(run_id, "control_action", control_payload)
+                        queue_narration(
+                            lm_client,
+                            active_models,
+                            run_state,
+                            bus,
+                            run_id,
+                            question,
+                            "control_action",
+                            control_payload,
+                        )
+                        return
                 await cancel_running_tasks()
                 allowed = {sid for sid in completed_steps if sid < control.to_step}
                 completed_steps.clear()
@@ -7371,7 +8547,7 @@ async def run_question(
                     bus,
                     run_id,
                     "search",
-                    "Looking for sources to support the answer.",
+                    "Pulling sources to back up the answer.",
                 )
             elif step.type in ("tavily_extract", "extract") and run_state.can_web:
                 await maybe_emit_work_log(
@@ -7379,7 +8555,7 @@ async def run_question(
                     bus,
                     run_id,
                     "read_sources",
-                    "Reading sources and pulling key details.",
+                    "Reading sources and pulling out the key details.",
                 )
             elif step.type == "merge":
                 await maybe_emit_work_log(
@@ -7387,7 +8563,7 @@ async def run_question(
                     bus,
                     run_id,
                     "compare",
-                    "Comparing notes across sources and watching for conflicts.",
+                    "Cross-checking notes across sources for conflicts.",
                 )
             elif step.type == "verify":
                 await maybe_emit_work_log(
@@ -7395,7 +8571,7 @@ async def run_question(
                     bus,
                     run_id,
                     "verify",
-                    "Reviewing the draft for issues and consistency.",
+                    "Giving the draft a quick consistency check.",
                 )
             elif step.type == "draft":
                 await maybe_emit_work_log(
@@ -7403,7 +8579,7 @@ async def run_question(
                     bus,
                     run_id,
                     "draft",
-                    "Drafting the answer and noting any caveats.",
+                    "Putting together the answer and flagging caveats.",
                 )
             elif step.type == "finalize":
                 await maybe_emit_work_log(
@@ -7411,7 +8587,7 @@ async def run_question(
                     bus,
                     run_id,
                     "finalize",
-                    "Finalizing the approved response.",
+                    "Polishing the final response.",
                 )
             step_payload = {
                 "step_id": step.step_id,
@@ -7455,6 +8631,7 @@ async def run_question(
                         db,
                         bus,
                         active_models,
+                        conversation_id=conversation_id,
                         upload_dir=upload_dir,
                         run_state=run_state,
                     )
@@ -7529,20 +8706,20 @@ async def run_question(
                 last_resource_refresh = loop.time()
                 try:
                     resource_snapshot = get_resource_snapshot()
-                    worker_budget = compute_worker_slots(
-                        active_models, model_tier, model_availability, resource_snapshot
-                    )
-                    max_parallel_slots = worker_budget.get("max_parallel", 1)
                 except Exception:
-                    worker_budget = {
-                        "max_parallel": 1,
-                        "configured": 1,
-                        "variants": 1,
-                        "ram_slots": 1,
-                        "vram_slots": 1,
-                    }
-                    max_parallel_slots = 1
+                    resource_snapshot = {}
+                if model_manager:
+                    instances = await model_manager.worker_pool.list_instances()
+                    ready_instances = [inst for inst in instances if inst.status != "busy"]
+                    ready_worker_count = len(ready_instances)
+                    ready_worker_models = {(inst.endpoint, inst.model_key) for inst in ready_instances}
+                    candidate_count = len(await model_manager.get_candidates())
+                worker_budget = compute_pool_budget(
+                    resource_snapshot, model_tier, ready_worker_count, candidate_count or len(ready_worker_models)
+                )
+                max_parallel_slots = worker_budget.get("max_parallel", 1)
                 pressure_limit = bool(worker_budget.get("ram_pressure") or worker_budget.get("vram_pressure"))
+                elastic_parallel = not pressure_limit
                 if pressure_limit:
                     min_parallel_slots = 1
                     force_parallel = False
@@ -7550,7 +8727,8 @@ async def run_question(
                 worker_budget["ready_workers"] = ready_worker_count
                 worker_budget["ready_variants"] = len(ready_worker_models)
                 worker_budget["min_parallel"] = min_parallel_slots
-                if ready_worker_count <= 0:
+                worker_budget["elastic_parallel"] = elastic_parallel
+                if ready_worker_count <= 0 and not model_manager:
                     max_parallel_slots = 1
                     worker_budget["max_parallel"] = 1
                     allow_parallel = False
@@ -7562,13 +8740,16 @@ async def run_question(
                 desired_slots = desired_parallelism(router_decision, worker_budget, strict_mode=strict_mode)
                 if force_parallel:
                     desired_slots = max(min_parallel_slots, desired_slots)
-                desired_slots = max(1, min(max_parallel_slots, desired_slots))
+                if pressure_limit:
+                    desired_slots = max(1, min(max_parallel_slots, desired_slots))
+                else:
+                    desired_slots = max(1, desired_slots)
                 worker_budget["desired_parallel"] = desired_slots
                 if (
                     max_parallel_slots > 1
                     and not allow_parallel
                     and not pressure_limit
-                    and ready_worker_count > 0
+                    and (ready_worker_count > 0 or model_manager)
                     and not chat_fallback_model
                 ):
                     allow_parallel = True
@@ -7578,7 +8759,10 @@ async def run_question(
                     else:
                         max_parallel_slots = 1
                         desired_slots = 1
-                new_target = max(1, min(max_parallel_slots, desired_slots))
+                if pressure_limit:
+                    new_target = max(1, min(max_parallel_slots, desired_slots))
+                else:
+                    new_target = max(1, desired_slots)
                 if force_parallel and not pressure_limit:
                     new_target = max(min_parallel_slots, new_target)
                 if new_target > target_parallel_slots:
@@ -7591,6 +8775,7 @@ async def run_question(
                             run_state=run_state,
                             run_id=run_id,
                             bus=bus,
+                            model_manager=model_manager,
                         )
                     )
                 target_parallel_slots = new_target
@@ -7635,9 +8820,13 @@ async def run_question(
                 start_ids = allocation.start_ids
                 if allocation.target_slots is not None:
                     suggested_slots = max(1, int(allocation.target_slots))
-                    suggested_slots = min(max_parallel_slots, suggested_slots)
+                    if pressure_limit:
+                        suggested_slots = min(max_parallel_slots, suggested_slots)
                     if not allow_parallel:
                         suggested_slots = 1
+                    elif target_parallel_slots > 1:
+                        # Keep target slots at capacity unless resources force a reduction.
+                        suggested_slots = max(target_parallel_slots, suggested_slots)
                     target_parallel_slots = suggested_slots
                 if allow_parallel:
                     queued_ids = allocation.queue_ids or [s.step_id for s in ready_steps if s.step_id not in start_ids]
@@ -7725,6 +8914,8 @@ async def run_question(
                         strict_mode,
                         run_id,
                         bus,
+                        db=db,
+                        conversation_id=conversation_id,
                         upload_dir=upload_dir,
                         run_state=run_state,
                     )
@@ -7870,6 +9061,7 @@ async def run_question(
                     bus=bus,
                     context="fallback_answer",
                     run_state=run_state,
+                    model_manager=run_state.model_manager if run_state else None,
                 )
             except Exception:
                 final_answer = final_answer or "Unable to produce an answer with the available context."
@@ -7917,67 +9109,89 @@ async def run_question(
                 pass
         existing_run_memory = await db.get_run_memory(run_id)
         if auto_memory and final_answer and not existing_run_memory:
-            mem_id = await db.add_memory_item(
-                kind="answer",
-                title=question[:80],
-                content=final_answer[:800],
-                tags=[router_decision.reasoning_level],
-                pinned=False,
-                relevance_score=1.0,
-            )
-            await db.link_memory_to_run(run_id, mem_id, "auto")
-            await bus.emit(run_id, "memory_saved", {"count": 1})
-            queue_narration(
-                lm_client,
-                active_models,
-                run_state,
-                bus,
-                run_id,
-                question,
-                "memory_saved",
-                {"count": 1},
-            )
-            existing_run_memory.append({"id": mem_id})
-        if final_answer and not existing_run_memory:
+            facts: List[str] = []
             try:
-                summary_prompt = (
-                    f"Conversation snippet to index for recall.\nQuestion: {question}\nAnswer: {final_answer}\n"
-                    f"Memory hints: {memory_context or 'n/a'}\nSummarize key takeaways (<=120 words) and keep it scannable."
+                facts_prompt = (
+                    "Extract up to 6 concise factual statements learned from this chat. "
+                    "Only include facts explicitly stated or confirmed here (no advice, no questions). "
+                    "Return JSON only as {\"activity_lines\": [], \"memory_notes\": [...], \"candidate_memory\": []}.\n"
+                    f"User question: {question}\nAssistant answer: {final_answer}"
                 )
-                summary_text = await run_worker(
+                facts_raw = await run_worker(
                     lm_client,
                     "Summarizer",
                     active_models,
-                    summary_prompt,
+                    facts_prompt,
                     temperature=0.2,
-                    max_tokens=180,
+                    max_tokens=220,
                     run_id=run_id,
                     bus=bus,
-                    context="memory_summary",
+                    context="memory_facts",
                     run_state=run_state,
+                    model_manager=run_state.model_manager if run_state else None,
                 )
+                fixer_model = (
+                    (active_models.get("summarizer") or {}).get("model")
+                    or (active_models.get("router") or {}).get("model")
+                    or (active_models.get("orch") or {}).get("model")
+                    or ""
+                )
+                parsed = await safe_json_parse(
+                    facts_raw,
+                    lm_client,
+                    fixer_model,
+                    run_state=run_state,
+                    model_manager=run_state.model_manager if run_state else None,
+                )
+                if isinstance(parsed, dict):
+                    notes = parsed.get("memory_notes") or parsed.get("facts") or parsed.get("candidate_memory") or []
+                    if isinstance(notes, list):
+                        facts = [str(note).strip() for note in notes if str(note).strip()]
+                    elif isinstance(notes, str) and notes.strip():
+                        facts = [notes.strip()]
             except Exception:
-                summary_text = (final_answer or question)[:400]
-            mem_id = await db.add_memory_item(
-                kind="summary",
-                title=f"Chat summary: {question[:60]}",
-                content=summary_text,
-                tags=[router_decision.reasoning_level, "summary"],
-                pinned=False,
-                relevance_score=0.9,
-            )
-            await db.link_memory_to_run(run_id, mem_id, "auto_summary")
-            await bus.emit(run_id, "memory_saved", {"count": 1})
-            queue_narration(
-                lm_client,
-                active_models,
-                run_state,
-                bus,
-                run_id,
-                question,
-                "memory_saved",
-                {"count": 1},
-            )
+                facts = []
+            if not facts:
+                fallback_fact = (final_answer or question or "").strip()
+                if fallback_fact:
+                    facts = [fallback_fact]
+            seen_facts: Set[str] = set()
+            cleaned_facts: List[str] = []
+            for fact in facts:
+                cleaned = str(fact).strip()
+                if not cleaned or cleaned in seen_facts:
+                    continue
+                seen_facts.add(cleaned)
+                if len(cleaned) > 400:
+                    cleaned = cleaned[:400].rstrip() + "..."
+                cleaned_facts.append(cleaned)
+                if len(cleaned_facts) >= 6:
+                    break
+            if cleaned_facts:
+                for fact in cleaned_facts:
+                    title = fact[:80]
+                    mem_id = await db.add_memory_item(
+                        conversation_id,
+                        kind="fact",
+                        title=title,
+                        content=fact,
+                        tags=["fact"],
+                        pinned=False,
+                        relevance_score=1.0,
+                    )
+                    await db.link_memory_to_run(run_id, mem_id, "auto_fact")
+                    existing_run_memory.append({"id": mem_id})
+                await bus.emit(run_id, "memory_saved", {"count": len(cleaned_facts)})
+                queue_narration(
+                    lm_client,
+                    active_models,
+                    run_state,
+                    bus,
+                    run_id,
+                    question,
+                    "memory_saved",
+                    {"count": len(cleaned_facts)},
+                )
         try:
             ui_note_prompt = (
                 f"Question: {question}\nAnswer: {final_answer[:320]}\n"
@@ -7995,6 +9209,7 @@ async def run_question(
                 bus=bus,
                 context="ui_note",
                 run_state=run_state,
+                model_manager=run_state.model_manager if run_state else None,
             )
             await bus.emit(run_id, "client_note", {"note": ui_note, "tier": model_tier, "route": deep_route_used})
         except Exception:
