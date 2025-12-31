@@ -62,7 +62,10 @@ class RoutingConfig(BaseModel):
 class ProfilingConfig(BaseModel):
     enabled: bool = True
     auto_profile: bool = True
+    observe_on_use: bool = True
     enforce_headroom: bool = False
+    pause_execution: bool = False
+    startup_wait_s: int = 120
     repeats: int = 1
     sample_interval_ms: int = 250
     test_timeout_s: int = 120

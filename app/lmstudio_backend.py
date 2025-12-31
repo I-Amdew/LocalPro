@@ -14,7 +14,12 @@ from .model_manager import ModelCandidate, ModelInstanceInfo, ModelBackend, Reso
 
 _DEFAULT_TIMEOUT = 60.0
 _CLI_TIMEOUT_S = 8.0
+_CLI_ESTIMATE_TIMEOUT_S = 15.0
+_CLI_LOAD_TIMEOUT_S = 120.0
+_CLI_UNLOAD_TIMEOUT_S = 30.0
+_CLI_SERVER_TIMEOUT_S = 30.0
 _VRAM_RE = re.compile(r"(\\d+(?:\\.\\d+)?)\\s*mb", re.IGNORECASE)
+_INSTANCE_SUFFIX_RE = re.compile(r"-[0-9a-f]{8}$", re.IGNORECASE)
 
 
 def _to_float(val: Any) -> Optional[float]:
@@ -29,6 +34,14 @@ def _parse_json_blob(raw: str) -> Any:
         return json.loads(raw)
     except Exception:
         return None
+
+
+def _looks_like_instance_id(model_key: str) -> bool:
+    if not model_key:
+        return False
+    if model_key.startswith("profile-"):
+        return True
+    return bool(_INSTANCE_SUFFIX_RE.search(model_key))
 
 
 class LMStudioBackend(ModelBackend):
@@ -62,7 +75,7 @@ class LMStudioBackend(ModelBackend):
             return self.cli_path
         return "lms"
 
-    async def _run_cli(self, args: List[str]) -> str:
+    async def _run_cli(self, args: List[str], timeout_s: Optional[float] = None) -> str:
         exe = self._cli_exe()
         if not exe:
             raise RuntimeError("LM Studio CLI disabled")
@@ -72,7 +85,7 @@ class LMStudioBackend(ModelBackend):
                 [exe, *args],
                 text=True,
                 stderr=subprocess.STDOUT,
-                timeout=_CLI_TIMEOUT_S,
+                timeout=timeout_s or _CLI_TIMEOUT_S,
                 encoding="utf-8",
                 errors="replace",
             )
@@ -91,7 +104,7 @@ class LMStudioBackend(ModelBackend):
             pass
         if not self._cli_exe():
             return
-        await self._run_cli(["server", "start", "--port", str(self.port)])
+        await self._run_cli(["server", "start", "--port", str(self.port)], timeout_s=_CLI_SERVER_TIMEOUT_S)
 
     async def is_server_reachable(self) -> bool:
         now = time.monotonic()
@@ -138,16 +151,17 @@ class LMStudioBackend(ModelBackend):
             resp = await self.client.get(f"{self.base_url}/models", timeout=5.0)
             if resp.status_code < 400:
                 data = resp.json()
+                allow_add = not candidates
                 for item in data.get("data", []):
                     if not isinstance(item, dict):
                         continue
                     model_key = item.get("id")
-                    if not model_key:
+                    if not model_key or _looks_like_instance_id(model_key):
                         continue
                     display = item.get("name") or model_key
                     if model_key in candidates:
                         candidates[model_key].metadata.setdefault("loaded", True)
-                    else:
+                    elif allow_add:
                         candidates[model_key] = ModelCandidate(
                             backend_id=self.id,
                             model_key=model_key,
@@ -162,6 +176,7 @@ class LMStudioBackend(ModelBackend):
         if not await self.is_server_reachable():
             return []
         instances: List[ModelInstanceInfo] = []
+        cli_instances: List[ModelInstanceInfo] = []
         if self._cli_exe():
             try:
                 raw = await self._run_cli(["ps", "--json"])
@@ -174,7 +189,7 @@ class LMStudioBackend(ModelBackend):
                     model_key = item.get("modelKey") or item.get("model_key") or item.get("model") or identifier
                     if not identifier:
                         continue
-                    instances.append(
+                    cli_instances.append(
                         ModelInstanceInfo(
                             backend_id=self.id,
                             instance_id=str(identifier),
@@ -186,9 +201,10 @@ class LMStudioBackend(ModelBackend):
                         )
                     )
             except Exception:
-                instances = []
-        if instances:
-            return instances
+                cli_instances = []
+        if cli_instances:
+            instances.extend(cli_instances)
+        seen_ids = {inst.api_identifier or inst.instance_id for inst in instances if inst}
         try:
             resp = await self.client.get(f"{self.base_url}/models", timeout=5.0)
             if resp.status_code < 400:
@@ -198,6 +214,8 @@ class LMStudioBackend(ModelBackend):
                         continue
                     model_id = item.get("id")
                     if not model_id:
+                        continue
+                    if model_id in seen_ids:
                         continue
                     instances.append(
                         ModelInstanceInfo(
@@ -209,6 +227,7 @@ class LMStudioBackend(ModelBackend):
                             status="ready",
                         )
                     )
+                    seen_ids.add(model_id)
         except Exception:
             pass
         return instances
@@ -226,7 +245,7 @@ class LMStudioBackend(ModelBackend):
         if opts.get("gpu"):
             args.extend(["--gpu", str(opts["gpu"])])
         if self._cli_exe():
-            await self._run_cli(args)
+            await self._run_cli(args, timeout_s=_CLI_LOAD_TIMEOUT_S)
         return ModelInstanceInfo(
             backend_id=self.id,
             instance_id=str(identifier),
@@ -240,7 +259,7 @@ class LMStudioBackend(ModelBackend):
     async def unload_instance(self, instance_id_or_identifier: str) -> None:
         if not self._cli_exe():
             return
-        await self._run_cli(["unload", str(instance_id_or_identifier)])
+        await self._run_cli(["unload", str(instance_id_or_identifier)], timeout_s=_CLI_UNLOAD_TIMEOUT_S)
 
     async def estimate_resources(self, model_key: str, opts: Dict[str, Any]) -> Optional[ResourceEstimate]:
         if not self._cli_exe():
@@ -251,7 +270,7 @@ class LMStudioBackend(ModelBackend):
         if opts.get("gpu"):
             args.extend(["--gpu", str(opts["gpu"])])
         try:
-            raw = await self._run_cli(args)
+            raw = await self._run_cli(args, timeout_s=_CLI_ESTIMATE_TIMEOUT_S)
         except Exception:
             return None
         payload = _parse_json_blob(raw)
@@ -277,14 +296,27 @@ class LMStudioBackend(ModelBackend):
     ) -> httpx.Response:
         resp = await self.client.post(url, json=payload, timeout=timeout)
         if resp.status_code == 400 and instance.model_key and instance.model_key != payload.get("model"):
+            should_retry = False
+            message = ""
+            code = ""
             try:
                 data = resp.json()
                 message = str((data.get("error") or {}).get("message") or "")
                 code = str((data.get("error") or {}).get("code") or "")
             except Exception:
-                message = ""
-                code = ""
+                data = None
             if "Invalid model identifier" in message or code == "model_not_found":
+                should_retry = True
+            if not should_retry:
+                text = ""
+                try:
+                    text = resp.text or ""
+                except Exception:
+                    text = ""
+                lower = text.lower()
+                if not message and (not text.strip() or "model" in lower or "identifier" in lower or "not found" in lower):
+                    should_retry = True
+            if should_retry:
                 retry_payload = dict(payload)
                 retry_payload["model"] = instance.model_key
                 resp = await self.client.post(url, json=retry_payload, timeout=timeout)

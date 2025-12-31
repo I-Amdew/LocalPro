@@ -79,7 +79,7 @@
             <button id="activityToggleBtn" class="pill-btn ghost">Thinking</button>
             <button id="memoryBtn" class="pill-btn ghost">Chat facts</button>
             <button id="mobileNewConversationBtn" class="pill-btn ghost mobile-only">New chat</button>
-            <button id="mobileOpenSettingsHint" class="pill-btn ghost mobile-only" disabled>Settings on desktop</button>
+            <button id="mobileOpenSettingsHint" class="pill-btn ghost mobile-only">Settings</button>
           </div>
         </header>
 
@@ -97,6 +97,12 @@
               <p class="label">Live thinking preview</p>
               <div id="liveTicker" class="ticker-text" title="Click to toggle thinking">Idle</div>
             </div>
+          </div>
+          <div class="runbar-row profiling-bar hidden" id="profilingStatusBar">
+            <span class="status-chip" id="profilingStatusChip">Profiling models</span>
+            <span class="meta-chip" id="profilingStatusCount">Models 0/0</span>
+            <div class="progress-bar mini"><div id="profilingStatusFill"></div></div>
+            <span class="meta-chip profile-detail" id="profilingStatusDetail"></span>
           </div>
         </section>
       </div>
@@ -247,6 +253,24 @@
             <label>Profile repeats <input id="cfgProfileRepeats" type="number" min="1"></label>
             <label>Profile max output tokens <input id="cfgProfileMaxTokens" type="number" min="32"></label>
             <label>Profile context length <input id="cfgProfileContext" type="number" min="0"></label>
+          </div>
+
+          <div class="settings-group">
+            <p class="label">Profiled models</p>
+            <div class="runbar-row startup-profile hidden" id="startupProfileSettingsRow">
+              <span class="meta-chip" id="startupProfileSettingsBadge">Startup profiling</span>
+              <div class="progress-bar mini">
+                <div id="startupProfileSettingsFill"></div>
+              </div>
+              <span class="meta-chip profile-detail" id="startupProfileSettingsDetail"></span>
+            </div>
+            <div class="panel-actions">
+              <button type="button" id="profileModelsSettingsForceBtn" class="pill-btn ghost">Re-profile models</button>
+            </div>
+            <p id="profileStatusSettings" class="status"></p>
+            <p id="profiledModelsSummary" class="status"></p>
+            <div id="profiledModelsList" class="candidate-list"></div>
+            <p class="sub">Demand shows RAM/VRAM peak and max instances from the last profile.</p>
           </div>
 
           <div class="settings-group">

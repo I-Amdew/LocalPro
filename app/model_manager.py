@@ -10,7 +10,7 @@ import aiosqlite
 
 from .capacity_planner import CapacityPlanner
 from .load_profiler import LoadProfiler, build_config_signature
-from .resource_profiles import ModelResourceProfileStore
+from .resource_profiles import PROFILE_VERSION, ModelResourceProfileStore
 from .resource_telemetry import ResourceTelemetry
 from .spawn_governor import SpawnGovernor
 
@@ -19,6 +19,9 @@ PROFILE_DEFAULT_TTL_S = 6 * 60 * 60
 PROFILE_MAX_CONCURRENT = 1
 INSTANCE_BUSY_TTL_S = 60 * 5
 INSTANCE_LOAD_TIMEOUT_S = 25
+INSTANCE_ACQUIRE_WAIT_S = 6
+INSTANCE_ACQUIRE_POLL_S = 0.25
+RESOURCE_PRESSURE_THRESHOLD = 0.9
 
 
 def utc_now() -> str:
@@ -49,6 +52,41 @@ def _safe_float(val: Any, default: float = 0.0) -> float:
         return default
 
 
+def _snapshot_ram_used(snapshot: Dict[str, Any]) -> float:
+    ram = snapshot.get("ram") or {}
+    return _safe_float(ram.get("used_bytes"), 0.0)
+
+
+def _gpu_used_map(snapshot: Dict[str, Any]) -> Dict[int, float]:
+    used: Dict[int, float] = {}
+    for gpu in snapshot.get("gpus") or []:
+        try:
+            idx = int(gpu.get("gpu_id") or 0)
+        except Exception:
+            idx = 0
+        used[idx] = _safe_float(gpu.get("vram_used_mb"), 0.0)
+    return used
+
+
+def _gpu_delta_map(after: Dict[int, float], before: Dict[int, float]) -> Dict[str, float]:
+    deltas: Dict[str, float] = {}
+    for idx, used in after.items():
+        base = before.get(idx, 0.0)
+        delta = used - base
+        if delta > 0.0:
+            deltas[str(idx)] = delta
+    return deltas
+
+
+def _merge_peak_map(existing: Dict[str, Any], observed: Dict[str, float]) -> Dict[str, float]:
+    merged: Dict[str, float] = {}
+    for key, val in (existing or {}).items():
+        merged[str(key)] = _safe_float(val, 0.0)
+    for key, val in (observed or {}).items():
+        merged[str(key)] = max(merged.get(str(key), 0.0), _safe_float(val, 0.0))
+    return merged
+
+
 def _model_size_hint(model_key: str) -> Optional[float]:
     if not model_key:
         return None
@@ -64,6 +102,10 @@ def _model_size_hint(model_key: str) -> Optional[float]:
 
 def _is_coder_key(model_key: str) -> bool:
     return "coder" in (model_key or "").lower()
+
+
+def _is_profile_key(model_key: str) -> bool:
+    return str(model_key or "").startswith("profile-")
 
 
 @dataclass
@@ -321,10 +363,26 @@ class ModelSelector:
                 return -size_hint
         return tps - (latency / 100.0)
 
+    def _resource_penalty(self, candidate: ModelCandidate) -> float:
+        profile = candidate.profile or {}
+        ram_bytes = _safe_float(profile.get("ram_instance_peak_bytes"), 0.0)
+        vram_map = profile.get("vram_instance_peak_mb_by_gpu") or {}
+        vram_peak = 0.0
+        for val in vram_map.values():
+            vram_peak = max(vram_peak, _safe_float(val, 0.0))
+        if vram_peak <= 0.0 and profile.get("vram_estimate_only_mb") is not None:
+            vram_peak = _safe_float(profile.get("vram_estimate_only_mb"), 0.0)
+        ram_gb = ram_bytes / (1024.0**3) if ram_bytes else 0.0
+        vram_gb = vram_peak / 1024.0 if vram_peak else 0.0
+        if ram_gb <= 0.0 and vram_gb <= 0.0:
+            return 0.5
+        return ram_gb + (vram_gb * 1.5)
+
     def choose_candidate(
         self,
         required_capabilities: Optional[List[str]] = None,
         objective: str = "balanced",
+        prefer_small: bool = False,
     ) -> Optional[ModelCandidate]:
         required_capabilities = required_capabilities or []
         best: Optional[Tuple[float, ModelCandidate]] = None
@@ -340,6 +398,8 @@ class ModelSelector:
                 score = cap_score + (self._quality_score(candidate) + self._latency_score(candidate)) / 2.0
             if candidate.model_key in self.prefer:
                 score += 1.5
+            if prefer_small:
+                score -= self._resource_penalty(candidate)
             if best is None or score > best[0]:
                 best = (score, candidate)
         return best[1] if best else None
@@ -350,6 +410,7 @@ class ModelSelector:
         candidates_by_key: Dict[str, ModelCandidate],
         required_capabilities: Optional[List[str]] = None,
         objective: str = "balanced",
+        prefer_small: bool = False,
     ) -> Optional[ModelInstanceInfo]:
         required_capabilities = required_capabilities or []
         best: Optional[Tuple[float, ModelInstanceInfo]] = None
@@ -372,6 +433,8 @@ class ModelSelector:
                 score += 1.5
             if inst.status == "busy":
                 score -= 1.0
+            if prefer_small:
+                score -= self._resource_penalty(candidate)
             if best is None or score > best[0]:
                 best = (score, inst)
         return best[1] if best else None
@@ -517,11 +580,36 @@ class ModelManager:
 
     async def _sync_loaded_instances(self) -> None:
         for backend_id, backend in self.backends.items():
+            reachable = True
+            check_reachable = getattr(backend, "is_server_reachable", None)
+            if callable(check_reachable):
+                try:
+                    reachable = await check_reachable()
+                except Exception:
+                    reachable = False
+            if not reachable:
+                continue
+            loaded: Optional[List[ModelInstanceInfo]] = None
             try:
                 loaded = await backend.list_loaded()
             except Exception:
-                loaded = []
+                loaded = None
+            if loaded is None:
+                continue
+            loaded_ids = {inst.instance_id for inst in loaded if inst.instance_id}
+            existing = await self.worker_pool.list_instances()
+            for inst in existing:
+                if inst.backend_id != backend_id:
+                    continue
+                if inst.instance_id not in loaded_ids:
+                    await self.worker_pool.remove(inst.instance_id)
             for instance in loaded:
+                if _is_profile_key(instance.instance_id) or _is_profile_key(instance.model_key):
+                    try:
+                        await backend.unload_instance(instance.instance_id)
+                    except Exception:
+                        pass
+                    continue
                 if not instance.instance_id:
                     instance.instance_id = f"{backend_id}:{instance.api_identifier}"
                 await self.worker_pool.add(instance)
@@ -533,6 +621,8 @@ class ModelManager:
         filtered: List[ModelCandidate] = []
         for candidate in candidates:
             model_key = candidate.model_key
+            if _is_profile_key(model_key):
+                continue
             if mode == "allowlist" and allow and model_key not in allow:
                 continue
             if mode == "denylist" and model_key in deny:
@@ -631,6 +721,213 @@ class ModelManager:
         if meta_context and "context_length" not in opts:
             opts["context_length"] = int(meta_context)
         return opts
+
+    def _observe_on_use_enabled(self) -> bool:
+        if self.profiling_config.get("enabled", True) is False:
+            return False
+        observe = self.profiling_config.get("observe_on_use")
+        return observe is not False
+
+    async def _record_usage_profile(
+        self,
+        *,
+        backend_id: str,
+        model_key: str,
+        base_snapshot: Dict[str, Any],
+        peak_snapshot: Dict[str, Any],
+        gpu_id: Optional[int] = None,
+        samples_summary: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        if not model_key or _is_profile_key(model_key):
+            return
+        try:
+            candidates = await self.get_candidates()
+            candidate = next(
+                (c for c in candidates if c.backend_id == backend_id and c.model_key == model_key),
+                None,
+            )
+            if not candidate:
+                return
+            base_ram_used = _snapshot_ram_used(base_snapshot)
+            peak_ram_used = _snapshot_ram_used(peak_snapshot)
+            ram_delta = max(peak_ram_used - base_ram_used, 0.0)
+            base_vram = _gpu_used_map(base_snapshot)
+            peak_vram = _gpu_used_map(peak_snapshot)
+            vram_deltas = _gpu_delta_map(peak_vram, base_vram)
+            if gpu_id is not None:
+                gpu_key = str(gpu_id)
+                if gpu_key in vram_deltas:
+                    vram_deltas = {gpu_key: vram_deltas[gpu_key]}
+                else:
+                    vram_deltas = {}
+            if ram_delta <= 0.0 and not vram_deltas:
+                return
+            opts = self._profile_opts(candidate)
+            config_sig = build_config_signature(candidate, opts)
+            existing = await self.resource_profile_store.get(backend_id, model_key, config_sig) or {}
+            updated = dict(existing)
+            observed_at = utc_now()
+            updated.setdefault("backend_id", backend_id)
+            updated.setdefault("model_key", model_key)
+            updated["config_signature"] = config_sig
+            updated.setdefault("profile_version", PROFILE_VERSION)
+            updated["profiled_at"] = observed_at
+            if not updated.get("status"):
+                updated["status"] = "observed"
+            updated["observed_at"] = observed_at
+            updated["observed_samples"] = _safe_int(updated.get("observed_samples"), 0) + 1
+            if samples_summary:
+                duration_ms = samples_summary.get("duration_ms")
+                if isinstance(duration_ms, (int, float)):
+                    updated["observed_duration_ms"] = int(duration_ms)
+            existing_ram = _safe_float(updated.get("ram_instance_peak_bytes"), 0.0)
+            updated["ram_instance_peak_bytes"] = max(existing_ram, ram_delta)
+            merged_vram = _merge_peak_map(updated.get("vram_instance_peak_mb_by_gpu") or {}, vram_deltas)
+            if merged_vram:
+                updated["vram_instance_peak_mb_by_gpu"] = merged_vram
+            ttl = int(self.profiling_config.get("profile_ttl_s") or self.profile_ttl_s)
+            await self.resource_profile_store.upsert(updated, ttl)
+            async with self._candidate_lock:
+                for cand in self._candidates:
+                    if cand.backend_id == backend_id and cand.model_key == model_key:
+                        self._apply_resource_profile(cand, updated)
+                        cand.updated_at = observed_at
+                        break
+        except Exception:
+            return
+
+    def profiling_active(self) -> bool:
+        if self._profiling_active > 0:
+            return True
+        if self._manual_profile_task and not self._manual_profile_task.done():
+            return True
+        for task in self._profile_tasks.values():
+            if task and not task.done():
+                return True
+        return False
+
+    async def auto_profile_status(self) -> Dict[str, Any]:
+        candidates = await self.get_candidates()
+        total = len(candidates)
+        profiling_enabled = bool(self.profiling_config.get("enabled", True))
+        auto_profile = bool(self.profiling_config.get("auto_profile", True))
+        enabled = profiling_enabled and auto_profile
+        profile_ttl = int(self.profiling_config.get("profile_ttl_s") or self.profile_ttl_s)
+        now = time.time()
+        completed = 0
+        pending = 0
+        current = None
+        candidate_keys = {(c.backend_id, c.model_key) for c in candidates}
+        running = any(
+            task
+            and not task.done()
+            and key in candidate_keys
+            for key, task in self._profile_tasks.items()
+        )
+
+        for candidate in candidates:
+            opts = self._profile_opts(candidate)
+            config_sig = build_config_signature(candidate, opts)
+            profiled_at = _parse_utc_timestamp(candidate.profile.get("resource_profiled_at"))
+            profile_sig = candidate.profile.get("resource_config_signature")
+            fresh = bool(
+                profiled_at
+                and (now - profiled_at) < profile_ttl
+                and profile_sig == config_sig
+            )
+            if fresh:
+                completed += 1
+                continue
+            pending += 1
+            key = (candidate.backend_id, candidate.model_key)
+            task = self._profile_tasks.get(key)
+            if not current and task and not task.done():
+                current = candidate.model_key
+
+        return {
+            "enabled": enabled,
+            "running": running if enabled else False,
+            "current": current if enabled else None,
+            "completed": completed,
+            "total": total,
+            "pending": pending,
+        }
+
+    async def wait_for_profiles(
+        self,
+        timeout_s: Optional[float] = None,
+        *,
+        cancel_on_timeout: bool = True,
+    ) -> None:
+        tasks = [task for task in self._profile_tasks.values() if task and not task.done()]
+        if self._manual_profile_task and not self._manual_profile_task.done():
+            tasks.append(self._manual_profile_task)
+        if not tasks:
+            return
+        if timeout_s and timeout_s > 0:
+            if cancel_on_timeout:
+                await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=timeout_s)
+            else:
+                await asyncio.wait(tasks, timeout=timeout_s)
+        else:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    def _resource_pressure(self) -> float:
+        snapshot = self.telemetry.snapshot()
+        ratios: List[float] = []
+        ram = snapshot.get("ram") or {}
+        total_ram = _safe_float(ram.get("total_bytes"))
+        used_ram = _safe_float(ram.get("used_bytes"))
+        if total_ram:
+            allowed = total_ram * (1.0 - (self.ram_headroom_pct / 100.0))
+            if allowed > 0:
+                ratios.append(used_ram / allowed)
+        for gpu in snapshot.get("gpus") or []:
+            total = _safe_float(gpu.get("vram_total_mb"))
+            used = _safe_float(gpu.get("vram_used_mb"))
+            if total:
+                allowed = total * (1.0 - (self.vram_headroom_pct / 100.0))
+                if allowed > 0:
+                    ratios.append(used / allowed)
+        return max(ratios) if ratios else 0.0
+
+    def _reservation_size_score(self, reservation: Dict[str, Any]) -> float:
+        ram_bytes = _safe_float(reservation.get("ram_bytes"), 0.0)
+        if ram_bytes <= 0.0 and reservation.get("ram_mb") is not None:
+            ram_bytes = _safe_float(reservation.get("ram_mb")) * 1024.0 * 1024.0
+        vram_mb = _safe_float(reservation.get("vram_mb"), 0.0)
+        ram_gb = ram_bytes / (1024.0**3) if ram_bytes else 0.0
+        vram_gb = vram_mb / 1024.0 if vram_mb else 0.0
+        return ram_gb + (vram_gb * 1.5)
+
+    async def _evict_idle_instance(self, exclude_model_key: Optional[str] = None) -> bool:
+        instances = await self.worker_pool.list_instances()
+        now = time.monotonic()
+        candidates = []
+        for inst in instances:
+            if inst.status == "busy":
+                continue
+            if exclude_model_key and inst.model_key == exclude_model_key:
+                continue
+            score = self._reservation_size_score(inst.resource_reservation or {})
+            idle_age = now - inst.last_used_at if inst.last_used_at else now
+            candidates.append((score, idle_age, inst))
+        if not candidates:
+            return False
+        candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        target = candidates[0][2]
+        backend = self.backends.get(target.backend_id)
+        if not backend:
+            return False
+        try:
+            await backend.unload_instance(target.instance_id)
+        except Exception:
+            return False
+        await self.worker_pool.remove(target.instance_id)
+        reservation_id = target.resource_reservation.get("reservation_id")
+        if reservation_id and self.resource_manager:
+            self.resource_manager.release(reservation_id)
+        return True
 
     async def _probe_tool_call(self, backend: ModelBackend, instance: ModelInstanceInfo) -> bool:
         if not backend.supports_tools():
@@ -746,12 +1043,14 @@ class ModelManager:
         ready_instances = await self.worker_pool.list_ready()
         if ready_instances:
             selector = ModelSelector(candidates, prefer=self.prefer)
+            prefer_small = self._resource_pressure() >= RESOURCE_PRESSURE_THRESHOLD
             candidates_by_key = {c.model_key: c for c in candidates}
             preferred = selector.choose_instance(
                 ready_instances,
                 candidates_by_key,
                 required_capabilities=["tool_use"] if self.tool_required_by_default else [],
                 objective=self.routing_objective,
+                prefer_small=prefer_small,
             )
             if preferred:
                 return preferred
@@ -760,6 +1059,7 @@ class ModelManager:
                 if candidate and candidate.metadata.get("type") not in ("embedding", "embeddings"):
                     return instance
         selector = ModelSelector(candidates, prefer=self.prefer)
+        prefer_small = self._resource_pressure() >= RESOURCE_PRESSURE_THRESHOLD
         tool_capable = [c for c in candidates if c.capabilities.get("tool_use")]
         ordered = tool_capable if tool_capable else candidates
         ordered.sort(key=lambda c: _model_size_hint(c.model_key) or 999.0)
@@ -867,12 +1167,29 @@ class ModelManager:
         backlog: int = 1,
         avoid_coder: bool = False,
     ) -> Optional[ModelInstanceInfo]:
+        if self.profiling_config.get("pause_execution") and self.profiling_active():
+            return None
         async with self._acquire_lock:
             candidates = await self.get_candidates()
             if not candidates:
                 candidates = await self.refresh()
             if not candidates:
                 return None
+            required_caps = list(required_capabilities or [])
+            if required_caps:
+                relaxed: List[str] = []
+                for cap in required_caps:
+                    supported = False
+                    for candidate in candidates:
+                        if candidate.metadata.get("type") in ("embedding", "embeddings") and cap != "embeddings":
+                            continue
+                        if candidate.capabilities.get(cap) is not False:
+                            supported = True
+                            break
+                    if supported:
+                        relaxed.append(cap)
+                required_caps = relaxed
+            prefer_small = self._resource_pressure() >= RESOURCE_PRESSURE_THRESHOLD
             candidate_sets: List[List[ModelCandidate]] = [candidates]
             if avoid_coder:
                 non_coder = [c for c in candidates if not _is_coder_key(c.model_key)]
@@ -887,8 +1204,9 @@ class ModelManager:
                 instance = selector.choose_instance(
                     ready,
                     candidates_by_key,
-                    required_capabilities=required_capabilities,
+                    required_capabilities=required_caps,
                     objective=objective or self.routing_objective,
+                    prefer_small=prefer_small,
                 )
                 if instance:
                     await self.worker_pool.mark_busy(instance.instance_id)
@@ -901,10 +1219,13 @@ class ModelManager:
                 if backend_id:
                     desired = self.autoscaler.desired_instances(backend_id, backlog, len(ready))
                     pending_candidates = list(attempt_candidates)
+                    prefer_small_load = prefer_small
                     while len(ready) < desired and pending_candidates:
                         selector = ModelSelector(pending_candidates, prefer=self.prefer)
                         candidate = selector.choose_candidate(
-                            required_capabilities=required_capabilities, objective=objective or self.routing_objective
+                            required_capabilities=required_caps,
+                            objective=objective or self.routing_objective,
+                            prefer_small=prefer_small_load,
                         )
                         if not candidate:
                             break
@@ -913,6 +1234,10 @@ class ModelManager:
                             continue
                         loaded = await self._load_instance(candidate)
                         if not loaded:
+                            pending_candidates = [c for c in pending_candidates if c.model_key != candidate.model_key]
+                            prefer_small_load = True
+                            if await self._evict_idle_instance(exclude_model_key=candidate.model_key):
+                                continue
                             break
                         ready = await self.worker_pool.list_ready()
                         ready = [inst for inst in ready if inst.model_key in candidates_by_key]
@@ -921,8 +1246,9 @@ class ModelManager:
                 instance = selector.choose_instance(
                     ready,
                     candidates_by_key,
-                    required_capabilities=required_capabilities,
+                    required_capabilities=required_caps,
                     objective=objective or self.routing_objective,
+                    prefer_small=prefer_small,
                 )
                 if instance:
                     await self.worker_pool.mark_busy(instance.instance_id)
@@ -1002,16 +1328,65 @@ class ModelManager:
             backlog=1,
             avoid_coder=avoid_coder,
         )
+        if not instance and INSTANCE_ACQUIRE_WAIT_S > 0:
+            deadline = time.monotonic() + INSTANCE_ACQUIRE_WAIT_S
+            while time.monotonic() < deadline:
+                await asyncio.sleep(INSTANCE_ACQUIRE_POLL_S)
+                instance = await self.acquire_instance(
+                    required_capabilities=required_capabilities,
+                    objective=objective,
+                    backlog=1,
+                    avoid_coder=avoid_coder,
+                )
+                if instance:
+                    break
         if not instance:
             raise RuntimeError("No suitable model instance available.")
         backend = self.backends.get(instance.backend_id)
         if not backend:
             await self.release_instance(instance.instance_id)
             raise RuntimeError("Backend unavailable.")
+        monitor_id = None
+        base_snapshot = None
+        if self._observe_on_use_enabled():
+            try:
+                base_snapshot = self.telemetry.snapshot()
+                sample_interval_ms = int(self.profiling_config.get("sample_interval_ms") or 250)
+                monitor_id = self.telemetry.monitor_start(sample_interval_ms)
+            except Exception:
+                monitor_id = None
+                base_snapshot = None
         try:
             response = await backend.call_chat_completion(instance, request)
             return response, instance
         finally:
+            peak_snapshot = None
+            samples_summary = None
+            if monitor_id:
+                try:
+                    result = self.telemetry.monitor_stop(monitor_id)
+                    peak_snapshot = result.get("peak_snapshot") or {}
+                    samples_summary = result.get("samples_summary") or {}
+                except Exception:
+                    peak_snapshot = None
+                    samples_summary = None
+            if base_snapshot and peak_snapshot:
+                gpu_id = None
+                if instance.resource_reservation and instance.resource_reservation.get("gpu_id") is not None:
+                    try:
+                        gpu_id = int(instance.resource_reservation.get("gpu_id"))
+                    except Exception:
+                        gpu_id = None
+                asyncio.create_task(
+                    self._record_usage_profile(
+                        backend_id=instance.backend_id,
+                        model_key=instance.model_key,
+                        base_snapshot=base_snapshot,
+                        peak_snapshot=peak_snapshot,
+                        gpu_id=gpu_id,
+                        samples_summary=samples_summary,
+                    )
+                )
             await self.release_instance(instance.instance_id)
 
     async def catalog(self) -> Dict[str, Any]:

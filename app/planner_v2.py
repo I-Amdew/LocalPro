@@ -38,6 +38,9 @@ async def scaffold_plan(
         "planning_mode": planning_mode,
         "reasoning_level": level,
     }
+    meta_overrides = overrides.get("metadata")
+    if isinstance(meta_overrides, dict):
+        metadata.update(meta_overrides)
     plan_id = await plan_store.create(metadata)
     steps: List[Dict[str, Any]] = []
     expand_needed = planning_mode == "extensive" or reasoning_mode == "extensive"

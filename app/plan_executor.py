@@ -1,6 +1,8 @@
 import asyncio
+import re
 import json
 import uuid
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from .artifact_store import ArtifactStore
@@ -9,6 +11,7 @@ from .plan_store import PlanStore
 from .model_manager import ModelManager, ModelInstanceInfo
 from .request_store import RequestStore
 from .resource_manager import ResourceManager
+from .tavily import TavilyClient
 
 
 class PlanExecutor:
@@ -22,6 +25,9 @@ class PlanExecutor:
         resource_manager: ResourceManager,
         state_store: ExecutorStateStore,
         model_manager: Optional[ModelManager] = None,
+        tavily_client: Optional[TavilyClient] = None,
+        bus: Optional[Any] = None,
+        run_id: Optional[str] = None,
         *,
         max_parallel: int = 4,
         page_size: int = 200,
@@ -33,13 +39,33 @@ class PlanExecutor:
         self.resource_manager = resource_manager
         self.state_store = state_store
         self.model_manager = model_manager
+        self.tavily = tavily_client
+        self._bus = bus
+        self._bus_run_id = run_id
         self.max_parallel = max(1, max_parallel)
         self.page_size = max(50, page_size)
         self.draft_token_budget = draft_token_budget
         self._paused_steps: set[str] = set()
         self._paused_by_finding: Dict[str, List[str]] = {}
+        self._resource_pressure_threshold = 0.9
+        self._plan_meta: Dict[str, Any] = {}
+        self._question = ""
+
+    async def _emit(self, event_type: str, payload: Dict[str, Any]) -> None:
+        if not self._bus or not self._bus_run_id:
+            return
+        try:
+            await self._bus.emit(self._bus_run_id, event_type, payload)
+        except Exception:
+            return
 
     async def run(self, plan_id: str, stop_event: Optional[asyncio.Event] = None) -> Dict[str, Any]:
+        plan = await self.plan_store.get(plan_id)
+        if plan:
+            metadata = plan.get("metadata") or {}
+            if isinstance(metadata, dict):
+                self._plan_meta = metadata
+                self._question = str(metadata.get("query") or metadata.get("question") or "")
         state = await self.state_store.get(plan_id)
         last_revision = int(state.get("last_revision") or 0)
         handled_findings = {str(fid) for fid in (state.get("handled_findings") or [])}
@@ -60,6 +86,12 @@ class PlanExecutor:
         async def _handle_step(step: Dict[str, Any], run_id: str, instance: Optional[ModelInstanceInfo]) -> Dict[str, Any]:
             step_id = step["step_id"]
             attempt = int(step.get("attempt") or 0) + 1
+            step_payload = {
+                "step_id": step_id,
+                "name": step.get("title") or step.get("name") or "",
+                "type": step.get("step_type") or step.get("type") or "",
+                "agent_profile": "executor",
+            }
             base_meta = dict(step.get("run_metadata") or {})
             if instance:
                 base_meta.update(
@@ -73,15 +105,18 @@ class PlanExecutor:
             else:
                 base_meta.update({"run_id": run_id})
             await self.plan_store.mark_running(plan_id, step_id, run_id, run_metadata=base_meta)
+            await self._emit("step_started", step_payload)
             try:
                 output_refs = await self._execute_step(plan_id, step, instance=instance)
                 await self.plan_store.mark_done(plan_id, step_id, output_refs)
+                await self._emit("step_completed", step_payload)
                 return {"ok": True, "step_id": step_id, "output_refs": output_refs}
             except Exception as exc:
                 await self.plan_store.mark_failed(plan_id, step_id, str(exc), retryable=True)
                 max_retries = int(step.get("max_retries") or 0)
                 if attempt < max_retries:
                     await self.plan_store.update_step(plan_id, step_id, {"status": "READY"})
+                await self._emit("step_error", {**step_payload, "message": str(exc)})
                 return {"ok": False, "step_id": step_id, "error": str(exc)}
             finally:
                 if instance and self.model_manager:
@@ -166,10 +201,13 @@ class PlanExecutor:
         return {"status": "done", "final_ref": final_ref}
 
     async def _fetch_candidates(self, plan_id: str, capacity: int) -> List[Dict[str, Any]]:
+        pressure = self._resource_pressure()
+        prefer_light = pressure >= self._resource_pressure_threshold
+        fetch_limit = min(self.page_size, max(capacity * (3 if prefer_light else 1), capacity))
         ready = await self.plan_store.list_steps(
             plan_id,
             status="READY",
-            limit=min(self.page_size, capacity),
+            limit=fetch_limit,
             fields=[
                 "step_id",
                 "title",
@@ -177,20 +215,31 @@ class PlanExecutor:
                 "step_type",
                 "status",
                 "prereq_step_ids",
+                "priority",
                 "cost_hint",
                 "max_retries",
                 "attempt",
                 "tags",
                 "run_metadata",
+                "notes",
             ],
         )
-        steps = [s for s in (ready.get("steps") or []) if s.get("step_id") not in self._paused_steps]
-        if len(steps) >= capacity:
+        steps: List[Dict[str, Any]] = []
+        needs_resolve = False
+        for step in (ready.get("steps") or []):
+            if step.get("step_id") in self._paused_steps:
+                continue
+            if self._has_unresolved_notes(step):
+                needs_resolve = True
+                await self.plan_store.update_step(plan_id, step["step_id"], {"status": "PENDING"})
+                continue
+            steps.append(step)
+        if len(steps) >= capacity and not prefer_light:
             return steps
         pending = await self.plan_store.list_steps(
             plan_id,
             status="PENDING",
-            limit=min(self.page_size, capacity - len(steps)),
+            limit=fetch_limit,
             fields=[
                 "step_id",
                 "title",
@@ -198,11 +247,13 @@ class PlanExecutor:
                 "step_type",
                 "status",
                 "prereq_step_ids",
+                "priority",
                 "cost_hint",
                 "max_retries",
                 "attempt",
                 "tags",
                 "run_metadata",
+                "notes",
             ],
         )
         pending_steps = [s for s in (pending.get("steps") or []) if s.get("step_id") not in self._paused_steps]
@@ -212,7 +263,7 @@ class PlanExecutor:
             stale = await self.plan_store.list_steps(
                 plan_id,
                 status="STALE",
-                limit=min(self.page_size, remaining),
+                limit=fetch_limit,
                 fields=[
                     "step_id",
                     "title",
@@ -220,20 +271,29 @@ class PlanExecutor:
                     "step_type",
                     "status",
                     "prereq_step_ids",
+                    "priority",
                     "cost_hint",
                     "max_retries",
                     "attempt",
                     "tags",
                     "run_metadata",
+                    "notes",
                 ],
             )
         for step in pending_steps:
+            if self._has_unresolved_notes(step):
+                needs_resolve = True
+                continue
             if not step.get("prereq_step_ids"):
                 await self.plan_store.update_step(plan_id, step["step_id"], {"status": "READY"})
                 steps.append({**step, "status": "READY"})
             else:
                 steps.append(step)
         for step in [s for s in (stale.get("steps") or []) if s.get("step_id") not in self._paused_steps]:
+            if self._has_unresolved_notes(step):
+                needs_resolve = True
+                await self.plan_store.update_step(plan_id, step["step_id"], {"status": "PENDING"})
+                continue
             if not step.get("prereq_step_ids"):
                 await self.plan_store.update_step(plan_id, step["step_id"], {"status": "READY"})
                 steps.append({**step, "status": "READY"})
@@ -244,20 +304,43 @@ class PlanExecutor:
         for step in steps:
             for prereq in step.get("prereq_step_ids") or []:
                 dependents[prereq] = dependents.get(prereq, 0) + 1
-        steps.sort(
-            key=lambda item: (
-                int(item.get("priority") or 0),
-                dependents.get(item.get("step_id"), 0),
-            ),
-            reverse=True,
-        )
+        if prefer_light:
+            def _score(item: Dict[str, Any]) -> int:
+                priority = int(item.get("priority") or 0)
+                deps = dependents.get(item.get("step_id"), 0)
+                cost = self._step_cost_score(item)
+                resolve_bonus = 5000 if needs_resolve and "phase:resolve" in (item.get("tags") or []) else 0
+                return (priority * 1000) + resolve_bonus + (deps * 10) - cost
+
+            steps.sort(key=_score, reverse=True)
+        else:
+            def _priority(item: Dict[str, Any]) -> int:
+                base = int(item.get("priority") or 0)
+                if needs_resolve and "phase:resolve" in (item.get("tags") or []):
+                    return base + 100
+                return base
+
+            steps.sort(
+                key=lambda item: (
+                    _priority(item),
+                    dependents.get(item.get("step_id"), 0),
+                ),
+                reverse=True,
+            )
         return steps[:capacity]
 
     async def _acquire_instance(self, step: Dict[str, Any]) -> Optional[ModelInstanceInfo]:
         if not self.model_manager:
             return None
+        step_kind = self._resolve_step_type(step)
+        tags = set(step.get("tags") or [])
+        if step_kind in {"VERIFIER", "PATCH_VERIFY"}:
+            return None
+        if tags.intersection({"phase:expand", "phase:resolve", "phase:draft", "phase:finalize"}):
+            return None
         cost_hint = step.get("cost_hint") or {}
         required = cost_hint.get("required_capabilities") or []
+        required = await self._resolve_required_capabilities(required)
         objective = cost_hint.get("preferred_objective") or self.model_manager.routing_objective
         if isinstance(objective, str):
             cleaned = objective.strip().lower()
@@ -275,15 +358,54 @@ class PlanExecutor:
 
     def _reservation_budgets(self, step: Dict[str, Any], instance: Optional[ModelInstanceInfo]) -> Dict[str, Any]:
         budgets = dict(step.get("cost_hint") or {})
+        if instance is None:
+            step_type = self._resolve_step_type(step)
+            tags = set(step.get("tags") or [])
+            if step_type in {"VERIFIER", "PATCH_VERIFY"} or tags.intersection(
+                {"phase:expand", "phase:resolve", "phase:draft", "phase:finalize"}
+            ):
+                return {}
         if instance and instance.resource_reservation:
             for key in ("vram_mb", "ram_mb", "ram_bytes", "cpu_pct", "gpu_id"):
                 if key in instance.resource_reservation and instance.resource_reservation[key] is not None:
                     budgets.setdefault(key, instance.resource_reservation[key])
+        if instance and not instance.resource_reservation:
+            return budgets
         if not budgets.get("vram_mb"):
             profile = self.resource_manager.model_profile(budgets.get("model_class") or "dynamic")
             budgets.setdefault("vram_mb", profile.get("vram_est"))
             budgets.setdefault("cpu_pct", profile.get("cpu_est"))
         return budgets
+
+    def _resource_pressure(self) -> float:
+        snapshot = self.resource_manager.snapshot()
+        ratios: List[float] = []
+        ram = snapshot.get("ram") or {}
+        total_ram = float(ram.get("total_bytes") or 0.0)
+        used_ram = float(ram.get("used_bytes") or 0.0)
+        if total_ram:
+            allowed = total_ram * (1.0 - (self.resource_manager.ram_headroom_pct / 100.0))
+            if allowed > 0:
+                ratios.append(used_ram / allowed)
+        for gpu in snapshot.get("gpus") or []:
+            total = float(gpu.get("vram_total_mb") or 0.0)
+            used = float(gpu.get("vram_used_mb") or 0.0)
+            if total:
+                allowed = total * (1.0 - (self.resource_manager.vram_headroom_pct / 100.0))
+                if allowed > 0:
+                    ratios.append(used / allowed)
+        return max(ratios) if ratios else 0.0
+
+    def _step_cost_score(self, step: Dict[str, Any]) -> int:
+        cost_hint = step.get("cost_hint") or {}
+        tokens = cost_hint.get("estimated_tokens")
+        try:
+            tokens_val = int(tokens)
+        except Exception:
+            tokens_val = 0
+        if tokens_val <= 0:
+            tokens_val = 1000
+        return tokens_val
 
     def _resolve_step_type(self, step: Dict[str, Any]) -> str:
         explicit = step.get("step_type")
@@ -298,11 +420,60 @@ class PlanExecutor:
             return "PATCH_VERIFY"
         return ""
 
+    async def _resolve_required_capabilities(self, required: List[str]) -> List[str]:
+        required = [str(cap) for cap in (required or []) if cap]
+        if not self.model_manager or "structured_output" not in required:
+            return required
+        try:
+            candidates = await self.model_manager.get_candidates()
+        except Exception:
+            return required
+        has_structured = any(c.capabilities.get("structured_output") for c in candidates)
+        if not has_structured:
+            return [cap for cap in required if cap != "structured_output"]
+        return required
+
+    async def _call_with_fallback(
+        self,
+        request: Dict[str, Any],
+        required_capabilities: Optional[List[str]] = None,
+        objective: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        if not self.model_manager:
+            raise RuntimeError("Model manager unavailable.")
+        required = await self._resolve_required_capabilities(required_capabilities or [])
+        cleaned_request = dict(request)
+        if "structured_output" not in required and "response_format" in cleaned_request:
+            cleaned_request.pop("response_format", None)
+        try:
+            return await self.model_manager.call(
+                required_capabilities=required,
+                objective=objective,
+                request=cleaned_request,
+            )
+        except RuntimeError as exc:
+            if "No suitable model instance available." not in str(exc) or "structured_output" not in required:
+                raise
+            fallback_required = [cap for cap in required if cap != "structured_output"]
+            fallback_request = dict(request)
+            fallback_request.pop("response_format", None)
+            return await self.model_manager.call(
+                required_capabilities=fallback_required,
+                objective=objective,
+                request=fallback_request,
+            )
+
     def _allow_fallback(self, step: Dict[str, Any]) -> bool:
         meta = step.get("run_metadata") or {}
         if meta.get("allow_fallback"):
             return True
-        return self._resolve_step_type(step) in {"VERIFIER", "REPLAN_PATCH", "PATCH_VERIFY"}
+        step_type = self._resolve_step_type(step)
+        if step_type in {"VERIFIER", "REPLAN_PATCH", "PATCH_VERIFY"}:
+            return True
+        tags = set(step.get("tags") or [])
+        if tags.intersection({"phase:expand", "phase:resolve", "phase:draft", "phase:finalize"}):
+            return True
+        return False
 
     def _coerce_str_list(self, value: Any) -> List[str]:
         if isinstance(value, list):
@@ -310,6 +481,58 @@ class PlanExecutor:
         if value is None:
             return []
         return [str(value)]
+
+    def _normalize_queries(self, value: Any) -> List[str]:
+        queries = self._coerce_str_list(value)
+        return [q.strip() for q in queries if q and str(q).strip()]
+
+    def _utc_iso(self) -> str:
+        return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+    def _sanitize_text(self, value: str) -> str:
+        if not value:
+            return value
+        replacements = {
+            "\u2013": "-",
+            "\u2014": "-",
+            "\u2019": "'",
+            "\u2018": "'",
+            "\u201c": '"',
+            "\u201d": '"',
+            "\u2026": "...",
+            "\u00a0": " ",
+        }
+        cleaned = value
+        for src, repl in replacements.items():
+            cleaned = cleaned.replace(src, repl)
+        return cleaned.encode("ascii", "ignore").decode("ascii")
+
+    def _reduce_source_text(self, text: str, limit: int = 2000) -> str:
+        if not text:
+            return text
+        if len(text) <= limit:
+            return text
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        hits: List[str] = []
+        for line in lines:
+            lowered = line.lower()
+            if any(token in lowered for token in ("golf", "country club", "club")):
+                if len(line) <= 200:
+                    hits.append(line)
+            if len(hits) >= 40:
+                break
+        if hits:
+            snippet = "\n".join(hits)
+            return snippet[:limit]
+        return text[:limit]
+
+    def _has_unresolved_notes(self, step: Dict[str, Any]) -> bool:
+        notes = step.get("notes")
+        if notes is None:
+            return False
+        if isinstance(notes, str):
+            return bool(notes.strip())
+        return True
 
     async def _auto_create_verifiers(
         self,
@@ -585,6 +808,8 @@ class PlanExecutor:
             return await self._draftbook(plan_id, step)
         if "phase:finalize" in tags:
             return await self._finalize(plan_id, step)
+        if "phase:execute" in tags:
+            return await self._execute_partition(plan_id, step, instance=instance)
         mock_output = (step.get("run_metadata") or {}).get("mock_output")
         if mock_output is not None:
             ref = await self.artifact_store.put(
@@ -926,32 +1151,192 @@ class PlanExecutor:
 
     async def _expand_partitions(self, plan_id: str, step: Dict[str, Any]) -> List[Dict[str, Any]]:
         expansion_count = int(step.get("run_metadata", {}).get("expansion_count") or 50)
+        question = self._question or str(self._plan_meta.get("query") or "")
+        needs_web = bool(self._plan_meta.get("needs_web", True))
+        tool_budget = self._plan_meta.get("tool_budget") or {}
+        search_budget = int(tool_budget.get("tavily_search", 0) or 0)
+        planning_mode = str(self._plan_meta.get("planning_mode") or "").lower()
+        reasoning_mode = str(self._plan_meta.get("reasoning_mode") or "").lower()
+        extensive = planning_mode == "extensive" or reasoning_mode == "extensive"
+        real_estate_info = self._real_estate_query_info(question)
+        if needs_web:
+            base_budget = search_budget if search_budget > 0 else 8
+            min_target = 4
+            max_target = 25
+            if extensive:
+                min_target = 8
+                max_target = 40
+            if real_estate_info:
+                min_target = max(min_target, 12)
+                max_target = max(max_target, 40)
+            budget_cap = max(min_target, min(max_target, base_budget if base_budget > 0 else max_target))
+            target_count = min(expansion_count, budget_cap)
+        else:
+            target_count = min(expansion_count, max(6, min(50, expansion_count)))
+        if target_count <= 0:
+            target_count = 0
+        max_results = int(self._plan_meta.get("max_results") or 6)
+        if max_results < 1:
+            max_results = 1
+        search_depth = str(self._plan_meta.get("search_depth") or self._plan_meta.get("search_depth_mode") or "basic")
+        if search_depth not in ("basic", "advanced"):
+            search_depth = "basic"
+        extract_depth = str(self._plan_meta.get("extract_depth") or "basic")
+        if extract_depth not in ("basic", "advanced"):
+            extract_depth = "basic"
+        discovery_queries: List[str] = []
+        discovered_developments: List[Dict[str, Any]] = []
+        partition_specs: List[Dict[str, Any]] = []
+        if real_estate_info and needs_web and target_count > 0:
+            discovery_queries = self._real_estate_discovery_queries(real_estate_info)
+            if discovery_queries:
+                discovered_developments = await self._discover_real_estate_developments(
+                    question,
+                    discovery_queries,
+                    search_depth,
+                    max_results,
+                    target_count,
+                )
+            if discovered_developments:
+                partition_specs = self._real_estate_development_specs(
+                    discovered_developments,
+                    real_estate_info,
+                    extensive,
+                )
+        if not partition_specs:
+            partition_specs = self._real_estate_partition_specs(question)
+        if not partition_specs and question and self.model_manager and target_count > 0:
+            partition_specs = await self._generate_partition_specs(question, target_count, needs_web)
+        if not partition_specs and target_count > 0:
+            partition_specs = self._fallback_partition_specs(question, target_count, needs_web)
+        if target_count > 0 and len(partition_specs) < target_count:
+            missing = target_count - len(partition_specs)
+            partition_specs.extend(self._fallback_partition_specs(question, missing, needs_web))
+        if len(partition_specs) > target_count:
+            partition_specs = partition_specs[:target_count]
+        max_queries = 1
+        if needs_web and search_budget and target_count and search_budget >= (target_count * 2):
+            max_queries = 2
+        if real_estate_info and extensive:
+            max_queries = max(max_queries, 2)
+        fallback_queries = self._build_fallback_queries(question, max(6, target_count))
         new_steps: List[Dict[str, Any]] = []
-        for idx in range(expansion_count):
+        discovery_step_id = None
+        if real_estate_info and needs_web and discovery_queries:
+            discovery_step_id = str(uuid.uuid4())
+            discovery_label = "Golf communities discovery"
+            discovery_run_metadata = {
+                "partition_label": discovery_label,
+                "queries": discovery_queries,
+                "focus": "Discover golf communities and developments.",
+                "needs_web": needs_web,
+                "max_queries": max(max_queries, min(3, len(discovery_queries))),
+                "max_results": max_results,
+                "search_depth": search_depth,
+                "extract_depth": extract_depth,
+                "topic": self._plan_meta.get("topic") or "general",
+                "time_range": self._plan_meta.get("time_range"),
+            }
+            new_steps.append(
+                {
+                    "step_id": discovery_step_id,
+                    "title": "Research golf communities list",
+                    "description": "Discover golf communities and developments in the target area.",
+                    "status": "READY",
+                    "tags": ["phase:execute", "phase:discover"],
+                    "partition_key": "discover",
+                    "priority": 6,
+                    "prereq_step_ids": [step["step_id"]],
+                    "cost_hint": {
+                        "required_capabilities": ["structured_output"],
+                        "preferred_objective": "balanced",
+                        "estimated_tokens": 500,
+                    },
+                    "run_metadata": discovery_run_metadata,
+                    "created_by": {"type": "expander", "id": step["step_id"]},
+                }
+            )
+            new_steps.append(
+                {
+                    "step_id": f"verify-{discovery_step_id}",
+                    "title": "Verify discovery",
+                    "description": "Verify discovery outputs for golf community list.",
+                    "step_type": "VERIFIER",
+                    "status": "PENDING",
+                    "tags": ["phase:verify", f"verifies:{discovery_step_id}"],
+                    "partition_key": "discover",
+                    "priority": 5,
+                    "prereq_step_ids": [discovery_step_id],
+                    "run_metadata": {"verify_step_id": discovery_step_id, "allow_fallback": True},
+                    "cost_hint": {
+                        "required_capabilities": ["structured_output"],
+                        "preferred_objective": "best_quality",
+                        "estimated_tokens": 200,
+                    },
+                    "created_by": {"type": "expander", "id": step["step_id"]},
+                }
+            )
+        for idx, spec in enumerate(partition_specs):
             exec_step_id = str(uuid.uuid4())
+            label = str(spec.get("label") or f"Partition {idx + 1}")
+            queries = self._normalize_queries(spec.get("queries"))
+            if needs_web and not queries and fallback_queries:
+                queries = [fallback_queries[idx % len(fallback_queries)]]
+            step_max_queries = int(spec.get("max_queries") or max_queries)
+            if step_max_queries < 1:
+                step_max_queries = 1
+            step_max_results = int(spec.get("max_results") or max_results)
+            if step_max_results < 1:
+                step_max_results = 1
+            step_search_depth = str(spec.get("search_depth") or search_depth)
+            if step_search_depth not in ("basic", "advanced"):
+                step_search_depth = search_depth
+            step_extract_depth = str(spec.get("extract_depth") or extract_depth)
+            if step_extract_depth not in ("basic", "advanced"):
+                step_extract_depth = extract_depth
+            run_metadata = {
+                "partition_label": label,
+                "queries": queries,
+                "focus": spec.get("focus") or label,
+                "needs_web": needs_web,
+                "max_queries": step_max_queries,
+                "max_results": step_max_results,
+                "search_depth": step_search_depth,
+                "extract_depth": step_extract_depth,
+                "topic": spec.get("topic") or self._plan_meta.get("topic") or "general",
+                "time_range": spec.get("time_range") or self._plan_meta.get("time_range"),
+            }
+            if spec.get("location"):
+                run_metadata["location"] = spec.get("location")
+            prereqs = [step["step_id"]]
+            if discovery_step_id:
+                prereqs.append(discovery_step_id)
+            title = spec.get("title") or f"Execute {label}"
+            description = spec.get("description") or f"Research partition: {label}."
             new_steps.append(
                 {
                     "step_id": exec_step_id,
-                    "title": f"Execute partition {idx + 1}",
-                    "description": f"Process partition {idx + 1}.",
+                    "title": title,
+                    "description": description,
                     "status": "READY",
                     "tags": ["phase:execute", f"partition:{idx + 1}"],
                     "partition_key": str(idx + 1),
                     "priority": 5,
-                    "prereq_step_ids": [step["step_id"]],
+                    "prereq_step_ids": prereqs,
                     "cost_hint": {
-                        "required_capabilities": [],
-                        "preferred_objective": "latency",
-                        "estimated_tokens": 200,
+                        "required_capabilities": ["structured_output"],
+                        "preferred_objective": "balanced",
+                        "estimated_tokens": 600,
                     },
+                    "run_metadata": run_metadata,
                     "created_by": {"type": "expander", "id": step["step_id"]},
                 }
             )
             new_steps.append(
                 {
                     "step_id": f"verify-{exec_step_id}",
-                    "title": f"Verify partition {idx + 1}",
-                    "description": f"Verify outputs for partition {idx + 1}.",
+                    "title": f"Verify {label}",
+                    "description": f"Verify outputs for {label}.",
                     "step_type": "VERIFIER",
                     "status": "PENDING",
                     "tags": ["phase:verify", f"verifies:{exec_step_id}"],
@@ -971,23 +1356,1041 @@ class PlanExecutor:
             await self.plan_store.add_steps(plan_id, new_steps)
         ref = await self.artifact_store.put(
             None,
-            {"created_steps": len(new_steps)},
+            {"created_steps": len(new_steps), "partitions": len(partition_specs)},
             metadata={"step_id": step["step_id"]},
             kind="json",
         )
         return [ref]
+
+    async def _generate_partition_specs(
+        self,
+        question: str,
+        target_count: int,
+        needs_web: bool,
+    ) -> List[Dict[str, Any]]:
+        if not self.model_manager or not question or target_count <= 0:
+            return []
+        topic = self._plan_meta.get("topic") or "general"
+        time_range = self._plan_meta.get("time_range")
+        guidance = (
+            "Return JSON with a partitions array. Each item must include label and 1-2 queries if web is needed. "
+            "Queries must be runnable (no placeholders like [neighborhoods]) and include Naples or Bonita Springs. "
+            "Keep queries short; do not stack every constraint into a single query."
+        )
+        prompt = {
+            "question": question,
+            "target_count": target_count,
+            "needs_web": needs_web,
+            "topic": topic,
+            "time_range": time_range,
+            "instructions": guidance,
+        }
+        schema = {
+            "name": "partition_plan",
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "partitions": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "label": {"type": "string"},
+                                "queries": {"type": "array", "items": {"type": "string"}},
+                                "topic": {"type": "string"},
+                                "time_range": {"type": "string"},
+                                "focus": {"type": "string"},
+                            },
+                            "required": ["label"],
+                            "additionalProperties": True,
+                        },
+                    }
+                },
+                "required": ["partitions"],
+                "additionalProperties": True,
+            },
+        }
+        try:
+            response = await self._call_with_fallback(
+                {
+                    "messages": [
+                        {
+                            "role": "system",
+                            "content": (
+                                "You propose research partitions. Keep it concise and use explicit search queries."
+                            ),
+                        },
+                        {"role": "user", "content": json.dumps(prompt, ensure_ascii=True)},
+                    ],
+                    "temperature": 0.2,
+                    "max_tokens": 800,
+                    "response_format": {"type": "json_schema", "json_schema": schema},
+                    "use_responses": True,
+                },
+                required_capabilities=["structured_output"],
+            )
+            content = response.get("choices", [{}])[0].get("message", {}).get("content") or ""
+            parsed = json.loads(content) if content else {}
+            partitions = parsed.get("partitions") if isinstance(parsed, dict) else None
+            if not isinstance(partitions, list):
+                return []
+            cleaned: List[Dict[str, Any]] = []
+            for item in partitions:
+                if not isinstance(item, dict):
+                    continue
+                label = str(item.get("label") or "").strip()
+                if not label:
+                    continue
+                queries = self._normalize_queries(item.get("queries"))
+                if queries:
+                    queries = [q for q in queries if "[" not in q and "]" not in q]
+                    if queries:
+                        item = dict(item)
+                        item["queries"] = queries
+                cleaned.append(item)
+            return cleaned
+        except Exception:
+            return []
+
+    def _real_estate_query_info(self, question: str) -> Optional[Dict[str, bool]]:
+        text = (question or "").lower()
+        if "golf" not in text:
+            return None
+        has_naples = "naples" in text
+        has_bonita = "bonita" in text
+        if not (has_naples or has_bonita):
+            return None
+        return {"has_naples": has_naples, "has_bonita": has_bonita}
+
+    def _real_estate_discovery_queries(self, info: Dict[str, bool]) -> List[str]:
+        queries: List[str] = []
+        if info.get("has_naples"):
+            queries.extend(
+                [
+                    "Naples FL golf communities list",
+                    "Naples FL golf country clubs list",
+                    "Naples FL golf communities new construction",
+                    "Naples FL golf community homes for sale under $1M",
+                ]
+            )
+        if info.get("has_bonita"):
+            queries.extend(
+                [
+                    "Bonita Springs FL golf communities list",
+                    "Bonita Springs FL golf country clubs list",
+                    "Bonita Springs FL golf communities new construction",
+                    "Bonita Springs FL golf community homes for sale under $1M",
+                ]
+            )
+        if info.get("has_naples") and info.get("has_bonita"):
+            queries.append("Naples Bonita Springs golf communities list")
+        deduped: List[str] = []
+        seen = set()
+        for query in queries:
+            key = query.strip().lower()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            deduped.append(query)
+        return deduped
+
+    def _normalize_development_name(self, name: str) -> str:
+        cleaned = re.sub(r"\s+", " ", name or "").strip()
+        return cleaned
+
+    def _looks_like_list_title(self, value: str) -> bool:
+        lowered = (value or "").lower()
+        list_markers = (
+            "top ",
+            "best ",
+            "list",
+            "guide",
+            "neighborhoods",
+            "communities",
+            "homes for sale",
+            "real estate",
+        )
+        if any(marker in lowered for marker in list_markers):
+            if "country club" in lowered or "golf club" in lowered or "golf & country club" in lowered:
+                return False
+            return True
+        return False
+
+    def _extract_development_names_from_text(self, text: str, limit: int) -> List[str]:
+        if not text:
+            return []
+        cleaned = re.sub(r"\s+", " ", text)
+        patterns = [
+            r"([A-Z][-A-Za-z0-9&' ]{2,}? (?:Golf|Country) Club)",
+            r"([A-Z][-A-Za-z0-9&' ]{2,}? Golf (?:&|and) Country Club)",
+            r"([A-Z][-A-Za-z0-9&' ]{2,}?)\\s+(?:golf community|golf neighborhood|golf course)s?",
+            r"(The Club at [A-Z][-A-Za-z0-9&' ]{2,})",
+        ]
+        found: List[str] = []
+        seen = set()
+        for pattern in patterns:
+            for match in re.findall(pattern, cleaned):
+                name = match[0] if isinstance(match, tuple) else match
+                name = self._normalize_development_name(name)
+                if not name or self._looks_like_list_title(name):
+                    continue
+                key = name.lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                found.append(name)
+                if len(found) >= limit:
+                    return found
+        return found
+
+    def _candidate_names_from_notes(self, text: str, limit: int) -> List[str]:
+        names: List[str] = []
+        seen = set()
+        for line in (text or "").splitlines():
+            line = line.strip()
+            if not line.lower().startswith("research "):
+                continue
+            name = line[9:].split(":", 1)[0].strip()
+            if not name or self._looks_like_list_title(name):
+                continue
+            key = name.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            names.append(name)
+            if len(names) >= limit:
+                return names
+        if names:
+            return names
+        return self._extract_development_names_from_text(text or "", limit)
+
+    def _real_estate_default_location(self, info: Dict[str, bool]) -> str:
+        has_naples = info.get("has_naples")
+        has_bonita = info.get("has_bonita")
+        if has_naples and has_bonita:
+            return "Naples Bonita Springs"
+        if has_naples:
+            return "Naples"
+        if has_bonita:
+            return "Bonita Springs"
+        return ""
+
+    def _real_estate_development_queries(
+        self, name: str, location: str, max_queries: int
+    ) -> List[str]:
+        base = f"{name} {location}".strip()
+        queries = [
+            f"{base} golf community homes for sale under $1M",
+            f"{base} single family homes villas",
+            f"{base} year built 2010 or newer",
+            f"{base} distance to beach",
+        ]
+        return queries[: max(1, max_queries)]
+
+    def _real_estate_development_specs(
+        self,
+        developments: List[Dict[str, Any]],
+        info: Dict[str, bool],
+        extensive: bool,
+    ) -> List[Dict[str, Any]]:
+        specs: List[Dict[str, Any]] = []
+        default_location = self._real_estate_default_location(info)
+        max_queries = 4 if extensive else 3
+        seen: set[str] = set()
+        for item in developments:
+            name = self._normalize_development_name(str(item.get("name") or ""))
+            if not name:
+                continue
+            key = name.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            location = str(item.get("location") or "").strip() or default_location
+            queries = self._real_estate_development_queries(name, location, max_queries)
+            specs.append(
+                {
+                    "label": name,
+                    "title": f"Research {name}",
+                    "description": (
+                        "Confirm build years (2010+), home type, price under $1M, and beach distance."
+                    ),
+                    "queries": queries,
+                    "focus": name,
+                    "location": location,
+                    "max_queries": max_queries,
+                }
+            )
+        return specs
+
+    def _guess_developments_from_sources(
+        self, sources: List[Dict[str, Any]], limit: int
+    ) -> List[Dict[str, Any]]:
+        results: List[Dict[str, Any]] = []
+        seen: set[str] = set()
+        for src in sources:
+            title = str(src.get("title") or "").strip()
+            snippet = str(src.get("snippet") or "").strip()
+            extracted = str(src.get("extracted_text") or "").strip()
+            candidates: List[str] = []
+            for text in (title, snippet, extracted):
+                if not text:
+                    continue
+                candidates.extend(self._extract_development_names_from_text(text, limit))
+            if not candidates and title and not self._looks_like_list_title(title):
+                candidates.append(title.split(" - ", 1)[0].split("|", 1)[0].strip())
+            for name in candidates:
+                normalized = self._normalize_development_name(name)
+                if not normalized or self._looks_like_list_title(normalized):
+                    continue
+                key = normalized.lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                results.append({"name": normalized, "location": ""})
+                if len(results) >= limit:
+                    return results
+        return results
+
+    async def _discover_real_estate_developments(
+        self,
+        question: str,
+        queries: List[str],
+        search_depth: str,
+        max_results: int,
+        limit: int,
+    ) -> List[Dict[str, Any]]:
+        if not self.tavily or not self.tavily.enabled:
+            return []
+        normalized_queries = self._normalize_queries(queries)
+        if not normalized_queries:
+            return []
+        sources: List[Dict[str, Any]] = []
+        for query in normalized_queries[:4]:
+            resp = await self.tavily.search(
+                query=query,
+                search_depth=search_depth,
+                max_results=max_results,
+                topic="general",
+                time_range=None,
+            )
+            if resp.get("error"):
+                continue
+            for res in resp.get("results") or []:
+                if not isinstance(res, dict):
+                    continue
+                url = str(res.get("url") or "").strip()
+                if not url:
+                    continue
+                content = res.get("content") or res.get("raw_content") or ""
+                sources.append(
+                    {
+                        "url": url,
+                        "title": res.get("title") or "",
+                        "publisher": res.get("source") or "",
+                        "date_published": res.get("published_date") or "",
+                        "snippet": str(content)[:400],
+                        "extracted_text": content,
+                    }
+                )
+        if not sources:
+            return []
+        if not self.model_manager:
+            return self._guess_developments_from_sources(sources, limit)
+        trimmed_sources: List[Dict[str, Any]] = []
+        for src in sources[:12]:
+            text = str(src.get("extracted_text") or src.get("snippet") or "")
+            text = self._reduce_source_text(text, 1600)
+            trimmed_sources.append(
+                {
+                    "url": src.get("url"),
+                    "title": src.get("title"),
+                    "snippet": src.get("snippet"),
+                    "extracted_text": text,
+                }
+            )
+        schema = {
+            "name": "development_discovery",
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "developments": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "name": {"type": "string"},
+                                "location": {"type": "string"},
+                                "notes": {"type": "string"},
+                            },
+                            "required": ["name"],
+                            "additionalProperties": True,
+                        },
+                    }
+                },
+                "required": ["developments"],
+                "additionalProperties": True,
+            },
+        }
+        prompt = {
+            "question": question,
+            "queries": normalized_queries,
+            "sources": trimmed_sources,
+            "instructions": (
+                "Extract golf communities or developments in Naples or Bonita Springs. "
+                "Return distinct names; include location if known."
+            ),
+        }
+        try:
+            response = await self._call_with_fallback(
+                {
+                    "messages": [
+                        {
+                            "role": "system",
+                            "content": "Extract a clean list of golf communities. Return JSON only.",
+                        },
+                        {"role": "user", "content": json.dumps(prompt, ensure_ascii=True)},
+                    ],
+                    "temperature": 0.2,
+                    "max_tokens": 700,
+                    "response_format": {"type": "json_schema", "json_schema": schema},
+                    "use_responses": True,
+                },
+                required_capabilities=["structured_output"],
+            )
+            content = response.get("choices", [{}])[0].get("message", {}).get("content") or ""
+            parsed = json.loads(content) if content else {}
+        except Exception:
+            return self._guess_developments_from_sources(sources, limit)
+        developments = parsed.get("developments") if isinstance(parsed, dict) else None
+        if not isinstance(developments, list):
+            return self._guess_developments_from_sources(sources, limit)
+        cleaned: List[Dict[str, Any]] = []
+        seen: set[str] = set()
+        for item in developments:
+            if not isinstance(item, dict):
+                continue
+            name = self._normalize_development_name(str(item.get("name") or ""))
+            if not name or self._looks_like_list_title(name):
+                continue
+            key = name.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            location = str(item.get("location") or "").strip()
+            cleaned.append({"name": name, "location": location})
+            if len(cleaned) >= limit:
+                break
+        if len(cleaned) < limit:
+            for guess in self._guess_developments_from_sources(sources, limit):
+                name = self._normalize_development_name(str(guess.get("name") or ""))
+                if not name or self._looks_like_list_title(name):
+                    continue
+                key = name.lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                cleaned.append({"name": name, "location": str(guess.get("location") or "").strip()})
+                if len(cleaned) >= limit:
+                    break
+        return cleaned
+
+    def _real_estate_partition_specs(self, question: str) -> List[Dict[str, Any]]:
+        text = (question or "").lower()
+        if "golf" not in text:
+            return []
+        has_naples = "naples" in text
+        has_bonita = "bonita" in text
+        if not (has_naples or has_bonita):
+            return []
+        specs: List[Dict[str, Any]] = []
+        if has_naples:
+            specs.append(
+                {
+                    "label": "Naples golf communities list",
+                    "queries": [
+                        "Naples golf communities list",
+                        "Naples golf communities real estate",
+                    ],
+                }
+            )
+            specs.append(
+                {
+                    "label": "Naples golf community homes under $1M",
+                    "queries": [
+                        "Naples golf community homes for sale under $1M",
+                        "Naples golf community villas for sale under $1M",
+                    ],
+                }
+            )
+            specs.append(
+                {
+                    "label": "Naples golf community new construction",
+                    "queries": [
+                        "Naples golf community new construction 2010",
+                        "Naples golf community year built 2010 or newer",
+                    ],
+                }
+            )
+        if has_bonita:
+            specs.append(
+                {
+                    "label": "Bonita Springs golf communities list",
+                    "queries": [
+                        "Bonita Springs golf communities list",
+                        "Bonita Springs golf communities real estate",
+                    ],
+                }
+            )
+            specs.append(
+                {
+                    "label": "Bonita Springs golf community homes under $1M",
+                    "queries": [
+                        "Bonita Springs golf community homes for sale under $1M",
+                        "Bonita Springs golf community villas for sale under $1M",
+                    ],
+                }
+            )
+            specs.append(
+                {
+                    "label": "Bonita Springs golf community new construction",
+                    "queries": [
+                        "Bonita Springs golf community new construction 2010",
+                        "Bonita Springs golf community year built 2010 or newer",
+                    ],
+                }
+            )
+        return specs
+
+    def _build_fallback_queries(self, question: str, limit: int) -> List[str]:
+        base = (question or "").strip()
+        if not base:
+            return []
+        base_lower = base.lower()
+        queries: List[str] = []
+        if "naples" in base_lower:
+            queries.extend(
+                [
+                    "Naples golf communities list",
+                    "Naples golf communities homes for sale",
+                    "Naples golf community villas for sale",
+                ]
+            )
+        if "bonita" in base_lower:
+            queries.extend(
+                [
+                    "Bonita Springs golf communities list",
+                    "Bonita Springs golf communities homes for sale",
+                    "Bonita Springs golf community villas for sale",
+                ]
+            )
+        if "golf" in base_lower:
+            queries.append("Naples Bonita Springs golf communities list")
+        hints = [
+            "list",
+            "guide",
+            "official site",
+            "2024",
+            "2025",
+            "pricing",
+            "reviews",
+            "map",
+            "neighborhoods",
+            "communities",
+        ]
+        variants = [base]
+        for hint in hints:
+            variants.append(f"{base} {hint}")
+        ordered = []
+        seen = set()
+        for item in queries + variants:
+            key = item.strip()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            ordered.append(key)
+        if limit <= 0:
+            return ordered
+        if len(ordered) >= limit:
+            return ordered[:limit]
+        extra: List[str] = []
+        idx = 0
+        while len(ordered) + len(extra) < limit:
+            extra.append(f"{base} {hints[idx % len(hints)]} details")
+            idx += 1
+        return ordered + extra
+
+    def _fallback_partition_specs(
+        self,
+        question: str,
+        target_count: int,
+        needs_web: bool,
+    ) -> List[Dict[str, Any]]:
+        specs: List[Dict[str, Any]] = []
+        queries = self._build_fallback_queries(question, max(6, target_count))
+        for idx in range(target_count):
+            label = f"Partition {idx + 1}"
+            spec: Dict[str, Any] = {"label": label}
+            if needs_web:
+                if queries:
+                    spec["queries"] = [queries[idx % len(queries)]]
+            else:
+                spec["focus"] = label
+            specs.append(spec)
+        return specs
+
+    async def _execute_partition(
+        self,
+        plan_id: str,
+        step: Dict[str, Any],
+        instance: Optional[ModelInstanceInfo] = None,
+    ) -> List[Dict[str, Any]]:
+        meta = step.get("run_metadata") or {}
+        partition_label = str(meta.get("partition_label") or step.get("title") or step.get("partition_key") or "")
+        focus = str(meta.get("focus") or partition_label or "")
+        queries = self._normalize_queries(meta.get("queries"))
+        needs_web = bool(meta.get("needs_web", self._plan_meta.get("needs_web", False)))
+        search_depth = str(meta.get("search_depth") or self._plan_meta.get("search_depth_mode") or "basic")
+        if search_depth not in ("basic", "advanced"):
+            search_depth = "basic"
+        extract_depth = str(meta.get("extract_depth") or self._plan_meta.get("extract_depth") or "basic")
+        if extract_depth not in ("basic", "advanced"):
+            extract_depth = "basic"
+        max_results = int(meta.get("max_results") or self._plan_meta.get("max_results") or 6)
+        if max_results < 1:
+            max_results = 1
+        max_results = min(max_results, 8)
+        max_queries = int(meta.get("max_queries") or 1)
+        if max_queries < 1:
+            max_queries = 1
+        topic = meta.get("topic") or self._plan_meta.get("topic") or "general"
+        time_range = meta.get("time_range") or self._plan_meta.get("time_range")
+        if needs_web and not queries and self._question:
+            queries = [self._question]
+        errors: List[str] = []
+        search_sources: List[Dict[str, Any]] = []
+        sources: List[Dict[str, Any]] = []
+        if needs_web:
+            if not self.tavily or not self.tavily.enabled:
+                errors.append("Tavily API key missing or disabled.")
+                await self._emit(
+                    "tavily_error",
+                    {"step": step.get("step_id"), "message": "Tavily API key missing or disabled."},
+                )
+            else:
+                async def _run_search(query_list: List[str]) -> None:
+                    for query in query_list:
+                        resp = await self.tavily.search(
+                            query=query,
+                            search_depth=search_depth,
+                            max_results=max_results,
+                            topic=topic,
+                            time_range=time_range,
+                        )
+                        if resp.get("error"):
+                            errors.append(f"search_error:{resp.get('error')}")
+                            await self._emit(
+                                "tavily_error",
+                                {"step": step.get("step_id"), "message": resp.get("error"), "query": query},
+                            )
+                            continue
+                        results = resp.get("results") or []
+                        await self._emit(
+                            "tavily_search",
+                            {
+                                "step": step.get("step_id"),
+                                "query": query,
+                                "result_count": len(results),
+                                "new_sources": len(results),
+                                "duplicate_sources": 0,
+                            },
+                        )
+                        for res in results:
+                            if not isinstance(res, dict):
+                                continue
+                            url = str(res.get("url") or "").strip()
+                            if not url:
+                                continue
+                            content = res.get("content") or res.get("raw_content") or ""
+                            search_sources.append(
+                                {
+                                    "url": url,
+                                    "title": res.get("title") or "",
+                                    "publisher": res.get("source") or "",
+                                    "date_published": res.get("published_date") or "",
+                                    "snippet": str(content)[:400],
+                                    "extracted_text": content,
+                                }
+                            )
+
+                await _run_search(queries[:max_queries])
+                seen_urls: set[str] = set()
+                deduped: List[Dict[str, Any]] = []
+                for src in search_sources:
+                    url = str(src.get("url") or "").strip()
+                    if not url or url in seen_urls:
+                        continue
+                    seen_urls.add(url)
+                    deduped.append(src)
+                search_sources = deduped
+                if not search_sources:
+                    fallback_queries = self._build_fallback_queries(self._question, 4)
+                    extra_queries = [q for q in fallback_queries if q not in queries][:1]
+                    if extra_queries:
+                        await _run_search(extra_queries)
+                        seen_urls.clear()
+                        deduped = []
+                        for src in search_sources:
+                            url = str(src.get("url") or "").strip()
+                            if not url or url in seen_urls:
+                                continue
+                            seen_urls.add(url)
+                            deduped.append(src)
+                        search_sources = deduped
+                else:
+                    q_lower = self._question.lower()
+                    location_keywords: List[str] = []
+                    domain_keywords: List[str] = []
+                    if "naples" in q_lower:
+                        location_keywords.append("naples")
+                    if "bonita" in q_lower:
+                        location_keywords.append("bonita")
+                    if "golf" in q_lower:
+                        domain_keywords.append("golf")
+                    relevant = 0
+                    for src in search_sources:
+                        text = f"{src.get('url','')} {src.get('title','')} {src.get('snippet','')}".lower()
+                        has_location = not location_keywords or any(k in text for k in location_keywords)
+                        has_domain = not domain_keywords or any(k in text for k in domain_keywords)
+                        if has_location and has_domain:
+                            relevant += 1
+                    if relevant == 0:
+                        fallback_queries = self._build_fallback_queries(self._question, 4)
+                        extra_queries = [q for q in fallback_queries if q not in queries][:1]
+                        if extra_queries:
+                            await _run_search(extra_queries)
+                            seen_urls.clear()
+                            deduped = []
+                            for src in search_sources:
+                                url = str(src.get("url") or "").strip()
+                                if not url or url in seen_urls:
+                                    continue
+                                seen_urls.add(url)
+                            deduped.append(src)
+                        search_sources = deduped
+                if search_sources:
+                    for src in search_sources[:3]:
+                        await self._emit(
+                            "source_found",
+                            {
+                                "step": step.get("step_id"),
+                                "title": src.get("title") or "",
+                                "publisher": src.get("publisher") or "",
+                                "url": src.get("url") or "",
+                            },
+                        )
+                sources = list(search_sources)
+                urls = [s.get("url") for s in search_sources if s.get("url")]
+                if urls:
+                    extract_budget = int((self._plan_meta.get("tool_budget") or {}).get("tavily_extract", 0) or 0)
+                    max_extracts = int(meta.get("max_extracts") or 0)
+                    if max_extracts <= 0:
+                        max_extracts = min(len(urls), max(2, min(extract_budget or max_results, max_results)))
+                    url_slice = urls[:max_extracts]
+                    await self._emit(
+                        "tavily_extract",
+                        {"step": step.get("step_id"), "urls": url_slice},
+                    )
+                    extract_resp = await self.tavily.extract(url_slice, extract_depth=extract_depth)
+                    if extract_resp.get("error"):
+                        errors.append(f"extract_error:{extract_resp.get('error')}")
+                        await self._emit(
+                            "tavily_error",
+                            {"step": step.get("step_id"), "message": extract_resp.get("error")},
+                        )
+                    else:
+                        extracted: List[Dict[str, Any]] = []
+                        for res in extract_resp.get("results") or []:
+                            if not isinstance(res, dict):
+                                continue
+                            url = str(res.get("url") or "").strip()
+                            if not url:
+                                continue
+                            content = res.get("content") or res.get("raw_content") or ""
+                            extracted.append(
+                                {
+                                    "url": url,
+                                    "title": res.get("title") or "",
+                                    "publisher": res.get("source") or "",
+                                    "date_published": res.get("published_date") or "",
+                                    "snippet": str(content)[:400],
+                                    "extracted_text": content,
+                                }
+                            )
+                        if extracted:
+                            sources = extracted
+        analysis: Dict[str, Any] = {"summary": "", "candidates": [], "gaps": []}
+        if self.model_manager:
+            trimmed_sources: List[Dict[str, Any]] = []
+            for src in sources[:12]:
+                text = str(src.get("extracted_text") or src.get("snippet") or "")
+                text = self._reduce_source_text(text, 2000)
+                trimmed_sources.append(
+                    {
+                        "url": src.get("url"),
+                        "title": src.get("title"),
+                        "snippet": src.get("snippet"),
+                        "extracted_text": text,
+                    }
+                )
+            schema = {
+                "name": "partition_analysis",
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "summary": {"type": "string"},
+                        "candidates": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "name": {"type": "string"},
+                                    "notes": {"type": "string"},
+                                    "meets_criteria": {"type": "boolean"},
+                                    "evidence_urls": {"type": "array", "items": {"type": "string"}},
+                                },
+                                "required": ["name"],
+                                "additionalProperties": True,
+                            },
+                        },
+                        "gaps": {"type": "array", "items": {"type": "string"}},
+                    },
+                    "required": ["summary", "candidates", "gaps"],
+                    "additionalProperties": True,
+                },
+            }
+            prompt = {
+                "question": self._question,
+                "partition": partition_label,
+                "focus": focus,
+                "queries": queries,
+                "sources": trimmed_sources,
+                "notes": (
+                    "List any named communities or neighborhoods mentioned in the sources. "
+                    "If criteria are missing, set meets_criteria=false and note what is missing."
+                ),
+            }
+            request = {
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": (
+                            "Summarize sources and extract candidate communities. "
+                            "Return JSON only; do not leave candidates empty if names are present."
+                        ),
+                    },
+                    {"role": "user", "content": json.dumps(prompt, ensure_ascii=True)},
+                ],
+                "temperature": 0.2,
+                "max_tokens": 700,
+                "response_format": {"type": "json_schema", "json_schema": schema},
+                "use_responses": True,
+            }
+            required = await self._resolve_required_capabilities(["structured_output"])
+            if "structured_output" not in required:
+                request.pop("response_format", None)
+            try:
+                if instance:
+                    response = await self.model_manager.backends[instance.backend_id].call_chat_completion(
+                        instance,
+                        request,
+                    )
+                else:
+                    response = await self._call_with_fallback(
+                        request,
+                        required_capabilities=required,
+                    )
+                content = response.get("choices", [{}])[0].get("message", {}).get("content") or ""
+                parsed = None
+                if content:
+                    try:
+                        parsed = json.loads(content)
+                    except Exception:
+                        parsed = None
+                if isinstance(parsed, dict):
+                    analysis.update(parsed)
+                elif content:
+                    analysis["summary"] = content.strip()
+            except Exception as exc:
+                analysis["gaps"].append(f"analysis_error:{exc}")
+        else:
+            if needs_web and not sources:
+                analysis["gaps"].append("No sources available for this partition.")
+            analysis["summary"] = f"Partition {partition_label} complete."
+        if not analysis.get("summary"):
+            analysis["summary"] = f"Partition {partition_label} complete."
+        if not analysis.get("candidates"):
+            guesses = self._guess_developments_from_sources(sources, 6)
+            if guesses:
+                analysis["candidates"] = [
+                    {
+                        "name": item.get("name") or "",
+                        "notes": (item.get("location") or "Needs verification").strip() or "Needs verification",
+                        "meets_criteria": False,
+                    }
+                    for item in guesses
+                    if item.get("name")
+                ]
+        payload = {
+            "partition": partition_label,
+            "focus": focus,
+            "queries": queries,
+            "sources": sources,
+            "analysis": analysis,
+            "errors": errors,
+            "timestamp_utc": self._utc_iso(),
+        }
+        ref = await self.artifact_store.put(
+            None,
+            payload,
+            metadata={"step_id": step["step_id"], "partition": partition_label},
+            kind="json",
+        )
+        await self._maybe_raise_worker_finding(plan_id, step, [ref])
+        return [ref]
+
+    def _format_partition_note(self, payload: Any, title: str) -> str:
+        if payload is None:
+            return ""
+        summary = ""
+        candidates: List[Any] = []
+        gaps: List[Any] = []
+        if isinstance(payload, dict):
+            analysis = payload.get("analysis") if isinstance(payload.get("analysis"), dict) else {}
+            summary = str(analysis.get("summary") or payload.get("summary") or "").strip()
+            candidates = analysis.get("candidates") or payload.get("candidates") or []
+            gaps = analysis.get("gaps") or payload.get("gaps") or []
+        else:
+            summary = str(payload).strip()
+        lines: List[str] = []
+        header = title
+        if summary:
+            header = f"{title}: {summary}"
+        lines.append(header)
+        if isinstance(candidates, list) and candidates:
+            for candidate in candidates[:5]:
+                if isinstance(candidate, dict):
+                    name = str(candidate.get("name") or "").strip()
+                    notes = str(candidate.get("notes") or "").strip()
+                    meets = candidate.get("meets_criteria")
+                    parts = [p for p in [name, notes] if p]
+                    if meets is True:
+                        parts.append("meets_criteria")
+                    elif meets is False:
+                        parts.append("borderline")
+                    line = " - " + ": ".join(parts) if parts else ""
+                else:
+                    line = " - " + str(candidate)
+                if line.strip():
+                    lines.append(line)
+        if isinstance(gaps, list) and gaps:
+            gap_text = "; ".join([str(g) for g in gaps[:3] if g])
+            if gap_text:
+                lines.append(f"Gaps: {gap_text}")
+        return "\n".join(lines).strip()
 
     async def _draftbook(self, plan_id: str, step: Dict[str, Any]) -> List[Dict[str, Any]]:
         prereq_ids = step.get("prereq_step_ids") or []
         step_rows = await self.plan_store.get_steps(
             plan_id,
             prereq_ids,
-            fields=["step_id", "output_refs"],
+            fields=["step_id", "output_refs", "title"],
         )
-        refs: List[Dict[str, Any]] = []
+        notes: List[str] = []
         for row in step_rows.get("steps") or []:
-            refs.extend(row.get("output_refs") or [])
-        draft_ref = await self.artifact_store.summarize(refs, self.draft_token_budget)
+            title = str(row.get("title") or row.get("step_id") or "")
+            for ref in row.get("output_refs") or []:
+                payload = await self.artifact_store.get(ref.get("ref_id"))
+                note = self._format_partition_note(payload, title)
+                if note:
+                    notes.append(note)
+        max_chars = max(500, self.draft_token_budget * 4)
+        packed: List[str] = []
+        total = 0
+        for note in notes:
+            if total + len(note) > max_chars:
+                break
+            packed.append(note)
+            total += len(note) + 1
+        packed_text = "\n\n".join(packed)
+        if self.model_manager:
+            schema = {
+                "name": "draftbook",
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "draft": {"type": "string"},
+                        "candidates": {"type": "array", "items": {"type": "string"}},
+                        "key_points": {"type": "array", "items": {"type": "string"}},
+                        "gaps": {"type": "array", "items": {"type": "string"}},
+                    },
+                    "required": ["draft", "candidates", "key_points", "gaps"],
+                    "additionalProperties": True,
+                },
+            }
+            prompt = {
+                "question": self._question,
+                "partition_notes": packed_text,
+                "instructions": (
+                    "Summarize partition notes into a draft answer and key points. "
+                    "List candidate communities mentioned, even if criteria are not confirmed."
+                ),
+            }
+            try:
+                response = await self._call_with_fallback(
+                    request={
+                        "messages": [
+                            {"role": "system", "content": "Create a draftbook from the notes. Return JSON only."},
+                            {"role": "user", "content": json.dumps(prompt, ensure_ascii=True)},
+                        ],
+                        "temperature": 0.2,
+                        "max_tokens": 900,
+                        "response_format": {"type": "json_schema", "json_schema": schema},
+                        "use_responses": True,
+                    },
+                    required_capabilities=["structured_output"],
+                )
+                content = response.get("choices", [{}])[0].get("message", {}).get("content") or ""
+                parsed = None
+                if content:
+                    try:
+                        parsed = json.loads(content)
+                    except Exception:
+                        parsed = None
+                if isinstance(parsed, dict):
+                    draft_ref = await self.artifact_store.put(
+                        None,
+                        parsed,
+                        metadata={"step_id": step["step_id"]},
+                        kind="json",
+                    )
+                    return [draft_ref]
+                if content:
+                    packed_text = content.strip()
+            except Exception:
+                pass
+        draft_text = packed_text or "Draftbook incomplete."
+        fallback_candidates = self._candidate_names_from_notes(packed_text, 12) if packed_text else []
+        draft_ref = await self.artifact_store.put(
+            None,
+            {
+                "draft": draft_text,
+                "candidates": fallback_candidates,
+                "key_points": [],
+                "gaps": ["draftbook_unstructured"] if fallback_candidates else [],
+            },
+            metadata={"step_id": step["step_id"]},
+            kind="json",
+        )
         return [draft_ref]
 
     async def _finalize(self, plan_id: str, step: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -996,11 +2399,52 @@ class PlanExecutor:
         refs: List[Dict[str, Any]] = []
         for row in step_rows.get("steps") or []:
             refs.extend(row.get("output_refs") or [])
+        draft_payload: Any = None
         if refs:
-            content = await self.artifact_store.get(refs[0]["ref_id"])
-            final_text = content if isinstance(content, str) else str(content)
+            draft_payload = await self.artifact_store.get(refs[0]["ref_id"])
+        draft_text = ""
+        candidate_text = ""
+        if isinstance(draft_payload, dict):
+            draft_text = str(draft_payload.get("draft") or json.dumps(draft_payload, ensure_ascii=True))
+            candidates = draft_payload.get("candidates") or []
+            if isinstance(candidates, list) and candidates:
+                candidate_text = "\n".join([f"- {c}" for c in candidates if c])
+        elif isinstance(draft_payload, str):
+            draft_text = draft_payload
+        if self.model_manager and draft_text:
+            prompt = f"Question: {self._question}\n\nDraftbook:\n{draft_text}\n\n"
+            if candidate_text:
+                prompt += f"Candidate communities:\n{candidate_text}\n\n"
+            prompt += (
+                "Write the final answer. Include a concise candidate list with caveats and "
+                "note which criteria are unverified if evidence is missing."
+            )
+            try:
+                response = await self.model_manager.call(
+                    required_capabilities=[],
+                    request={
+                        "messages": [
+                            {
+                                "role": "system",
+                                "content": (
+                                    "You finalize the response. Return plain text only and include "
+                                    "candidate communities with brief caveats."
+                                ),
+                            },
+                            {"role": "user", "content": prompt},
+                        ],
+                        "temperature": 0.2,
+                        "max_tokens": 900,
+                        "use_responses": True,
+                    },
+                )
+                final_text = response.get("choices", [{}])[0].get("message", {}).get("content") or ""
+                final_text = final_text.strip() or draft_text
+            except Exception:
+                final_text = draft_text
         else:
-            final_text = "Final synthesis complete."
+            final_text = draft_text or "Final synthesis complete."
+        final_text = self._sanitize_text(final_text)
         ref = await self.artifact_store.put(
             None, final_text, metadata={"step_id": step["step_id"]}, kind="text"
         )

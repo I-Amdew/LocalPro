@@ -15,7 +15,7 @@ from .db import Database
 from .llm import LMStudioClient
 from .lmstudio_backend import LMStudioBackend
 from .model_manager import Autoscaler, ModelManager
-from .orchestrator import EventBus, new_run_id, run_question
+from .orchestrator import EventBus, compute_pool_budget, new_run_id, run_question
 from .schemas import ControlCommand, StartRunRequest
 from .tavily import TavilyClient
 from .resource_manager import ResourceManager
@@ -195,16 +195,14 @@ async def refresh_model_check(settings_obj: AppSettings, model_manager: ModelMan
     instances = catalog.get("instances") or []
     ready = [inst for inst in instances if inst.get("status") != "busy"]
     ready_variants = {inst.get("model_key") for inst in ready if inst.get("model_key")}
+    candidate_count = len(catalog.get("candidates") or [])
+    worker_budget = compute_pool_budget(resources, "pro", len(ready), candidate_count)
+    worker_budget["ready_workers"] = len(ready)
+    worker_budget["ready_variants"] = len(ready_variants)
     return {
         "catalog": catalog,
         "resources": resources,
-        "worker_slots": {
-            "max_parallel": max(1, len(ready)) if instances else 1,
-            "ready_workers": len(ready),
-            "ready_variants": len(ready_variants),
-            "configured": len(catalog.get("candidates") or []),
-            "variants": len(ready_variants),
-        },
+        "worker_slots": worker_budget,
     }
 
 
@@ -358,8 +356,9 @@ async def get_settings_route(
     settings: AppSettings = Depends(get_settings),
     model_manager: ModelManager = Depends(get_model_manager),
     model_check: Dict[str, Any] = Depends(get_model_check),
+    refresh: bool = False,
 ):
-    if not model_check:
+    if refresh or not model_check:
         request.app.state.model_check = await refresh_model_check(settings, model_manager)
     return {"settings": settings.to_safe_dict(), "model_check": request.app.state.model_check}
 
@@ -478,7 +477,8 @@ async def profile_models(
 async def profile_status(
     model_manager: ModelManager = Depends(get_model_manager),
 ):
-    return {"status": model_manager.profile_status()}
+    auto_status = await model_manager.auto_profile_status()
+    return {"status": model_manager.profile_status(), "auto": auto_status}
 
 
 @router.post("/api/run")
@@ -946,18 +946,29 @@ def create_app(
         await app.state.db.init()
         await app.state.db.save_config(app.state.settings.model_dump())
         app.state.upload_dir.mkdir(parents=True, exist_ok=True)
-        async def _refresh_model_check() -> None:
-            try:
-                app.state.model_check = await refresh_model_check(app.state.settings, app.state.model_manager)
-            except Exception:
-                app.state.model_check = {}
-
-        refresh_task = asyncio.create_task(_refresh_model_check())
+        try:
+            app.state.model_check = await refresh_model_check(app.state.settings, app.state.model_manager)
+            if (
+                app.state.model_manager.profiling_config.get("pause_execution")
+                and app.state.model_manager.profiling_active()
+            ):
+                startup_wait_s = float(
+                    app.state.model_manager.profiling_config.get("startup_wait_s") or 0.0
+                )
+                if startup_wait_s > 0:
+                    await app.state.model_manager.wait_for_profiles(
+                        timeout_s=startup_wait_s,
+                        cancel_on_timeout=False,
+                    )
+                    if not app.state.model_manager.profiling_active():
+                        app.state.model_check = await refresh_model_check(
+                            app.state.settings, app.state.model_manager
+                        )
+        except Exception:
+            app.state.model_check = {}
         try:
             yield
         finally:
-            if not refresh_task.done():
-                refresh_task.cancel()
             await app.state.lm_client.close()
             await app.state.tavily_client.close()
             await close_backends(app.state.model_manager)

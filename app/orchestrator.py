@@ -4,6 +4,7 @@ import base64
 import csv
 import io
 import json
+import logging
 import math
 import operator
 import os
@@ -38,6 +39,8 @@ from .schemas import (
 )
 from .plan_runner import run_plan_pipeline
 from .tavily import TavilyClient
+
+logger = logging.getLogger("uvicorn.error")
 from .system_info import get_resource_snapshot
 
 
@@ -531,6 +534,8 @@ async def emit_narration(
         "Focus on what you are doing or just learned, not internal mechanics. "
         "Use present tense, roughly 6-16 words. "
         "Avoid internal jargon (worker slots, step ids, allocators, tool names). "
+        "Avoid stock phrases like 'Kicking things off' or 'Route picked'. "
+        "Do not repeat the full user question or any recent line. "
         "If there is no user-facing update, return an empty string. "
         "Light label prefixes like \"Goal:\" or \"Plan:\" are OK when they fit. "
         "If a source or claim is provided, mention the source title or publisher. "
@@ -665,6 +670,101 @@ def make_dev_trace_cb(bus: "EventBus", run_id: str) -> Callable[[str, Optional[d
     return _cb
 
 
+def _plan_coerce_int(value: Any) -> int:
+    try:
+        return int(value)
+    except Exception:
+        return 0
+
+
+def _summarize_plan_event(event_type: str, payload: dict) -> Optional[str]:
+    if event_type in ("plan_created", "plan_updated"):
+        steps = payload.get("expected_total_steps") or payload.get("steps")
+        passes = payload.get("expected_passes")
+        return f"{event_type}: steps={steps} passes={passes}" if steps else f"{event_type}"
+    return None
+
+
+def _resolve_lmstudio_log_path() -> Optional[Path]:
+    for key in ("LM_STUDIO_LOG_PATH", "LMSTUDIO_LOG_PATH"):
+        env_path = os.getenv(key)
+        if env_path:
+            return Path(env_path)
+    appdata = os.getenv("APPDATA")
+    if appdata:
+        candidate = Path(appdata) / "LM Studio" / "logs" / "main.log"
+        if candidate.exists():
+            return candidate
+    if os.name == "nt":
+        candidate = Path.home() / "AppData" / "Roaming" / "LM Studio" / "logs" / "main.log"
+        if candidate.exists():
+            return candidate
+    candidate = Path.home() / "Library" / "Logs" / "LM Studio" / "main.log"
+    if candidate.exists():
+        return candidate
+    candidate = Path.home() / ".local" / "share" / "LM Studio" / "logs" / "main.log"
+    if candidate.exists():
+        return candidate
+    return None
+
+
+def _read_tail_lines(path: Path, max_bytes: int = 65536, max_lines: int = 25) -> List[str]:
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return []
+    offset = max(size - max_bytes, 0)
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as handle:
+            handle.seek(offset)
+            data = handle.read()
+    except OSError:
+        return []
+    lines = [line.strip() for line in data.splitlines() if line.strip()]
+    return lines[-max_lines:]
+
+
+async def tail_lmstudio_log(
+    run_id: str,
+    stop_events: Optional[List[asyncio.Event]] = None,
+    poll_interval_s: float = 3.0,
+) -> None:
+    path = _resolve_lmstudio_log_path()
+    if not path:
+        logger.warning("LM Studio log path not found; set LM_STUDIO_LOG_PATH to enable tailing.")
+        return
+    stop_events = stop_events or []
+    last_pos: Optional[int] = None
+    try:
+        initial_lines = _read_tail_lines(path)
+        for line in initial_lines:
+            logger.info("LMStudio[%s] %s", run_id, line)
+        last_pos = path.stat().st_size
+    except OSError:
+        last_pos = 0
+    while True:
+        if any(evt.is_set() for evt in stop_events if evt):
+            return
+        try:
+            size = path.stat().st_size
+            if last_pos is None or size < last_pos:
+                last_pos = 0
+            with path.open("r", encoding="utf-8", errors="replace") as handle:
+                handle.seek(last_pos or 0)
+                chunk = handle.read()
+                last_pos = handle.tell()
+            for line in chunk.splitlines():
+                trimmed = line.strip()
+                if trimmed:
+                    logger.info("LMStudio[%s] %s", run_id, trimmed[:800])
+        except FileNotFoundError:
+            logger.warning("LM Studio log not found at %s", path)
+            return
+        except Exception as exc:
+            logger.warning("LM Studio log tail failed: %s", exc)
+        await asyncio.sleep(poll_interval_s)
+
+
 class EventBus:
     """In-memory fan-out for SSE plus persisted events."""
 
@@ -685,6 +785,11 @@ class EventBus:
         if "conversation_id" not in safe_payload and run_id in self.run_conversations:
             safe_payload["conversation_id"] = self.run_conversations[run_id]
         stored = await self.db.add_event(run_id, event_type, safe_payload)
+        summary = _summarize_plan_event(event_type, safe_payload)
+        if event_type.startswith("plan_") and event_type != "plan_overview" and not summary:
+            summary = event_type
+        if summary:
+            logger.info("Run %s %s", run_id, summary)
         async with self.lock:
             queues = list(self.subscribers.get(run_id, []))
             global_queues = list(self.global_subscribers)
@@ -4197,6 +4302,12 @@ async def call_router(
             "expected_passes": expected_passes,
             "stop_conditions": {},
         }
+    topic = parsed.get("topic")
+    if isinstance(topic, str):
+        cleaned = topic.strip().lower()
+        parsed["topic"] = cleaned if cleaned in ALLOWED_TOPICS else "general"
+    else:
+        parsed["topic"] = "general"
     decision = RouterDecision(**parsed)
     if manual_level is not None:
         decision.reasoning_level = manual_level
@@ -4745,10 +4856,9 @@ async def warm_worker_pool(
     if max_workers <= 0:
         return
     if model_manager:
-        for _ in range(max_workers):
-            instance = await model_manager.acquire_instance(required_capabilities=["tool_use"], backlog=max_workers)
-            if instance:
-                await model_manager.release_instance(instance.instance_id)
+        instance = await model_manager.acquire_instance(required_capabilities=["tool_use"], backlog=1)
+        if instance:
+            await model_manager.release_instance(instance.instance_id)
         return
     seen: Set[Tuple[str, str]] = set()
     targets: List[Tuple[str, str]] = []
@@ -7526,6 +7636,8 @@ async def run_question(
 ) -> None:
     """Main orchestration loop for a single run (now with parallel step execution)."""
     active_models: Dict[str, Dict[str, str]] = settings_models
+    lm_log_stop = asyncio.Event()
+    lm_log_task: Optional[asyncio.Task] = None
     try:
         if upload_dir is None:
             upload_dir = Path(os.getenv("UPLOAD_DIR", "uploads"))
@@ -7537,6 +7649,10 @@ async def run_question(
             {"id": user_msg.get("id"), "role": "user", "content": question, "run_id": run_id, "created_at": user_msg.get("created_at")},
         )
         await bus.emit(run_id, "run_started", {"question": question})
+        if model_manager and "lmstudio" in model_manager.backends:
+            lm_log_task = asyncio.create_task(
+                tail_lmstudio_log(run_id, stop_events=[evt for evt in (stop_event, lm_log_stop) if evt])
+            )
 
         run_state = RunState()
         run_state.question = question
@@ -7552,6 +7668,15 @@ async def run_question(
                 "Discovering available local models.",
             )
             await model_manager.refresh()
+            if model_manager.profiling_config.get("pause_execution") and model_manager.profiling_active():
+                await maybe_emit_work_log(
+                    run_state,
+                    bus,
+                    run_id,
+                    "model_profiling",
+                    "Profiling local models (one at a time) before execution.",
+                )
+                await model_manager.wait_for_profiles()
             bootstrap_instance = await model_manager.bootstrap()
             candidates = await model_manager.get_candidates()
             if not candidates:
@@ -7899,7 +8024,22 @@ async def run_question(
             search_depth_mode = "advanced"
         if not router_decision.tool_budget:
             router_decision.tool_budget = depth_profile.get("tool_budget", {})
-        deep_route_used = deep_mode
+        if (
+            run_state.can_web
+            and router_decision.needs_web
+            and (plan_reasoning_mode == "extensive" or planning_mode == "extensive" or plan_granularity_level >= 4)
+        ):
+            min_budget = depth_profile.get("tool_budget", {})
+            if min_budget:
+                current_budget = router_decision.tool_budget or {}
+                merged_budget = dict(current_budget)
+                for key in ("tavily_search", "tavily_extract"):
+                    merged_budget[key] = max(int(current_budget.get(key, 0) or 0), int(min_budget.get(key, 0) or 0))
+                router_decision.tool_budget = merged_budget
+            router_decision.max_results = max(router_decision.max_results or 0, 8)
+            if router_decision.extract_depth == "basic":
+                router_decision.extract_depth = "advanced"
+        deep_route_used = ""
         if model_tier == "deep":
             deep_route_used = await choose_deep_route(
                 lm_client,
@@ -7946,7 +8086,6 @@ async def run_question(
             {
                 "model_tier": model_tier,
                 "requested_tier": requested_tier_original,
-                "deep_route": deep_route_used,
                 "execution_mode": execution_mode,
                 "web_available": run_state.can_web,
                 "freshness_required": run_state.freshness_required,
@@ -7955,6 +8094,8 @@ async def run_question(
                 "plan_reasoning_level": plan_granularity_level,
             }
         )
+        if model_tier == "deep" and deep_route_used:
+            decision_payload["deep_route"] = deep_route_used
         try:
             resource_snapshot = get_resource_snapshot()
         except Exception:
@@ -8121,7 +8262,8 @@ async def run_question(
         tier_note = model_tier.upper()
         if requested_tier_original != model_tier:
             tier_note = f"{requested_tier_original.upper()}->{model_tier.upper()}"
-        await bus.emit(run_id, "client_note", {"note": f"{tier_note} mode: {execution_mode} (route {deep_route_used})"})
+        route_note = f" (route {deep_route_used})" if model_tier == "deep" and deep_route_used else ""
+        await bus.emit(run_id, "client_note", {"note": f"{tier_note} mode: {execution_mode}{route_note}"})
 
         # Conversation memory retrieval (facts only within this chat).
         mem_hits = await db.search_memory(question, conversation_id=conversation_id, limit=5)
@@ -8171,6 +8313,16 @@ async def run_question(
 
         use_plan_pipeline = planning_mode == "extensive" or plan_reasoning_mode == "extensive"
         if use_plan_pipeline:
+            plan_context = {
+                "needs_web": bool(router_decision.needs_web),
+                "tool_budget": router_decision.tool_budget or {},
+                "topic": router_decision.topic or "general",
+                "max_results": router_decision.max_results,
+                "extract_depth": router_decision.extract_depth,
+                "search_depth_mode": search_depth_mode,
+                "web_available": bool(run_state.can_web),
+                "freshness_required": bool(run_state.freshness_required),
+            }
             plan_result = await run_plan_pipeline(
                 db_path=db.path,
                 question=question,
@@ -8182,7 +8334,9 @@ async def run_question(
                 vram_headroom_pct=vram_headroom_pct,
                 max_concurrent_runs=max_concurrent_runs,
                 per_model_class_limits=per_model_class_limits or {},
+                plan_context=plan_context,
                 model_manager=model_manager,
+                tavily_client=tavily,
                 bus=bus,
                 run_id=run_id,
             )
@@ -8274,7 +8428,8 @@ async def run_question(
         step_plan = trim_step_plan(step_plan, max_steps)
         step_plan.global_constraints.setdefault("expected_passes", router_decision.expected_passes)
         step_plan.global_constraints.setdefault("model_tier", model_tier)
-        step_plan.global_constraints.setdefault("route", deep_route_used)
+        if deep_route_used:
+            step_plan.global_constraints.setdefault("route", deep_route_used)
         progress_meta = compute_progress_meta(step_plan, step_plan.global_constraints.get("expected_passes", 1))
         default_response_guidance = response_guidance_text(question, router_decision.reasoning_level, progress_meta)
         step_plan.global_constraints.setdefault("response_guidance", default_response_guidance)
@@ -9193,9 +9348,10 @@ async def run_question(
                     {"count": len(cleaned_facts)},
                 )
         try:
+            route_label = f", Route: {deep_route_used}" if deep_route_used else ""
             ui_note_prompt = (
                 f"Question: {question}\nAnswer: {final_answer[:320]}\n"
-                f"Tier: {model_tier}, Route: {deep_route_used}, Confidence: {confidence}\n"
+                f"Tier: {model_tier}{route_label}, Confidence: {confidence}\n"
                 "Summarize in one short status line for the UI ticker."
             )
             ui_note = await run_worker(
@@ -9211,7 +9367,10 @@ async def run_question(
                 run_state=run_state,
                 model_manager=run_state.model_manager if run_state else None,
             )
-            await bus.emit(run_id, "client_note", {"note": ui_note, "tier": model_tier, "route": deep_route_used})
+            note_payload = {"note": ui_note, "tier": model_tier}
+            if deep_route_used:
+                note_payload["route"] = deep_route_used
+            await bus.emit(run_id, "client_note", note_payload)
         except Exception:
             pass
         archived_payload = {"run_id": run_id, "confidence": confidence}
@@ -9257,6 +9416,18 @@ async def run_question(
             error_payload,
             tone="error",
         )
+    finally:
+        if lm_log_task:
+            lm_log_stop.set()
+            try:
+                await asyncio.wait_for(lm_log_task, timeout=2.0)
+            except asyncio.TimeoutError:
+                lm_log_task.cancel()
+        if model_manager:
+            try:
+                await model_manager.unload_idle(idle_seconds=0)
+            except Exception:
+                pass
 
 
 def new_run_id() -> str:

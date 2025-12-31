@@ -7,6 +7,7 @@ let sttActive = false;
 let sttBuffer = "";
 let timerInterval = null;
 let timerStartedAt = null;
+let timerRunId = null;
 let etaTargetAt = null;
 let lastAssistantRunId = null;
 let historyLog = [];
@@ -17,6 +18,7 @@ let liveEventBuffer = [];
 let liveFlushTimer = null;
 let pendingQuestion = "";
 let questionShownInLive = false;
+let profileStatusPollTimer = null;
 let multiAgentMode = false;
 let latestRunPoll = null;
 let pendingUploads = [];
@@ -75,6 +77,7 @@ const APP_BASE_URL = (() => {
 const NARRATION_PREFIX = "";
 const EXECUTOR_AGENT_KEY = "__executor__";
 const EXECUTOR_AGENT_LABEL = "Executor";
+const DEFAULT_STEP_MS = 15000;
 function getInitialApiBase() {
   const params = new URLSearchParams(window.location.search);
   const fromQuery = params.get("api") || params.get("api_base");
@@ -334,16 +337,21 @@ function setStatus(text, tone = "idle") {
   }
 }
 
-function startTimer() {
+function startTimer(startAtMs = null, runId = null) {
   clearInterval(timerInterval);
-  timerStartedAt = Date.now();
-  el("runTimer").textContent = "00:00";
+  const startAt = Number.isFinite(startAtMs) ? startAtMs : Date.now();
+  timerStartedAt = startAt;
+  timerRunId = runId || currentRunId;
+  el("runTimer").textContent = formatTime(Date.now() - startAt);
   timerInterval = setInterval(() => {
     if (timerStartedAt) {
       el("runTimer").textContent = formatTime(Date.now() - timerStartedAt);
     }
+    updateProgressUI();
     updateEtaCountdown();
-  }, 500);
+  }, 250);
+  updateProgressUI();
+  updateEtaCountdown();
 }
 
 function stopTimer(label) {
@@ -355,6 +363,7 @@ function stopTimer(label) {
     el("runTimer").textContent = formatTime(Date.now() - timerStartedAt);
   }
   timerStartedAt = null;
+  timerRunId = null;
 }
 
 function updateEtaCountdown() {
@@ -1252,7 +1261,7 @@ function resetLiveAgentState() {
 function setExecutorActive(active) {
   const hasExecutor = activeAgentSteps.has(EXECUTOR_AGENT_KEY);
   if (active && !hasExecutor) {
-    activeAgentSteps.set(EXECUTOR_AGENT_KEY, { label: EXECUTOR_AGENT_LABEL });
+    activeAgentSteps.set(EXECUTOR_AGENT_KEY, { label: EXECUTOR_AGENT_LABEL, startedAt: Date.now() });
   } else if (!active && hasExecutor) {
     activeAgentSteps.delete(EXECUTOR_AGENT_KEY);
   } else {
@@ -1263,18 +1272,26 @@ function setExecutorActive(active) {
 
 function syncExecutorFromRun(run = {}) {
   const status = String(run.status || "").toLowerCase();
-  setExecutorActive(status === "running");
+  const running = status === "running";
+  setExecutorActive(running);
+  if (!running) return;
+  if (timerInterval && timerRunId === run.run_id) return;
+  const createdAt = Date.parse(run.created_at || "");
+  startTimer(Number.isFinite(createdAt) ? createdAt : null, run.run_id);
+}
+
+function activeAgentEntries() {
+  return Array.from(activeAgentSteps.entries()).filter(([key]) => key !== EXECUTOR_AGENT_KEY);
 }
 
 function updateLiveAgentIndicator() {
   const chip = el("liveAgentCount");
   if (!chip) return;
-  const entries = Array.from(activeAgentSteps.entries()).filter(([key]) => key !== EXECUTOR_AGENT_KEY);
+  const entries = activeAgentEntries();
   const count = entries.length;
-  const hasExecutor = activeAgentSteps.has(EXECUTOR_AGENT_KEY);
   chip.textContent = `Live agents: ${count}`;
   if (count === 0) {
-    chip.title = hasExecutor ? "Executor active" : "No active agents";
+    chip.title = "No active agents";
     return;
   }
   const labels = entries
@@ -1287,7 +1304,7 @@ function updateLiveAgentIndicator() {
 function noteAgentStepStarted(detail = {}) {
   const key = stepKeyFrom(detail);
   if (!key) return;
-  activeAgentSteps.set(key, { label: agentLabelFrom(detail) });
+  activeAgentSteps.set(key, { label: agentLabelFrom(detail), startedAt: Date.now() });
   updateLiveAgentIndicator();
 }
 
@@ -1363,15 +1380,31 @@ function scheduleLiveFlush() {
   liveFlushTimer = setTimeout(() => flushLiveEvents(), 2000);
 }
 
+function modeLabel(mode) {
+  const key = String(mode || "").toLowerCase();
+  const labels = {
+    pro_full: "full run",
+    fast_direct: "fast path",
+    deep_cluster: "deep cluster",
+    oss_team: "OSS team",
+  };
+  return labels[key] || key.replace(/_/g, " ");
+}
+
 function normalizeNote(note) {
   if (!note) return "";
-  const match = note.match(/^([A-Za-z0-9_-]+) mode: [^()]+\(route ([^)]+)\)/i);
+  const trimmed = String(note).trim();
+  const match = trimmed.match(/^([A-Za-z0-9_-]+)\s*mode:\s*([A-Za-z0-9_-]+)(?:\s*\(route ([^)]+)\))?/i);
   if (match) {
     const tier = match[1].toUpperCase();
-    const route = match[2];
-    return `Using ${tier} mode (${route} route).`;
+    const mode = modeLabel(match[2]);
+    const route = match[3];
+    let line = `Using ${tier} mode`;
+    if (mode) line += ` (${mode})`;
+    if (route) line += `, ${route} route`;
+    return `${line}.`;
   }
-  return note;
+  return trimmed;
 }
 
 const LANE_LABELS = {
@@ -1429,6 +1462,8 @@ function inferStepType(detail) {
   if (name.includes("finalize") || name.includes("final")) return "finalize";
   if (name.includes("verify") || name.includes("check")) return "verify";
   if (name.includes("analysis") || name.includes("analy")) return "analysis";
+  if (name.includes("partition")) return "partition";
+  if (name.includes("expand")) return "expand";
   return "";
 }
 
@@ -1457,6 +1492,8 @@ function stepAction(type, phase, detail = {}) {
     draft: { start: "Writing up the response", done: "Draft ready" },
     finalize: { start: "Polishing the response", done: "Final response ready" },
     verify: { start: "Giving the draft a quick check", done: "Checks done" },
+    partition: { start: "Laying out the partitions", done: "Partitions ready" },
+    expand: { start: "Expanding the plan", done: "Expansion done" },
   };
   const entry = actions[type];
   if (!entry) return "";
@@ -1698,11 +1735,29 @@ function traceUrls(detail = {}) {
   return urls;
 }
 
+function humanizeWorkLogText(text) {
+  const raw = String(text || "").trim();
+  if (!raw) return "";
+  const normalized = raw.replace(/\s+/g, " ").trim();
+  const lower = normalized.toLowerCase();
+  if (lower.startsWith("here's the ask:")) {
+    const ask = normalized.slice(normalized.indexOf(":") + 1).trim();
+    const shortened = shortenWords(ask, 18);
+    return ask ? `Goal: ${shortened}` : "Goal locked in";
+  }
+  const key = lower.replace(/[.]+$/, "");
+  const rewrites = {
+    "discovering available local models": "Checking which local models are available.",
+    "quick check on available sources": "Checking which sources are available.",
+  };
+  return rewrites[key] || normalized;
+}
+
 function traceLineForEvent(type, detail = {}) {
   const safe = detail || {};
   switch (type) {
     case "work_log": {
-      const text = String(safe.text || "").trim();
+      const text = humanizeWorkLogText(safe.text);
       if (!text) return null;
       return { text, tone: safe.tone || "info", lane: "worklog", urls: traceUrls(safe) };
     }
@@ -1717,7 +1772,7 @@ function traceLineForEvent(type, detail = {}) {
     case "run_started": {
       const question = shortenWords(String(safe.question || ""), 18);
       return {
-        text: question ? `Kicking things off: ${question}` : "Kicking things off",
+        text: question ? `Starting on: ${question}` : "Starting up",
         tone: "info",
         lane: "orch",
         urls: traceUrls(safe),
@@ -1726,26 +1781,26 @@ function traceLineForEvent(type, detail = {}) {
     case "router_decision": {
       const tier = safe.model_tier || safe.requested_tier || "";
       const level = safe.reasoning_level || "";
-      let text = "Route picked";
-      if (tier) text += `: ${tierLabel(tier)}`;
-      if (safe.deep_route) {
+      const isDeep = String(tier).toLowerCase() === "deep";
+      let text = tier ? `Using ${tierLabel(tier)}` : "Choosing a route";
+      if (isDeep && safe.deep_route) {
         text += ` (${deepRouteLabel(safe.deep_route)})`;
       } else if (level) {
-        text += ` (Plan depth: ${level})`;
+        text += ` (plan depth: ${level})`;
       }
       return { text, tone: "info", lane: "router", urls: traceUrls(safe) };
     }
     case "plan_created": {
       const steps = Number(safe.expected_total_steps || safe.steps || 0);
       const passes = Number(safe.expected_passes || 0);
-      let text = steps ? `Plan sketched: ${steps} steps` : "Plan sketched";
+      let text = steps ? `Plan outlined: ${steps} steps` : "Plan outlined";
       if (passes) text += `, ${passes} pass${passes === 1 ? "" : "es"}`;
       return { text, tone: "info", lane: "orch", urls: traceUrls(safe) };
     }
     case "plan_updated": {
       const steps = Number(safe.expected_total_steps || safe.steps || 0);
       const passes = Number(safe.expected_passes || 0);
-      let text = steps ? `Plan refreshed: ${steps} steps` : "Plan refreshed";
+      let text = steps ? `Plan updated: ${steps} steps` : "Plan updated";
       if (passes) text += `, ${passes} pass${passes === 1 ? "" : "es"}`;
       return { text, tone: "info", lane: "orch", urls: traceUrls(safe) };
     }
@@ -1841,7 +1896,7 @@ function traceLineForEvent(type, detail = {}) {
     case "memory_retrieved": {
       const count = Number(safe.count || 0);
       return {
-        text: count ? `Pulled chat facts (${count})` : "Pulled chat facts",
+        text: count ? `Loaded prior notes (${count})` : "Loaded prior notes",
         tone: "info",
         lane: "memory",
         urls: traceUrls(safe),
@@ -1850,7 +1905,7 @@ function traceLineForEvent(type, detail = {}) {
     case "memory_saved": {
       const count = Number(safe.count || 0);
       return {
-        text: count ? `Saved chat facts (${count})` : "Saved chat facts",
+        text: count ? `Saved notes (${count})` : "Saved notes",
         tone: "info",
         lane: "memory",
         urls: traceUrls(safe),
@@ -1907,9 +1962,9 @@ function narrationForEvent(ev) {
       return "Handing out tasks";
     case "memory_retrieved":
       if (Number.isFinite(Number(d.count)) && Number(d.count) > 0) {
-        return `Pulling chat facts (${Number(d.count)})`;
+        return `Loading prior notes (${Number(d.count)})`;
       }
-      return "Pulling chat facts";
+      return "Loading prior notes";
     case "memory_saved":
       if (Number.isFinite(Number(d.count)) && Number(d.count) > 0) {
         return `Saving notes (${Number(d.count)})`;
@@ -1991,7 +2046,7 @@ function summarizeLiveEvents(events) {
       const question = String(d.question || pendingQuestion || "").trim();
       if (question && !questionShownInLive) {
         usedQuestion = true;
-        pushLine(`Starting with: ${shortenWords(question, 18)}`, ev);
+        pushLine(`Starting on: ${shortenWords(question, 18)}`, ev);
         return;
       }
     }
@@ -2393,15 +2448,30 @@ function renderSourcesRow(urls = [], sourceMeta = {}) {
     }
     feed.scrollTop = feed.scrollHeight;
   }
+function historySignature(entry) {
+  if (!entry) return "";
+  const urls = Array.isArray(entry.urls) ? entry.urls.join("|") : "";
+  const media = entry.media ? JSON.stringify(entry.media) : "";
+  return `${entry.text}::${entry.lane}::${entry.tone}::${urls}::${media}`;
+}
+
 function addHistory(text, lane = "orch", urls = [], tone = "info", runId = null, media = null) {
   const trimmed = String(text || "").trim();
   if (!trimmed) return;
   const entry = { text: trimmed, lane, urls, tone, ts: Date.now(), media };
-  historyLog.push(entry);
-  if (historyLog.length > 150) historyLog.shift();
   const targetRunId = runId || currentRunId;
   if (targetRunId) {
     if (!runEvents[targetRunId]) runEvents[targetRunId] = [];
+    const runLog = runEvents[targetRunId];
+    if (runLog.length && historySignature(runLog[runLog.length - 1]) === historySignature(entry)) {
+      return;
+    }
+  } else if (historyLog.length && historySignature(historyLog[historyLog.length - 1]) === historySignature(entry)) {
+    return;
+  }
+  historyLog.push(entry);
+  if (historyLog.length > 150) historyLog.shift();
+  if (targetRunId) {
     runEvents[targetRunId].push(entry);
     if (runEvents[targetRunId].length > 200) runEvents[targetRunId].shift();
   }
@@ -2461,11 +2531,13 @@ async function requestRunStop(runId) {
   }
 }
 
-async function loadSettings() {
+async function loadSettings(opts = {}) {
   let data = null;
   syncApiBaseInput();
   try {
-    const res = await fetch(resolveEndpoint("/settings"));
+    const refresh = opts.refresh === true;
+    const endpoint = refresh ? "/settings?refresh=1" : "/settings";
+    const res = await fetch(resolveEndpoint(endpoint));
     if (!res.ok) throw new Error(`Settings ${res.status}`);
     data = await res.json();
   } catch (err) {
@@ -2551,6 +2623,7 @@ async function loadSettings() {
     modelWarning.classList.remove("hidden");
   }
   renderModelCandidates(s, latestModelCheck || {});
+  renderProfiledModelsSummary();
   // Auto-discover if models are missing and we haven't tried yet.
   const baseUrls = discoveryInput ? discoveryInput.value.split(",").map((v) => v.trim()).filter(Boolean) : [];
   if (!triedAutoDiscover && baseUrls.length && missingRoles.length) {
@@ -2725,6 +2798,105 @@ function renderModelCandidates(settings, modelCheck) {
     actions.appendChild(preferLabel);
     row.appendChild(main);
     row.appendChild(actions);
+    list.appendChild(row);
+  });
+}
+
+function renderProfiledModelsSummary() {
+  const list = el("profiledModelsList");
+  if (!list) return;
+  const summary = el("profiledModelsSummary");
+  list.innerHTML = "";
+  const candidates = Array.isArray(modelCatalog) ? modelCatalog : [];
+  if (!candidates.length) {
+    if (summary) summary.textContent = "No models discovered yet.";
+    const empty = document.createElement("div");
+    empty.className = "status";
+    empty.textContent = "No models discovered yet.";
+    list.appendChild(empty);
+    return;
+  }
+  const profiled = candidates.filter((candidate) => {
+    const profile = candidate?.profile || {};
+    return !!profile.resource_profiled_at;
+  });
+  const pending = Math.max(candidates.length - profiled.length, 0);
+  if (summary) {
+    summary.textContent = profiled.length
+      ? `Profiled ${profiled.length}/${candidates.length} models${pending ? ` (${pending} pending)` : ""}.`
+      : `No profiles yet (${pending} pending).`;
+  }
+  if (!profiled.length) {
+    const empty = document.createElement("div");
+    empty.className = "status";
+    empty.textContent = "Profiles will appear here after auto or manual profiling.";
+    list.appendChild(empty);
+    return;
+  }
+  const sorted = profiled.slice().sort((a, b) => {
+    const aKey = (a.model_key || a.model || a.display_name || "").toLowerCase();
+    const bKey = (b.model_key || b.model || b.display_name || "").toLowerCase();
+    return aKey.localeCompare(bKey);
+  });
+  sorted.forEach((candidate) => {
+    const modelKey = candidate.model_key || candidate.model || candidate.display_name || "";
+    if (!modelKey) return;
+    const profile = candidate.profile || {};
+    const profiledAt = formatTimestamp(profile.resource_profiled_at);
+    const profileStatus = profile.profile_status && profile.profile_status !== "ok"
+      ? `status ${profile.profile_status}`
+      : null;
+    const perfBits = [];
+    if (typeof profile.tps === "number") perfBits.push(`tps ${fmtMetric(profile.tps)}`);
+    if (typeof profile.latency_ms === "number") perfBits.push(`${fmtMetric(profile.latency_ms, 0)}ms`);
+    const perfLine = perfBits.length ? `perf ${perfBits.join(" | ")}` : null;
+    const profileLine = [
+      profiledAt ? `profiled ${profiledAt}` : "profile pending",
+      perfLine,
+      profileStatus,
+    ].filter(Boolean).join(" | ");
+    const ramPeak = typeof profile.ram_instance_peak_bytes === "number"
+      ? `RAM peak ${formatBytes(profile.ram_instance_peak_bytes)}`
+      : null;
+    const vramMap = profile.vram_instance_peak_mb_by_gpu || {};
+    const vramPeakVal = Object.values(vramMap).reduce((acc, val) => {
+      const num = typeof val === "number" ? val : Number(val || 0);
+      return num > acc ? num : acc;
+    }, 0);
+    const vramPeak = vramPeakVal
+      ? `VRAM peak ${formatMb(vramPeakVal)}`
+      : typeof profile.vram_estimate_only_mb === "number"
+        ? `VRAM est ${formatMb(profile.vram_estimate_only_mb)}`
+        : null;
+    const capacity = profile.capacity || {};
+    let capacityLine = null;
+    if (typeof capacity.max_instances === "number") {
+      const perGpu = capacity.max_instances_by_gpu || {};
+      const gpuEntries = Object.entries(perGpu).map(([key, val]) => `${key}:${val}`);
+      capacityLine = gpuEntries.length
+        ? `max inst ${gpuEntries.join(", ")}`
+        : `max inst ${capacity.max_instances}`;
+    }
+    const demandBits = [ramPeak, vramPeak, capacityLine].filter(Boolean);
+    const demandLine = demandBits.length ? `demand ${demandBits.join(" | ")}` : "demand pending";
+
+    const row = document.createElement("div");
+    row.className = "candidate-row";
+    const main = document.createElement("div");
+    main.className = "candidate-main";
+    const name = document.createElement("div");
+    name.className = "candidate-name mono";
+    name.textContent = modelKey;
+    const meta = document.createElement("div");
+    meta.className = "candidate-meta";
+    meta.textContent = profileLine;
+    const metaSecondary = document.createElement("div");
+    metaSecondary.className = "candidate-meta";
+    metaSecondary.textContent = demandLine;
+    main.appendChild(name);
+    if (profileLine) main.appendChild(meta);
+    if (demandLine) main.appendChild(metaSecondary);
+    row.appendChild(main);
     list.appendChild(row);
   });
 }
@@ -2960,32 +3132,138 @@ async function loadProfileStatus() {
     const res = await fetch(resolveEndpoint("/api/models/profile"));
     if (!res.ok) return;
     const data = await res.json();
-    renderProfileStatus(data.status || {});
+    const status = data.status || {};
+    const autoStatus = data.auto || data.auto_status || {};
+    renderProfileStatus(status);
+    renderStartupProfilingStatus(autoStatus);
+    renderProfilingRunbar(status, autoStatus);
+    scheduleProfileStatusPoll(status, autoStatus);
   } catch (_) {}
 }
 
 function renderProfileStatus(status = {}) {
-  const target = el("profileStatus");
-  if (!target) return;
+  const targets = [el("profileStatus"), el("profileStatusSettings")].filter(Boolean);
+  if (!targets.length) return;
   if (!status || typeof status !== "object") {
-    target.textContent = "";
+    targets.forEach((target) => {
+      target.textContent = "";
+    });
     return;
   }
   if (status.running) {
     const current = status.current ? ` (${status.current})` : "";
-    target.textContent = `Profiling ${status.completed || 0}/${status.total || "?"}${current}`;
+    targets.forEach((target) => {
+      target.textContent = `Profiling ${status.completed || 0}/${status.total || "?"}${current}`;
+    });
     return;
   }
   if (status.total) {
-    target.textContent = `Profiling complete (${status.completed || 0}/${status.total}).`;
+    targets.forEach((target) => {
+      target.textContent = `Profiling complete (${status.completed || 0}/${status.total}).`;
+    });
   } else {
-    target.textContent = "";
+    targets.forEach((target) => {
+      target.textContent = "";
+    });
   }
 }
 
+function renderStartupProfilingStatus(status = {}) {
+  const row = el("startupProfileSettingsRow");
+  const badge = el("startupProfileSettingsBadge");
+  const detail = el("startupProfileSettingsDetail");
+  const fill = el("startupProfileSettingsFill");
+  if (!row) return;
+  if (!status || typeof status !== "object") {
+    row.classList.add("hidden");
+    return;
+  }
+  const enabled = status.enabled !== false;
+  const total = Number(status.total || 0);
+  const completed = Number(status.completed || 0);
+  const pending = Number.isFinite(status.pending) ? Number(status.pending) : Math.max(total - completed, 0);
+  const running = !!status.running;
+  const current = status.current ? String(status.current) : "";
+  const show = enabled && total > 0 && (running || pending > 0);
+  row.classList.toggle("hidden", !show);
+  if (!show) return;
+  const progress = total > 0 ? Math.min(100, Math.round((completed / total) * 100)) : 0;
+  if (badge) badge.textContent = `Startup profiling ${completed}/${total}`;
+  if (detail) {
+    detail.textContent = current ? `current ${current}` : `pending ${pending}`;
+    detail.title = current || "";
+  }
+  if (fill) fill.style.width = `${progress}%`;
+}
+
+function renderProfilingRunbar(status = {}, autoStatus = {}) {
+  const row = el("profilingStatusBar");
+  if (!row) return;
+  const manualRunning = !!status.running;
+  const autoRunning = !!autoStatus.running;
+  const running = manualRunning || autoRunning;
+  row.classList.toggle("hidden", !running);
+  if (!running) return;
+  const source = manualRunning ? status : autoStatus;
+  const completed = Number(source.completed || 0);
+  const total = Number(source.total || 0);
+  const pending = Number.isFinite(source.pending) ? Number(source.pending) : null;
+  const current = source.current ? String(source.current) : "";
+  const label = manualRunning ? "Profiling models" : "Auto-profiling models";
+  const countText = total ? `${completed}/${total}` : `${completed}/?`;
+  const progress = total > 0 ? Math.min(100, Math.round((completed / total) * 100)) : 0;
+  const chip = el("profilingStatusChip");
+  if (chip) chip.textContent = label;
+  const count = el("profilingStatusCount");
+  if (count) count.textContent = `Models ${countText}`;
+  const fill = el("profilingStatusFill");
+  if (fill) fill.style.width = `${progress}%`;
+  const detail = el("profilingStatusDetail");
+  if (detail) {
+    if (current) {
+      detail.textContent = `current ${current}`;
+      detail.title = current;
+    } else if (typeof pending === "number") {
+      detail.textContent = `pending ${pending}`;
+      detail.title = "";
+    } else {
+      detail.textContent = "starting";
+      detail.title = "";
+    }
+  }
+}
+
+function shouldPollProfileStatus(status = {}, autoStatus = {}) {
+  const manualRunning = !!status.running;
+  const autoRunning = !!autoStatus.running;
+  const enabled = autoStatus.enabled !== false;
+  const pending = Number.isFinite(autoStatus.pending) ? Number(autoStatus.pending) : 0;
+  return manualRunning || autoRunning || (enabled && pending > 0);
+}
+
+function scheduleProfileStatusPoll(status = {}, autoStatus = {}, delayMs = 2000) {
+  if (!shouldPollProfileStatus(status, autoStatus)) {
+    if (profileStatusPollTimer) {
+      clearTimeout(profileStatusPollTimer);
+      profileStatusPollTimer = null;
+    }
+    return;
+  }
+  if (profileStatusPollTimer) return;
+  profileStatusPollTimer = setTimeout(async () => {
+    profileStatusPollTimer = null;
+    await loadProfileStatus();
+  }, delayMs);
+}
+
 async function profileModels(force = false) {
-  const btn = el(force ? "profileModelsForceBtn" : "profileModelsBtn");
-  if (btn) btn.disabled = true;
+  const btnIds = force
+    ? ["profileModelsForceBtn", "profileModelsSettingsForceBtn"]
+    : ["profileModelsBtn"];
+  const btns = btnIds.map((id) => el(id)).filter(Boolean);
+  btns.forEach((btn) => {
+    btn.disabled = true;
+  });
   try {
     const res = await fetch(resolveEndpoint("/api/models/profile"), {
       method: "POST",
@@ -2994,18 +3272,26 @@ async function profileModels(force = false) {
     });
     if (res.ok) {
       const data = await res.json();
-      renderProfileStatus(data.status || {});
+      const status = data.status || {};
+      const autoStatus = data.auto || data.auto_status || {};
+      renderProfileStatus(status);
+      renderProfilingRunbar(status, autoStatus);
+      scheduleProfileStatusPoll(status, autoStatus);
       await pollProfileStatus();
-      await loadSettings();
+      await loadSettings({ refresh: true });
     } else {
-      const status = el("profileStatus");
-      if (status) status.textContent = "Profiling failed to start.";
+      [el("profileStatus"), el("profileStatusSettings")].forEach((status) => {
+        if (status) status.textContent = "Profiling failed to start.";
+      });
     }
   } catch (_) {
-    const status = el("profileStatus");
-    if (status) status.textContent = "Profiling failed to start.";
+    [el("profileStatus"), el("profileStatusSettings")].forEach((status) => {
+      if (status) status.textContent = "Profiling failed to start.";
+    });
   } finally {
-    if (btn) btn.disabled = false;
+    btns.forEach((btn) => {
+      btn.disabled = false;
+    });
   }
 }
 
@@ -3093,19 +3379,50 @@ function updateReasoningBadge() {
 }
 
 function updateProgressUI() {
-  const pct = totalSteps > 0 ? Math.min(100, Math.round((completedSteps / totalSteps) * 100)) : 0;
+  const now = Date.now();
+  let estimatedCompleted = completedSteps;
+  let perStepMs = null;
+  if (timerStartedAt && totalSteps > 0) {
+    const entries = activeAgentEntries();
+    const elapsed = Math.max(now - timerStartedAt, 0);
+    perStepMs = completedSteps > 0 ? elapsed / completedSteps : DEFAULT_STEP_MS;
+    if (entries.length) {
+      const runningDurations = entries
+        .map(([, entry]) => (Number.isFinite(entry.startedAt) ? now - entry.startedAt : null))
+        .filter((val) => Number.isFinite(val) && val > 0);
+      if (runningDurations.length) {
+        const sum = runningDurations.reduce((acc, val) => acc + val, 0);
+        const avg = sum / runningDurations.length;
+        if (Number.isFinite(avg) && avg > 0) {
+          perStepMs = Math.max(perStepMs, avg);
+        }
+      }
+      const remaining = Math.max(totalSteps - completedSteps, 0);
+      let inFlight = 0;
+      for (const [, entry] of entries) {
+        if (inFlight >= remaining) break;
+        const startedAt = Number.isFinite(entry.startedAt) ? entry.startedAt : timerStartedAt;
+        const since = Math.max(now - (startedAt || now), 0);
+        const fraction = perStepMs > 0 ? Math.min(0.9, since / perStepMs) : 0;
+        inFlight += fraction;
+      }
+      estimatedCompleted += Math.min(inFlight, remaining);
+    }
+    if (!Number.isFinite(perStepMs) || perStepMs <= 0) perStepMs = DEFAULT_STEP_MS;
+    perStepMs = Math.max(perStepMs, 1000);
+  }
+  const pct = totalSteps > 0 ? Math.min(100, Math.round((estimatedCompleted / totalSteps) * 100)) : 0;
   const progressText = el("progressText");
   const fill = el("runProgressFill");
   if (progressText) progressText.textContent = `Progress: ${pct}%`;
   if (fill) fill.style.width = `${pct}%`;
   const etaEl = el("etaText");
   if (etaEl) {
-    if (timerStartedAt && totalSteps > 0 && completedSteps > 0) {
-      const elapsed = Date.now() - timerStartedAt;
-      const remaining = Math.max(totalSteps - completedSteps, 0);
-      const perStep = elapsed / Math.max(completedSteps, 1);
+    if (timerStartedAt && totalSteps > 0 && estimatedCompleted > 0) {
+      const remaining = Math.max(totalSteps - estimatedCompleted, 0);
+      const perStep = perStepMs || DEFAULT_STEP_MS;
       const etaMs = perStep * remaining;
-      etaTargetAt = Date.now() + etaMs;
+      etaTargetAt = now + etaMs;
       etaEl.textContent = `ETA: ${formatTime(etaMs)}`;
     } else if (totalSteps > 0) {
       etaTargetAt = null;
@@ -3216,7 +3533,8 @@ function handleEvent(type, p) {
       break;
     case "work_log":
       if (p && p.text) {
-        updateLiveTicker(p.text, p.urls || []);
+        const note = humanizeWorkLogText(p.text);
+        if (note) updateLiveTicker(note, p.urls || []);
       }
       break;
     case "dev_trace":
@@ -3242,9 +3560,9 @@ function handleEvent(type, p) {
       resetLiveAgentState();
       setExecutorActive(true);
       setStatus("Thinking", "live");
-      startTimer();
       totalSteps = 0;
       completedSteps = 0;
+      startTimer(null, p.run_id || currentRunId);
       updateProgressUI();
       ensureThinkingPlaceholder(currentRunId || p.run_id);
       queueLiveEvent("run_started", { question: p.question }, "orch");
@@ -3728,8 +4046,9 @@ function extractFinalText(raw) {
 
 function buildReasoningSummary(run = {}, sources = [], claims = [], routerDecision = {}) {
   const items = [];
-  const route = routerDecision.deep_route || routerDecision.route;
-    if (routerDecision.reasoning_level) items.push(`Plan depth: ${routerDecision.reasoning_level}`);
+  const tier = String(routerDecision.model_tier || "").toLowerCase();
+  const route = tier === "deep" ? routerDecision.deep_route || routerDecision.route : "";
+  if (routerDecision.reasoning_level) items.push(`Plan depth: ${routerDecision.reasoning_level}`);
   if (route) items.push(`Route: ${deepRouteLabel(route)}`);
   if (sources.length) items.push(`Cited ${sources.length} source${sources.length === 1 ? "" : "s"}`);
   if (claims.length) items.push(`Claims recorded: ${claims.length}`);
@@ -4028,6 +4347,8 @@ document.addEventListener("DOMContentLoaded", async () => {
   if (endPromptBtn) endPromptBtn.addEventListener("click", endPrompt);
   const settingsBtn = el("settingsBtn");
   if (settingsBtn) settingsBtn.addEventListener("click", () => toggleModal(true));
+  const mobileSettingsBtn = el("mobileOpenSettingsHint");
+  if (mobileSettingsBtn) mobileSettingsBtn.addEventListener("click", () => toggleModal(true));
   const closeSettings = el("closeSettings");
   if (closeSettings) closeSettings.addEventListener("click", () => toggleModal(false));
   const closeSettingsFooter = el("closeSettingsFooter");
@@ -4079,6 +4400,8 @@ document.addEventListener("DOMContentLoaded", async () => {
   if (profileBtn) profileBtn.addEventListener("click", () => profileModels(false));
   const profileForceBtn = el("profileModelsForceBtn");
   if (profileForceBtn) profileForceBtn.addEventListener("click", () => profileModels(true));
+  const profileSettingsForceBtn = el("profileModelsSettingsForceBtn");
+  if (profileSettingsForceBtn) profileSettingsForceBtn.addEventListener("click", () => profileModels(true));
 
   const reasoningLevel = el("reasoningLevel");
   if (reasoningLevel)

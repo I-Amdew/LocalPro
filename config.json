@@ -44,7 +44,7 @@
     "base_url": "http://127.0.0.1:1234/v1",
     "model_id": "qwen/qwen3-vl-8b"
   },
-  "tavily_api_key": "",
+  "tavily_api_key": "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",
   "search_depth_mode": "auto",
   "max_results_base": 6,
   "max_results_high": 10,
@@ -54,8 +54,37 @@
   "port": 8000,
   "strict_mode": false,
   "reasoning_depth_default": "AUTO",
-  "ram_headroom_pct": 10,
-  "vram_headroom_pct": 10,
+  "plan_reasoning_mode_default": "auto",
+  "planning_mode_default": "auto",
+  "reasoning_level_default": 2,
+  "ram_headroom_pct": 10.0,
+  "vram_headroom_pct": 10.0,
+  "max_concurrent_runs": null,
+  "per_model_class_limits": {},
+  "discovery_base_urls": [
+    "http://127.0.0.1:1234/v1"
+  ],
+  "upload_dir": "uploads",
+  "upload_max_mb": 15,
+  "backends": {
+    "lmstudio": {
+      "enabled": true,
+      "host": "127.0.0.1",
+      "port": 1234,
+      "use_cli": true,
+      "cli_path": null,
+      "default_ttl_s": 600
+    }
+  },
+  "model_candidates": {
+    "mode": "auto",
+    "allow": [],
+    "deny": [],
+    "prefer": [
+      "qwen/qwen3-vl-4b",
+      "qwen/qwen3-vl-8b"
+    ]
+  },
   "autoscaling": {
     "enabled": true,
     "global_max_instances": null,
@@ -63,17 +92,23 @@
     "min_instances": {
       "executor": 1
     },
-    "max_concurrent_loads": 1,
+    "max_concurrent_loads": 2,
     "headroom": {
       "vram_free_mb_min": null,
       "vram_headroom_pct": 10,
       "ram_headroom_pct": 10
     }
   },
+  "routing": {
+    "objective": "balanced",
+    "tool_required_by_default": true
+  },
   "profiling": {
     "enabled": true,
     "auto_profile": true,
     "enforce_headroom": false,
+    "pause_execution": false,
+    "startup_wait_s": 120,
     "repeats": 1,
     "sample_interval_ms": 250,
     "test_timeout_s": 120,
@@ -83,13 +118,7 @@
     "context_length": null,
     "profile_ttl_s": 21600
   },
-  "model_candidates": {
-    "mode": "auto",
-    "allow": [],
-    "deny": [],
-    "prefer": []
-  },
-  "discovery_base_urls": [
-    "http://127.0.0.1:1234/v1"
-  ]
+  "legacy_compat": {
+    "read_old_worker_slots_as_preferences": true
+  }
 }
