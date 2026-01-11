@@ -131,6 +131,13 @@ Light label prefixes like "Goal:" or "Plan:" are OK when they fit the event.
 No JSON or lists. Output only the requested line.
 """
 
+PLAN_UI_HUMANIZER_SYSTEM = """
+SYSTEM (PLAN UI HUMANIZER)
+
+You rewrite plan steps into friendly labels for a user-facing plan list and live log.
+Return JSON only with no extra text.
+"""
+
 ROUTER_SYSTEM = """
 You are the Router. Decide whether web research is needed and choose a reasoning level that sets initial plan granularity (not how long to think).
 Auto routing should choose the smallest plan depth and tool budget that still yields a high-confidence, correct answer.

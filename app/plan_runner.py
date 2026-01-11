@@ -1,10 +1,10 @@
 import asyncio
 import logging
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from .artifact_store import ArtifactStore
 from .executor_state_store import ExecutorStateStore
-from .plan_executor import PlanExecutor
+from .plan_executor import PlanExecutor, humanize_plan_steps
 from .plan_store import PlanStore
 from .planner_v2 import scaffold_plan
 from .tavily import TavilyClient
@@ -46,6 +46,86 @@ def _summarize_overview(view: Dict[str, Any]) -> str:
         f"(running={running}, ready={ready}, pending={pending}, failed={failed}) "
         f"partitions={len(partitions)} rev={view.get('revision')}{blocker_summary}"
     )
+
+
+def _summarize_steps(
+    steps: List[Dict[str, Any]],
+    humanized: Optional[Dict[str, Dict[str, str]]] = None,
+) -> List[Dict[str, Any]]:
+    payload: List[Dict[str, Any]] = []
+    lookup = humanized or {}
+    for step in steps or []:
+        step_id = str(step.get("step_id") or "")
+        human = lookup.get(step_id) if step_id else None
+        payload.append(
+            {
+                "step_id": step.get("step_id"),
+                "title": step.get("title") or step.get("name") or "",
+                "status": step.get("status") or "",
+                "step_type": step.get("step_type") or step.get("type") or "",
+                "tags": step.get("tags") or [],
+                "prereq_step_ids": step.get("prereq_step_ids") or [],
+                "priority": step.get("priority"),
+                "partition_key": step.get("partition_key"),
+                **(
+                    {
+                        "display_title": human.get("display_title"),
+                        "display_target": human.get("display_target"),
+                    }
+                    if human
+                    else {}
+                ),
+            }
+        )
+    return payload
+
+
+async def _emit_plan_snapshot(
+    plan_store: PlanStore,
+    *,
+    bus: Optional[Any],
+    run_id: Optional[str],
+    plan_id: str,
+    question: str,
+    model_manager: Optional[Any],
+    humanized_cache: Optional[Dict[str, Dict[str, str]]] = None,
+    note: Optional[str] = None,
+) -> None:
+    if not bus or not run_id:
+        return
+    overview = await plan_store.get_overview(plan_id)
+    steps_data = await plan_store.list_steps(
+        plan_id,
+        limit=200,
+        fields=[
+            "step_id",
+            "title",
+            "status",
+            "step_type",
+            "tags",
+            "prereq_step_ids",
+            "priority",
+            "partition_key",
+            "run_metadata",
+        ],
+        order_by="priority_desc",
+    )
+    humanized = await humanize_plan_steps(
+        model_manager,
+        question,
+        steps_data.get("steps") or [],
+        cache=humanized_cache,
+    )
+    payload = {
+        "plan_id": plan_id,
+        "kind": "plan_pipeline",
+        "revision": steps_data.get("revision"),
+        "counts_by_status": overview.get("counts_by_status") or {},
+        "steps": _summarize_steps(steps_data.get("steps") or [], humanized),
+    }
+    if note:
+        payload["note"] = note
+    await bus.emit(run_id, "plan_snapshot", payload)
 async def run_plan_pipeline(
     *,
     db_path: str,
@@ -90,11 +170,22 @@ async def run_plan_pipeline(
     updater_stop = asyncio.Event()
     updater_task: Optional[asyncio.Task] = None
     if bus and run_id:
+        humanized_cache: Dict[str, Dict[str, str]] = {}
         total_steps = sum(overview.get("counts_by_status", {}).values())
         await bus.emit(
             run_id,
             "plan_created",
             {"steps": total_steps, "expected_total_steps": total_steps, "expected_passes": 1},
+        )
+        await _emit_plan_snapshot(
+            plan_store,
+            bus=bus,
+            run_id=run_id,
+            plan_id=plan_id,
+            question=question,
+            model_manager=model_manager,
+            humanized_cache=humanized_cache,
+            note="scaffold",
         )
         async def _ui_updater() -> None:
             last_revision = -1
@@ -109,7 +200,9 @@ async def run_plan_pipeline(
                             summary = f"rev={revision} (summary unavailable)"
                             logger.warning("Run %s plan_overview summary failed: %s", run_id, exc)
                         logger.info("Run %s plan_overview: %s", run_id, summary)
-                        await bus.emit(run_id, "plan_overview", view)
+                        view_payload = dict(view)
+                        view_payload["plan_id"] = plan_id
+                        await bus.emit(run_id, "plan_overview", view_payload)
                         last_revision = revision
                 except Exception as exc:
                     logger.warning("Run %s plan_overview refresh failed: %s", run_id, exc)

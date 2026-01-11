@@ -5,6 +5,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
+from . import agents
 from .artifact_store import ArtifactStore
 from .executor_state_store import ExecutorStateStore
 from .plan_store import PlanStore
@@ -12,6 +13,148 @@ from .model_manager import ModelManager, ModelInstanceInfo
 from .request_store import RequestStore
 from .resource_manager import ResourceManager
 from .tavily import TavilyClient
+
+
+_CODING_HINT_RE = re.compile(
+    r"\b("
+    r"code|coding|script|program|function|api|endpoint|refactor|debug|compile|build|runtime|syntax|"
+    r"stack trace|traceback|exception|regex|sql|database|schema|json|yaml|toml|ini|"
+    r"python|javascript|typescript|java|rust|golang|ruby|php|swift|kotlin|bash|powershell|shell|"
+    r"dockerfile|makefile|pip|npm|yarn|pnpm|gradle|maven|cargo|dotnet|node"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_coding_task(text: str) -> bool:
+    if not text:
+        return False
+    if "```" in text:
+        return True
+    return bool(_CODING_HINT_RE.search(text))
+
+
+_HUMANIZE_BATCH_SIZE = 20
+_HUMANIZE_MAX_TOKENS = 360
+
+
+def _clean_human_label(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    return re.sub(r"\s+", " ", text)
+
+
+def _humanize_step_payload(step: Dict[str, Any]) -> Dict[str, Any]:
+    meta = step.get("run_metadata") or {}
+    step_type = str(step.get("step_type") or step.get("type") or "").strip().lower()
+    queries = meta.get("queries")
+    if isinstance(queries, list):
+        queries = queries[:2]
+    else:
+        queries = []
+    return {
+        "step_id": str(step.get("step_id") or ""),
+        "title": step.get("title") or step.get("name") or "",
+        "description": step.get("description") or "",
+        "step_type": step_type,
+        "partition_label": step.get("partition_label") or meta.get("partition_label") or "",
+        "focus": step.get("focus") or meta.get("focus") or "",
+        "queries": queries,
+        "tags": step.get("tags") or [],
+    }
+
+
+def _extract_json_payload(raw: str) -> Optional[dict]:
+    try:
+        return json.loads(raw)
+    except Exception:
+        pass
+    start = raw.find("{")
+    end = raw.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        return None
+    snippet = raw[start : end + 1]
+    try:
+        return json.loads(snippet)
+    except Exception:
+        return None
+
+
+async def humanize_plan_steps(
+    model_manager: Optional[ModelManager],
+    question: str,
+    steps: List[Dict[str, Any]],
+    cache: Optional[Dict[str, Dict[str, str]]] = None,
+) -> Dict[str, Dict[str, str]]:
+    if not model_manager or not steps:
+        return cache or {}
+    mapping = cache if cache is not None else {}
+    pending = []
+    for step in steps:
+        step_id = str(step.get("step_id") or "")
+        if step_id and step_id not in mapping:
+            pending.append(step)
+    if not pending:
+        return mapping
+    for idx in range(0, len(pending), _HUMANIZE_BATCH_SIZE):
+        batch = pending[idx : idx + _HUMANIZE_BATCH_SIZE]
+        payload = [_humanize_step_payload(step) for step in batch]
+        prompt = (
+            "Return JSON only as {\"steps\":[{\"step_id\":\"\",\"display_title\":\"\",\"display_target\":\"\"}]}.\n"
+            "Rules:\n"
+            "- display_title: short plain-English action (2-8 words), literal and friendly.\n"
+            "- display_target: short noun phrase (2-6 words), no verbs.\n"
+            "- Avoid internal jargon: partition, step, executor, worker, verifier, phase, lane, pipeline, tool, model.\n"
+            "- If step_type is verify or title starts with Verify, use \"Check {target}\" for display_title.\n"
+            "- If step_type is draft, use \"Draft response\". If finalize, use \"Polish response\".\n"
+            "- Use partition_label or focus as the target when available; queries can hint at a target.\n"
+            "- If the target is unclear, use \"details\" or \"draft\".\n"
+            "- Output ASCII when possible.\n"
+            f"Question: {question}\n"
+            f"Steps: {json.dumps(payload, ensure_ascii=True)}"
+        )
+        request = {
+            "messages": [
+                {"role": "system", "content": agents.PLAN_UI_HUMANIZER_SYSTEM},
+                {"role": "user", "content": prompt},
+            ],
+            "temperature": 0.2,
+            "max_tokens": _HUMANIZE_MAX_TOKENS,
+            "use_responses": True,
+        }
+        raw = ""
+        for required in (["structured_output"], []):
+            try:
+                resp = await model_manager.call(
+                    required_capabilities=required,
+                    objective=model_manager.routing_objective,
+                    request=request,
+                )
+                raw = resp["choices"][0]["message"]["content"]
+                break
+            except Exception:
+                continue
+        parsed = _extract_json_payload(raw or "")
+        if not isinstance(parsed, dict):
+            continue
+        entries = parsed.get("steps") if isinstance(parsed.get("steps"), list) else []
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            step_id = str(entry.get("step_id") or "").strip()
+            if not step_id:
+                continue
+            display_title = _clean_human_label(entry.get("display_title"))
+            display_target = _clean_human_label(entry.get("display_target"))
+            if not display_title and display_target:
+                display_title = display_target
+            if display_title:
+                mapping[step_id] = {
+                    "display_title": display_title,
+                    "display_target": display_target,
+                }
+    return mapping
 
 
 class PlanExecutor:
@@ -32,6 +175,8 @@ class PlanExecutor:
         max_parallel: int = 4,
         page_size: int = 200,
         draft_token_budget: int = 1200,
+        instance_acquire_timeout_s: int = 20,
+        claim_stale_s: int = 120,
     ) -> None:
         self.plan_store = plan_store
         self.artifact_store = artifact_store
@@ -45,11 +190,14 @@ class PlanExecutor:
         self.max_parallel = max(1, max_parallel)
         self.page_size = max(50, page_size)
         self.draft_token_budget = draft_token_budget
+        self.instance_acquire_timeout_s = max(0, int(instance_acquire_timeout_s or 0))
+        self.claim_stale_s = max(0, int(claim_stale_s or 0))
         self._paused_steps: set[str] = set()
         self._paused_by_finding: Dict[str, List[str]] = {}
         self._resource_pressure_threshold = 0.9
         self._plan_meta: Dict[str, Any] = {}
         self._question = ""
+        self._humanized_steps: Dict[str, Dict[str, str]] = {}
 
     async def _emit(self, event_type: str, payload: Dict[str, Any]) -> None:
         if not self._bus or not self._bus_run_id:
@@ -58,6 +206,62 @@ class PlanExecutor:
             await self._bus.emit(self._bus_run_id, event_type, payload)
         except Exception:
             return
+
+    def _summarize_plan_steps(
+        self,
+        steps: List[Dict[str, Any]],
+        humanized: Optional[Dict[str, Dict[str, str]]] = None,
+    ) -> List[Dict[str, Any]]:
+        summarized: List[Dict[str, Any]] = []
+        lookup = humanized or self._humanized_steps
+        for step in steps or []:
+            step_id = str(step.get("step_id") or "")
+            human = lookup.get(step_id) if step_id else None
+            summarized.append(
+                {
+                    "step_id": step.get("step_id"),
+                    "title": step.get("title") or step.get("name") or "",
+                    "status": step.get("status") or "",
+                    "step_type": step.get("step_type") or step.get("type") or "",
+                    "tags": step.get("tags") or [],
+                    "prereq_step_ids": step.get("prereq_step_ids") or step.get("depends_on") or [],
+                    "priority": step.get("priority"),
+                    "partition_key": step.get("partition_key"),
+                    **(
+                        {
+                            "display_title": human.get("display_title"),
+                            "display_target": human.get("display_target"),
+                        }
+                        if human
+                        else {}
+                    ),
+                }
+            )
+        return summarized
+
+    def _normalize_phase_tags(self, step: Dict[str, Any]) -> set[str]:
+        tags = {str(tag) for tag in (step.get("tags") or []) if tag}
+        step_type = str(step.get("step_type") or step.get("type") or "").strip().lower()
+        if step_type:
+            tags.add(f"phase:{step_type}")
+        for tag in list(tags):
+            if tag.startswith("type:"):
+                tags.add(f"phase:{tag.split(':', 1)[1]}")
+        return tags
+
+    async def _emit_plan_steps_added(
+        self,
+        plan_id: str,
+        steps: List[Dict[str, Any]],
+        note: Optional[str] = None,
+    ) -> None:
+        if not steps:
+            return
+        humanized = await humanize_plan_steps(self.model_manager, self._question, steps, cache=self._humanized_steps)
+        payload = {"plan_id": plan_id, "steps": self._summarize_plan_steps(steps, humanized)}
+        if note:
+            payload["note"] = note
+        await self._emit("plan_steps_added", payload)
 
     async def run(self, plan_id: str, stop_event: Optional[asyncio.Event] = None) -> Dict[str, Any]:
         plan = await self.plan_store.get(plan_id)
@@ -86,12 +290,17 @@ class PlanExecutor:
         async def _handle_step(step: Dict[str, Any], run_id: str, instance: Optional[ModelInstanceInfo]) -> Dict[str, Any]:
             step_id = step["step_id"]
             attempt = int(step.get("attempt") or 0) + 1
+            tags = self._normalize_phase_tags(step)
             step_payload = {
                 "step_id": step_id,
                 "name": step.get("title") or step.get("name") or "",
                 "type": step.get("step_type") or step.get("type") or "",
                 "agent_profile": "executor",
             }
+            human = self._humanized_steps.get(str(step_id))
+            if human:
+                step_payload["display_title"] = human.get("display_title") or ""
+                step_payload["display_target"] = human.get("display_target") or ""
             base_meta = dict(step.get("run_metadata") or {})
             if instance:
                 base_meta.update(
@@ -108,6 +317,16 @@ class PlanExecutor:
             await self._emit("step_started", step_payload)
             try:
                 output_refs = await self._execute_step(plan_id, step, instance=instance)
+                if "phase:discover" in tags:
+                    try:
+                        await self._maybe_expand_discovery(plan_id, step, output_refs)
+                    except Exception:
+                        pass
+                elif "phase:execute" in tags:
+                    try:
+                        await self._maybe_expand_candidates(plan_id, step, output_refs)
+                    except Exception:
+                        pass
                 await self.plan_store.mark_done(plan_id, step_id, output_refs)
                 await self._emit("step_completed", step_payload)
                 return {"ok": True, "step_id": step_id, "output_refs": output_refs}
@@ -145,6 +364,7 @@ class PlanExecutor:
                 },
             )
             await self._fulfill_requests(plan_id)
+            await self._release_stale_claims(plan_id)
 
             # Clean up completed tasks
             if running_tasks:
@@ -164,13 +384,32 @@ class PlanExecutor:
             reserve_denied = False
             if capacity > 0:
                 candidates = await self._fetch_candidates(plan_id, capacity)
+                instance_backlog = sum(1 for step in candidates if self._step_requires_instance(step))
+                if instance_backlog <= 0:
+                    instance_backlog = 1
                 for step in candidates:
                     step_id = step["step_id"]
                     claim = await self.plan_store.claim_step(plan_id, step_id, "executor")
                     if not claim.get("ok"):
                         continue
                     run_id = f"{plan_id}:{step_id}:{uuid.uuid4()}"
-                    instance = await self._acquire_instance(step)
+                    instance = None
+                    try:
+                        if self.instance_acquire_timeout_s > 0:
+                            instance = await asyncio.wait_for(
+                                self._acquire_instance(step, instance_backlog),
+                                timeout=self.instance_acquire_timeout_s,
+                            )
+                        else:
+                            instance = await self._acquire_instance(step, instance_backlog)
+                    except asyncio.TimeoutError:
+                        await self.plan_store.update_step(plan_id, step_id, {"status": "READY", "claimed_by": None})
+                        reserve_denied = True
+                        continue
+                    except Exception:
+                        await self.plan_store.update_step(plan_id, step_id, {"status": "READY", "claimed_by": None})
+                        reserve_denied = True
+                        continue
                     if instance is None and self.model_manager is not None and not self._allow_fallback(step):
                         await self.plan_store.update_step(plan_id, step_id, {"status": "READY", "claimed_by": None})
                         reserve_denied = True
@@ -309,14 +548,15 @@ class PlanExecutor:
                 priority = int(item.get("priority") or 0)
                 deps = dependents.get(item.get("step_id"), 0)
                 cost = self._step_cost_score(item)
-                resolve_bonus = 5000 if needs_resolve and "phase:resolve" in (item.get("tags") or []) else 0
+                tags = self._normalize_phase_tags(item)
+                resolve_bonus = 5000 if needs_resolve and "phase:resolve" in tags else 0
                 return (priority * 1000) + resolve_bonus + (deps * 10) - cost
 
             steps.sort(key=_score, reverse=True)
         else:
             def _priority(item: Dict[str, Any]) -> int:
                 base = int(item.get("priority") or 0)
-                if needs_resolve and "phase:resolve" in (item.get("tags") or []):
+                if needs_resolve and "phase:resolve" in self._normalize_phase_tags(item):
                     return base + 100
                 return base
 
@@ -329,47 +569,53 @@ class PlanExecutor:
             )
         return steps[:capacity]
 
-    async def _acquire_instance(self, step: Dict[str, Any]) -> Optional[ModelInstanceInfo]:
+    def _step_requires_instance(self, step: Dict[str, Any]) -> bool:
+        step_kind = self._resolve_step_type(step)
+        tags = self._normalize_phase_tags(step)
+        if step_kind in {"VERIFIER", "PATCH_VERIFY"}:
+            return False
+        if tags.intersection({"phase:expand", "phase:resolve", "phase:draft", "phase:finalize"}):
+            return False
+        return True
+
+    async def _acquire_instance(
+        self, step: Dict[str, Any], backlog: Optional[int] = None
+    ) -> Optional[ModelInstanceInfo]:
         if not self.model_manager:
             return None
-        step_kind = self._resolve_step_type(step)
-        tags = set(step.get("tags") or [])
-        if step_kind in {"VERIFIER", "PATCH_VERIFY"}:
+        if not self._step_requires_instance(step):
             return None
-        if tags.intersection({"phase:expand", "phase:resolve", "phase:draft", "phase:finalize"}):
-            return None
+        title = str(step.get("title") or step.get("name") or "")
+        description = str(step.get("description") or "")
+        coding_task = _looks_like_coding_task(self._question) or _looks_like_coding_task(title) or _looks_like_coding_task(description)
+        avoid_coder = not coding_task
         cost_hint = step.get("cost_hint") or {}
         required = cost_hint.get("required_capabilities") or []
         required = await self._resolve_required_capabilities(required)
-        objective = cost_hint.get("preferred_objective") or self.model_manager.routing_objective
-        if isinstance(objective, str):
-            cleaned = objective.strip().lower()
-            if cleaned in ("latency", "fast", "speed"):
-                objective = "best_latency"
-            elif cleaned in ("quality", "best_quality", "accuracy"):
-                objective = "best_quality"
-            elif cleaned in ("balanced", "balance", ""):
-                objective = "balanced"
+        if coding_task and "coding" not in required:
+            required.append("coding")
+        objective = self._normalize_objective(
+            cost_hint.get("preferred_objective") or self.model_manager.routing_objective
+        )
+        backlog_value = max(1, int(backlog or self.max_parallel))
         return await self.model_manager.acquire_instance(
             required_capabilities=list(required),
             objective=objective,
-            backlog=1,
+            backlog=backlog_value,
+            avoid_coder=avoid_coder,
         )
 
     def _reservation_budgets(self, step: Dict[str, Any], instance: Optional[ModelInstanceInfo]) -> Dict[str, Any]:
         budgets = dict(step.get("cost_hint") or {})
         if instance is None:
             step_type = self._resolve_step_type(step)
-            tags = set(step.get("tags") or [])
+            tags = self._normalize_phase_tags(step)
             if step_type in {"VERIFIER", "PATCH_VERIFY"} or tags.intersection(
                 {"phase:expand", "phase:resolve", "phase:draft", "phase:finalize"}
             ):
                 return {}
-        if instance and instance.resource_reservation:
-            for key in ("vram_mb", "ram_mb", "ram_bytes", "cpu_pct", "gpu_id"):
-                if key in instance.resource_reservation and instance.resource_reservation[key] is not None:
-                    budgets.setdefault(key, instance.resource_reservation[key])
-        if instance and not instance.resource_reservation:
+        if instance:
+            # Avoid double-counting already-loaded model memory in per-step reservations.
             return budgets
         if not budgets.get("vram_mb"):
             profile = self.resource_manager.model_profile(budgets.get("model_class") or "dynamic")
@@ -408,10 +654,17 @@ class PlanExecutor:
         return tokens_val
 
     def _resolve_step_type(self, step: Dict[str, Any]) -> str:
-        explicit = step.get("step_type")
+        explicit = step.get("step_type") or step.get("type")
         if explicit:
-            return str(explicit).upper()
-        tags = set(step.get("tags") or [])
+            explicit_clean = str(explicit).strip().lower()
+            if explicit_clean in {"verify", "verifier"}:
+                return "VERIFIER"
+            if explicit_clean in {"replan", "replan_patch", "replan-patch"}:
+                return "REPLAN_PATCH"
+            if explicit_clean in {"patch_verify", "patch-verify", "patchverify"}:
+                return "PATCH_VERIFY"
+            return explicit_clean.upper()
+        tags = self._normalize_phase_tags(step)
         if "phase:verify" in tags:
             return "VERIFIER"
         if "phase:replan" in tags:
@@ -433,11 +686,32 @@ class PlanExecutor:
             return [cap for cap in required if cap != "structured_output"]
         return required
 
+    def _normalize_objective(self, objective: Optional[str]) -> Optional[str]:
+        if not isinstance(objective, str):
+            return objective
+        cleaned = objective.strip().lower()
+        if cleaned in ("latency", "fast", "speed"):
+            return "best_latency"
+        if cleaned in ("quality", "best_quality", "accuracy"):
+            return "best_quality"
+        if cleaned in ("balanced", "balance", ""):
+            return "balanced"
+        return objective
+
+    def _should_avoid_coder(self, *texts: str) -> bool:
+        coding_task = _looks_like_coding_task(self._question)
+        for text in texts:
+            if _looks_like_coding_task(text):
+                coding_task = True
+                break
+        return not coding_task
+
     async def _call_with_fallback(
         self,
         request: Dict[str, Any],
         required_capabilities: Optional[List[str]] = None,
         objective: Optional[str] = None,
+        avoid_coder: bool = False,
     ) -> Dict[str, Any]:
         if not self.model_manager:
             raise RuntimeError("Model manager unavailable.")
@@ -450,6 +724,7 @@ class PlanExecutor:
                 required_capabilities=required,
                 objective=objective,
                 request=cleaned_request,
+                avoid_coder=avoid_coder,
             )
         except RuntimeError as exc:
             if "No suitable model instance available." not in str(exc) or "structured_output" not in required:
@@ -461,7 +736,43 @@ class PlanExecutor:
                 required_capabilities=fallback_required,
                 objective=objective,
                 request=fallback_request,
+                avoid_coder=avoid_coder,
             )
+
+    async def _call_with_instance_fallback(
+        self,
+        instance: Optional[ModelInstanceInfo],
+        request: Dict[str, Any],
+        required_capabilities: Optional[List[str]] = None,
+        objective: Optional[str] = None,
+        avoid_coder: bool = False,
+    ) -> Dict[str, Any]:
+        if not self.model_manager:
+            raise RuntimeError("Model manager unavailable.")
+        required = await self._resolve_required_capabilities(required_capabilities or [])
+        cleaned_request = dict(request)
+        if "structured_output" not in required and "response_format" in cleaned_request:
+            cleaned_request.pop("response_format", None)
+        if instance:
+            try:
+                return await self.model_manager.backends[instance.backend_id].call_chat_completion(
+                    instance,
+                    cleaned_request,
+                )
+            except Exception as exc:
+                if self.model_manager._is_instance_unavailable_error(exc):
+                    try:
+                        await self.model_manager._drop_instance(instance)
+                    except Exception:
+                        pass
+                else:
+                    raise
+        return await self._call_with_fallback(
+            cleaned_request,
+            required_capabilities=required,
+            objective=self._normalize_objective(objective),
+            avoid_coder=avoid_coder,
+        )
 
     def _allow_fallback(self, step: Dict[str, Any]) -> bool:
         meta = step.get("run_metadata") or {}
@@ -470,7 +781,7 @@ class PlanExecutor:
         step_type = self._resolve_step_type(step)
         if step_type in {"VERIFIER", "REPLAN_PATCH", "PATCH_VERIFY"}:
             return True
-        tags = set(step.get("tags") or [])
+        tags = self._normalize_phase_tags(step)
         if tags.intersection({"phase:expand", "phase:resolve", "phase:draft", "phase:finalize"}):
             return True
         return False
@@ -488,6 +799,14 @@ class PlanExecutor:
 
     def _utc_iso(self) -> str:
         return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+    def _parse_utc(self, value: Optional[str]) -> Optional[datetime]:
+        if not value:
+            return None
+        try:
+            return datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except Exception:
+            return None
 
     def _sanitize_text(self, value: str) -> str:
         if not value:
@@ -534,6 +853,33 @@ class PlanExecutor:
             return bool(notes.strip())
         return True
 
+    async def _release_stale_claims(self, plan_id: str) -> None:
+        if self.claim_stale_s <= 0:
+            return
+        now = datetime.now(timezone.utc)
+        cursor = None
+        while True:
+            batch = await self.plan_store.list_steps(
+                plan_id,
+                cursor=cursor,
+                limit=self.page_size,
+                status="CLAIMED",
+                fields=["step_id", "updated_at", "claimed_by"],
+            )
+            for step in batch.get("steps") or []:
+                updated_at = self._parse_utc(step.get("updated_at"))
+                if not updated_at:
+                    continue
+                age = (now - updated_at).total_seconds()
+                if age < self.claim_stale_s:
+                    continue
+                await self.plan_store.update_step(
+                    plan_id, step.get("step_id"), {"status": "READY", "claimed_by": None}
+                )
+            cursor = batch.get("cursor_next")
+            if not cursor:
+                break
+
     async def _auto_create_verifiers(
         self,
         plan_id: str,
@@ -573,7 +919,7 @@ class PlanExecutor:
                 auto_verified.add(step_id)
                 continue
             step_type = str(row.get("step_type") or "").upper()
-            tags = set(row.get("tags") or [])
+            tags = self._normalize_phase_tags(row)
             if step_type in ("VERIFIER", "REPLAN_PATCH", "PATCH_VERIFY"):
                 auto_verified.add(step_id)
                 continue
@@ -789,13 +1135,17 @@ class PlanExecutor:
         step_kind = self._resolve_step_type(step)
         step_title = str(step.get("title") or "")
         step_type = step_title.strip().lower()
-        tags = set(step.get("tags") or [])
+        tags = self._normalize_phase_tags(step)
         if step_kind == "VERIFIER":
             return await self._verify_step(plan_id, step)
         if step_kind == "REPLAN_PATCH":
             return await self._replan_patch(plan_id, step, instance=instance)
         if step_kind == "PATCH_VERIFY":
             return await self._patch_verify(plan_id, step)
+        if step_kind in {"DRAFT", "DRAFTBOOK"}:
+            return await self._draftbook(plan_id, step)
+        if step_kind in {"FINAL", "FINALIZE"}:
+            return await self._finalize(plan_id, step)
         if "phase:expand" in tags or step_type.startswith("expand"):
             return await self._expand_partitions(plan_id, step)
         if "phase:resolve" in tags:
@@ -830,15 +1180,21 @@ class PlanExecutor:
             packed = await self.artifact_store.pack_context(step["step_id"], input_refs, 800)
             context_text = await self.artifact_store.get(packed["ref_id"])
             prompt += f"Context: {context_text}"
-        required_caps = (step.get("cost_hint") or {}).get("required_capabilities") or []
-        response = await self.model_manager.backends[instance.backend_id].call_chat_completion(
+        cost_hint = step.get("cost_hint") or {}
+        required_caps = cost_hint.get("required_capabilities") or []
+        objective = cost_hint.get("preferred_objective") or self.model_manager.routing_objective
+        avoid_coder = self._should_avoid_coder(prompt)
+        response = await self._call_with_instance_fallback(
             instance,
             {
                 "messages": [{"role": "system", "content": "Complete the task."}, {"role": "user", "content": prompt}],
                 "temperature": 0.2,
-                "max_tokens": int((step.get("cost_hint") or {}).get("estimated_tokens") or 500),
+                "max_tokens": int(cost_hint.get("estimated_tokens") or 500),
                 "use_responses": True,
             },
+            required_capabilities=required_caps,
+            objective=objective,
+            avoid_coder=avoid_coder,
         )
         content = response.get("choices", [{}])[0].get("message", {}).get("content") or ""
         ref = await self.artifact_store.put(
@@ -1048,6 +1404,8 @@ class PlanExecutor:
                 "impact": meta.get("impact") or {},
                 "base_revision": base_revision,
             }
+            cost_hint = step.get("cost_hint") or {}
+            objective = cost_hint.get("preferred_objective") or self.model_manager.routing_objective
             schema = {
                 "name": "plan_patch",
                 "schema": {
@@ -1061,7 +1419,7 @@ class PlanExecutor:
                 },
             }
             try:
-                response = await self.model_manager.backends[instance.backend_id].call_chat_completion(
+                response = await self._call_with_instance_fallback(
                     instance,
                     {
                         "messages": [
@@ -1076,6 +1434,9 @@ class PlanExecutor:
                         "response_format": {"type": "json_schema", "json_schema": schema},
                         "use_responses": True,
                     },
+                    required_capabilities=["structured_output"],
+                    objective=objective,
+                    avoid_coder=self._should_avoid_coder(self._question),
                 )
                 content = response.get("choices", [{}])[0].get("message", {}).get("content") or ""
                 parsed = json.loads(content) if content else {}
@@ -1172,7 +1533,8 @@ class PlanExecutor:
             budget_cap = max(min_target, min(max_target, base_budget if base_budget > 0 else max_target))
             target_count = min(expansion_count, budget_cap)
         else:
-            target_count = min(expansion_count, max(6, min(50, expansion_count)))
+            non_web_cap = 12 if extensive else 6
+            target_count = min(expansion_count, non_web_cap)
         if target_count <= 0:
             target_count = 0
         max_results = int(self._plan_meta.get("max_results") or 6)
@@ -1219,6 +1581,12 @@ class PlanExecutor:
             max_queries = 2
         if real_estate_info and extensive:
             max_queries = max(max_queries, 2)
+        max_development_steps = 12
+        if real_estate_info:
+            if extensive:
+                max_development_steps = min(max(target_count, 12), 24)
+            else:
+                max_development_steps = min(max(target_count, 8), 12)
         fallback_queries = self._build_fallback_queries(question, max(6, target_count))
         new_steps: List[Dict[str, Any]] = []
         discovery_step_id = None
@@ -1236,6 +1604,7 @@ class PlanExecutor:
                 "extract_depth": extract_depth,
                 "topic": self._plan_meta.get("topic") or "general",
                 "time_range": self._plan_meta.get("time_range"),
+                "max_development_steps": max_development_steps,
             }
             new_steps.append(
                 {
@@ -1354,6 +1723,8 @@ class PlanExecutor:
             )
         if new_steps:
             await self.plan_store.add_steps(plan_id, new_steps)
+            await self._emit_plan_steps_added(plan_id, new_steps, note="discovery expansion")
+            await self._emit_plan_steps_added(plan_id, new_steps, note="partition expansion")
         ref = await self.artifact_store.put(
             None,
             {"created_steps": len(new_steps), "partitions": len(partition_specs)},
@@ -1428,6 +1799,7 @@ class PlanExecutor:
                     "use_responses": True,
                 },
                 required_capabilities=["structured_output"],
+                avoid_coder=self._should_avoid_coder(question),
             )
             content = response.get("choices", [{}])[0].get("message", {}).get("content") or ""
             parsed = json.loads(content) if content else {}
@@ -1498,6 +1870,53 @@ class PlanExecutor:
         cleaned = re.sub(r"\s+", " ", name or "").strip()
         return cleaned
 
+    def _clean_development_candidate(self, name: str) -> str:
+        cleaned = self._sanitize_text(self._normalize_development_name(name))
+        if not cleaned:
+            return ""
+        lowered = cleaned.lower()
+        prefixes = (
+            "welcome to ",
+            "discover ",
+            "find ",
+            "our website features ",
+            "our website features the best ",
+            "tour ",
+            "under $1m:",
+            "under $1m ",
+            "under $1m -",
+        )
+        for prefix in prefixes:
+            if lowered.startswith(prefix):
+                cleaned = cleaned[len(prefix):].strip(" -,:;")
+                lowered = cleaned.lower()
+                break
+        extracted = self._extract_development_names_from_text(cleaned, 1)
+        if extracted:
+            cleaned = extracted[0]
+            lowered = cleaned.lower()
+        club_match = re.search(r"^(.+?(?:golf|country) club)", cleaned, re.IGNORECASE)
+        if club_match:
+            cleaned = club_match.group(1).strip()
+            lowered = cleaned.lower()
+        cleaned = cleaned.strip(" -,:;")
+        if not cleaned:
+            return ""
+        if self._looks_like_list_title(cleaned):
+            return ""
+        if any(
+            token in lowered
+            for token in ("homes for sale", "real estate", "neighborhoods list", "communities list")
+        ):
+            return ""
+        if lowered in {"home page", "homepage", "home"}:
+            return ""
+        if len(cleaned.split()) > 10:
+            return ""
+        if len(cleaned) < 4:
+            return ""
+        return cleaned
+
     def _looks_like_list_title(self, value: str) -> bool:
         lowered = (value or "").lower()
         list_markers = (
@@ -1551,7 +1970,8 @@ class PlanExecutor:
             if not line.lower().startswith("research "):
                 continue
             name = line[9:].split(":", 1)[0].strip()
-            if not name or self._looks_like_list_title(name):
+            name = self._clean_development_candidate(name)
+            if not name:
                 continue
             key = name.lower()
             if key in seen:
@@ -1563,6 +1983,211 @@ class PlanExecutor:
         if names:
             return names
         return self._extract_development_names_from_text(text or "", limit)
+
+    async def _discovery_expansion_context(self, plan_id: str, step_id: str) -> tuple[bool, set[str]]:
+        marker = f"discover:{step_id}"
+        expanded = False
+        existing: set[str] = set()
+        cursor = None
+        while True:
+            batch = await self.plan_store.list_steps(
+                plan_id,
+                cursor=cursor,
+                limit=self.page_size,
+                fields=["title", "tags"],
+            )
+            for step in batch.get("steps") or []:
+                tags = set(step.get("tags") or [])
+                if marker in tags:
+                    expanded = True
+                title = str(step.get("title") or "")
+                if title.lower().startswith("research "):
+                    name = title[9:].strip()
+                    if name:
+                        existing.add(name.lower())
+            cursor = batch.get("cursor_next")
+            if not cursor:
+                break
+        return expanded, existing
+
+    async def _candidate_expansion_context(self, plan_id: str, step_id: str) -> tuple[bool, set[str]]:
+        marker = f"expand:{step_id}"
+        expanded = False
+        existing: set[str] = set()
+        cursor = None
+        while True:
+            batch = await self.plan_store.list_steps(
+                plan_id,
+                cursor=cursor,
+                limit=self.page_size,
+                fields=["title", "tags"],
+            )
+            for step in batch.get("steps") or []:
+                tags = set(step.get("tags") or [])
+                if marker in tags:
+                    expanded = True
+                title = str(step.get("title") or "")
+                if title.lower().startswith("research "):
+                    name = title[9:].strip()
+                    if name:
+                        existing.add(name.lower())
+            cursor = batch.get("cursor_next")
+            if not cursor:
+                break
+        return expanded, existing
+
+    async def _extract_discovery_candidates(
+        self, output_refs: List[Dict[str, Any]], limit: int
+    ) -> List[str]:
+        names: List[str] = []
+        seen = set()
+        for ref in output_refs or []:
+            ref_id = ref.get("ref_id") if isinstance(ref, dict) else None
+            if not ref_id:
+                continue
+            content = await self.artifact_store.get(ref_id)
+            if isinstance(content, dict):
+                candidates = content.get("candidates") or content.get("developments") or []
+                if not candidates and isinstance(content.get("analysis"), dict):
+                    analysis = content.get("analysis") or {}
+                    candidates = analysis.get("candidates") or analysis.get("developments") or []
+                if isinstance(candidates, list):
+                    for item in candidates:
+                        if not isinstance(item, dict):
+                            continue
+                        raw = str(item.get("name") or "").strip()
+                        if not raw:
+                            continue
+                        cleaned = self._clean_development_candidate(raw)
+                        if not cleaned:
+                            continue
+                        key = cleaned.lower()
+                        if key in seen:
+                            continue
+                        seen.add(key)
+                        names.append(cleaned)
+                        if len(names) >= limit:
+                            return names
+                continue
+            if isinstance(content, str):
+                for raw in self._candidate_names_from_notes(content, limit):
+                    cleaned = self._clean_development_candidate(raw)
+                    if not cleaned:
+                        continue
+                    key = cleaned.lower()
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    names.append(cleaned)
+                    if len(names) >= limit:
+                        return names
+        return names
+
+    async def _maybe_expand_discovery(
+        self,
+        plan_id: str,
+        step: Dict[str, Any],
+        output_refs: List[Dict[str, Any]],
+    ) -> None:
+        info = self._real_estate_query_info(self._question)
+        if not info:
+            return
+        step_id = str(step.get("step_id") or "")
+        if not step_id:
+            return
+        expanded, existing = await self._discovery_expansion_context(plan_id, step_id)
+        if expanded:
+            return
+        max_new = int((step.get("run_metadata") or {}).get("max_development_steps") or 12)
+        if max_new <= 0:
+            return
+        names = await self._extract_discovery_candidates(output_refs, max_new * 2)
+        if not names:
+            return
+        filtered = [name for name in names if name.lower() not in existing]
+        if not filtered:
+            return
+        filtered = filtered[:max_new]
+        planning_mode = str(self._plan_meta.get("planning_mode") or "").lower()
+        reasoning_mode = str(self._plan_meta.get("reasoning_mode") or "").lower()
+        extensive = planning_mode == "extensive" or reasoning_mode == "extensive"
+        developments = [{"name": name, "location": ""} for name in filtered]
+        specs = self._real_estate_development_specs(developments, info, extensive)
+        if not specs:
+            return
+        max_results = int(self._plan_meta.get("max_results") or 6)
+        if max_results < 1:
+            max_results = 1
+        search_depth = str(self._plan_meta.get("search_depth") or self._plan_meta.get("search_depth_mode") or "basic")
+        if search_depth not in ("basic", "advanced"):
+            search_depth = "basic"
+        extract_depth = str(self._plan_meta.get("extract_depth") or "basic")
+        if extract_depth not in ("basic", "advanced"):
+            extract_depth = "basic"
+        new_steps: List[Dict[str, Any]] = []
+        for idx, spec in enumerate(specs):
+            exec_step_id = str(uuid.uuid4())
+            label = str(spec.get("label") or f"Development {idx + 1}")
+            queries = self._normalize_queries(spec.get("queries"))
+            step_max_queries = int(spec.get("max_queries") or (4 if extensive else 3))
+            if step_max_queries < 1:
+                step_max_queries = 1
+            run_metadata = {
+                "partition_label": label,
+                "queries": queries,
+                "focus": spec.get("focus") or label,
+                "needs_web": True,
+                "max_queries": step_max_queries,
+                "max_results": max_results,
+                "search_depth": search_depth,
+                "extract_depth": extract_depth,
+                "topic": self._plan_meta.get("topic") or "general",
+                "time_range": self._plan_meta.get("time_range"),
+            }
+            if spec.get("location"):
+                run_metadata["location"] = spec.get("location")
+            new_steps.append(
+                {
+                    "step_id": exec_step_id,
+                    "title": spec.get("title") or f"Research {label}",
+                    "description": spec.get("description") or "Verify build years, price, home type, and beach distance.",
+                    "status": "READY",
+                    "tags": ["phase:execute", "phase:development", f"discover:{step_id}"],
+                    "partition_key": "discover",
+                    "priority": 6,
+                    "prereq_step_ids": [step_id],
+                    "cost_hint": {
+                        "required_capabilities": ["structured_output"],
+                        "preferred_objective": "balanced",
+                        "estimated_tokens": 600,
+                    },
+                    "run_metadata": run_metadata,
+                    "created_by": {"type": "expander", "id": step_id},
+                }
+            )
+            new_steps.append(
+                {
+                    "step_id": f"verify-{exec_step_id}",
+                    "title": f"Verify {label}",
+                    "description": f"Verify outputs for {label}.",
+                    "step_type": "VERIFIER",
+                    "status": "PENDING",
+                    "tags": ["phase:verify", f"verifies:{exec_step_id}", f"discover:{step_id}"],
+                    "partition_key": "discover",
+                    "priority": 5,
+                    "prereq_step_ids": [exec_step_id],
+                    "run_metadata": {"verify_step_id": exec_step_id, "allow_fallback": True},
+                    "cost_hint": {
+                        "required_capabilities": ["structured_output"],
+                        "preferred_objective": "best_quality",
+                        "estimated_tokens": 200,
+                    },
+                    "created_by": {"type": "expander", "id": step_id},
+                }
+            )
+        if new_steps:
+            await self.plan_store.add_steps(plan_id, new_steps)
+            await self._emit_plan_steps_added(plan_id, new_steps, note="discovery expansion")
 
     def _real_estate_default_location(self, info: Dict[str, bool]) -> str:
         has_naples = info.get("has_naples")
@@ -1598,7 +2223,7 @@ class PlanExecutor:
         max_queries = 4 if extensive else 3
         seen: set[str] = set()
         for item in developments:
-            name = self._normalize_development_name(str(item.get("name") or ""))
+            name = self._clean_development_candidate(str(item.get("name") or ""))
             if not name:
                 continue
             key = name.lower()
@@ -1639,8 +2264,8 @@ class PlanExecutor:
             if not candidates and title and not self._looks_like_list_title(title):
                 candidates.append(title.split(" - ", 1)[0].split("|", 1)[0].strip())
             for name in candidates:
-                normalized = self._normalize_development_name(name)
-                if not normalized or self._looks_like_list_title(normalized):
+                normalized = self._clean_development_candidate(name)
+                if not normalized:
                     continue
                 key = normalized.lower()
                 if key in seen:
@@ -1756,6 +2381,7 @@ class PlanExecutor:
                     "use_responses": True,
                 },
                 required_capabilities=["structured_output"],
+                avoid_coder=self._should_avoid_coder(question),
             )
             content = response.get("choices", [{}])[0].get("message", {}).get("content") or ""
             parsed = json.loads(content) if content else {}
@@ -1769,8 +2395,8 @@ class PlanExecutor:
         for item in developments:
             if not isinstance(item, dict):
                 continue
-            name = self._normalize_development_name(str(item.get("name") or ""))
-            if not name or self._looks_like_list_title(name):
+            name = self._clean_development_candidate(str(item.get("name") or ""))
+            if not name:
                 continue
             key = name.lower()
             if key in seen:
@@ -1782,8 +2408,8 @@ class PlanExecutor:
                 break
         if len(cleaned) < limit:
             for guess in self._guess_developments_from_sources(sources, limit):
-                name = self._normalize_development_name(str(guess.get("name") or ""))
-                if not name or self._looks_like_list_title(name):
+                name = self._clean_development_candidate(str(guess.get("name") or ""))
+                if not name:
                     continue
                 key = name.lower()
                 if key in seen:
@@ -1793,6 +2419,115 @@ class PlanExecutor:
                 if len(cleaned) >= limit:
                     break
         return cleaned
+
+    async def _maybe_expand_candidates(
+        self,
+        plan_id: str,
+        step: Dict[str, Any],
+        output_refs: List[Dict[str, Any]],
+    ) -> None:
+        info = self._real_estate_query_info(self._question)
+        if not info:
+            return
+        step_id = str(step.get("step_id") or "")
+        if not step_id:
+            return
+        tags = self._normalize_phase_tags(step)
+        if "phase:development" in tags:
+            return
+        expanded, existing = await self._candidate_expansion_context(plan_id, step_id)
+        if expanded:
+            return
+        planning_mode = str(self._plan_meta.get("planning_mode") or "").lower()
+        reasoning_mode = str(self._plan_meta.get("reasoning_mode") or "").lower()
+        extensive = planning_mode == "extensive" or reasoning_mode == "extensive"
+        max_new = int((step.get("run_metadata") or {}).get("max_development_steps") or (12 if extensive else 8))
+        if max_new <= 0:
+            return
+        names = await self._extract_discovery_candidates(output_refs, max_new * 2)
+        if not names:
+            return
+        filtered = [name for name in names if name.lower() not in existing]
+        if not filtered:
+            return
+        filtered = filtered[:max_new]
+        developments = [{"name": name, "location": ""} for name in filtered]
+        specs = self._real_estate_development_specs(developments, info, extensive)
+        if not specs:
+            return
+        max_results = int(self._plan_meta.get("max_results") or 6)
+        if max_results < 1:
+            max_results = 1
+        search_depth = str(self._plan_meta.get("search_depth") or self._plan_meta.get("search_depth_mode") or "basic")
+        if search_depth not in ("basic", "advanced"):
+            search_depth = "basic"
+        extract_depth = str(self._plan_meta.get("extract_depth") or "basic")
+        if extract_depth not in ("basic", "advanced"):
+            extract_depth = "basic"
+        new_steps: List[Dict[str, Any]] = []
+        for idx, spec in enumerate(specs):
+            exec_step_id = str(uuid.uuid4())
+            label = str(spec.get("label") or f"Development {idx + 1}")
+            queries = self._normalize_queries(spec.get("queries"))
+            step_max_queries = int(spec.get("max_queries") or (4 if extensive else 3))
+            if step_max_queries < 1:
+                step_max_queries = 1
+            run_metadata = {
+                "partition_label": label,
+                "queries": queries,
+                "focus": spec.get("focus") or label,
+                "needs_web": True,
+                "max_queries": step_max_queries,
+                "max_results": max_results,
+                "search_depth": search_depth,
+                "extract_depth": extract_depth,
+                "topic": self._plan_meta.get("topic") or "general",
+                "time_range": self._plan_meta.get("time_range"),
+            }
+            if spec.get("location"):
+                run_metadata["location"] = spec.get("location")
+            new_steps.append(
+                {
+                    "step_id": exec_step_id,
+                    "title": spec.get("title") or f"Research {label}",
+                    "description": spec.get("description") or "Verify build years, price, home type, and beach distance.",
+                    "status": "READY",
+                    "tags": ["phase:execute", "phase:development", f"expand:{step_id}"],
+                    "partition_key": "development",
+                    "priority": 6,
+                    "prereq_step_ids": [step_id],
+                    "cost_hint": {
+                        "required_capabilities": ["structured_output"],
+                        "preferred_objective": "balanced",
+                        "estimated_tokens": 600,
+                    },
+                    "run_metadata": run_metadata,
+                    "created_by": {"type": "expander", "id": step_id},
+                }
+            )
+            new_steps.append(
+                {
+                    "step_id": f"verify-{exec_step_id}",
+                    "title": f"Verify {label}",
+                    "description": f"Verify outputs for {label}.",
+                    "step_type": "VERIFIER",
+                    "status": "PENDING",
+                    "tags": ["phase:verify", f"verifies:{exec_step_id}", f"expand:{step_id}"],
+                    "partition_key": "development",
+                    "priority": 5,
+                    "prereq_step_ids": [exec_step_id],
+                    "run_metadata": {"verify_step_id": exec_step_id, "allow_fallback": True},
+                    "cost_hint": {
+                        "required_capabilities": ["structured_output"],
+                        "preferred_objective": "best_quality",
+                        "estimated_tokens": 200,
+                    },
+                    "created_by": {"type": "expander", "id": step_id},
+                }
+            )
+        if new_steps:
+            await self.plan_store.add_steps(plan_id, new_steps)
+            await self._emit_plan_steps_added(plan_id, new_steps, note="candidate expansion")
 
     def _real_estate_partition_specs(self, question: str) -> List[Dict[str, Any]]:
         text = (question or "").lower()
@@ -1986,11 +2721,37 @@ class PlanExecutor:
                             topic=topic,
                             time_range=time_range,
                         )
-                        if resp.get("error"):
-                            errors.append(f"search_error:{resp.get('error')}")
+                        fallback_error = resp.get("fallback_error")
+                        if fallback_error:
+                            errors.append(f"search_fallback:{fallback_error}")
                             await self._emit(
                                 "tavily_error",
-                                {"step": step.get("step_id"), "message": resp.get("error"), "query": query},
+                                {
+                                    "step": step.get("step_id"),
+                                    "message": "search_fallback",
+                                    "detail": fallback_error,
+                                    "query": query,
+                                    "fallback": True,
+                                },
+                            )
+                        if resp.get("error"):
+                            status = resp.get("status_code")
+                            detail = resp.get("detail")
+                            message = resp.get("error") or "search_error"
+                            if status is not None:
+                                message = f"{message}:{status}"
+                            if detail:
+                                message = f"{message}:{detail}"
+                            errors.append(f"search_error:{message}")
+                            await self._emit(
+                                "tavily_error",
+                                {
+                                    "step": step.get("step_id"),
+                                    "message": message,
+                                    "detail": detail,
+                                    "status_code": status,
+                                    "query": query,
+                                },
                             )
                             continue
                         results = resp.get("results") or []
@@ -2057,12 +2818,16 @@ class PlanExecutor:
                     if "golf" in q_lower:
                         domain_keywords.append("golf")
                     relevant = 0
+                    filtered_sources: List[Dict[str, Any]] = []
                     for src in search_sources:
                         text = f"{src.get('url','')} {src.get('title','')} {src.get('snippet','')}".lower()
                         has_location = not location_keywords or any(k in text for k in location_keywords)
                         has_domain = not domain_keywords or any(k in text for k in domain_keywords)
                         if has_location and has_domain:
                             relevant += 1
+                            filtered_sources.append(src)
+                    if filtered_sources:
+                        search_sources = filtered_sources
                     if relevant == 0:
                         fallback_queries = self._build_fallback_queries(self._question, 4)
                         extra_queries = [q for q in fallback_queries if q not in queries][:1]
@@ -2101,11 +2866,30 @@ class PlanExecutor:
                         {"step": step.get("step_id"), "urls": url_slice},
                     )
                     extract_resp = await self.tavily.extract(url_slice, extract_depth=extract_depth)
-                    if extract_resp.get("error"):
-                        errors.append(f"extract_error:{extract_resp.get('error')}")
+                    fallback_error = extract_resp.get("fallback_error")
+                    if fallback_error:
+                        errors.append(f"extract_fallback:{fallback_error}")
                         await self._emit(
                             "tavily_error",
-                            {"step": step.get("step_id"), "message": extract_resp.get("error")},
+                            {
+                                "step": step.get("step_id"),
+                                "message": "extract_fallback",
+                                "detail": fallback_error,
+                                "fallback": True,
+                            },
+                        )
+                    if extract_resp.get("error"):
+                        status = extract_resp.get("status_code")
+                        detail = extract_resp.get("detail")
+                        message = extract_resp.get("error") or "extract_error"
+                        if status is not None:
+                            message = f"{message}:{status}"
+                        if detail:
+                            message = f"{message}:{detail}"
+                        errors.append(f"extract_error:{message}")
+                        await self._emit(
+                            "tavily_error",
+                            {"step": step.get("step_id"), "message": message, "detail": detail, "status_code": status},
                         )
                     else:
                         extracted: List[Dict[str, Any]] = []
@@ -2199,16 +2983,13 @@ class PlanExecutor:
             if "structured_output" not in required:
                 request.pop("response_format", None)
             try:
-                if instance:
-                    response = await self.model_manager.backends[instance.backend_id].call_chat_completion(
-                        instance,
-                        request,
-                    )
-                else:
-                    response = await self._call_with_fallback(
-                        request,
-                        required_capabilities=required,
-                    )
+                avoid_coder = self._should_avoid_coder(self._question, focus, partition_label)
+                response = await self._call_with_instance_fallback(
+                    instance,
+                    request,
+                    required_capabilities=required,
+                    avoid_coder=avoid_coder,
+                )
                 content = response.get("choices", [{}])[0].get("message", {}).get("content") or ""
                 parsed = None
                 if content:
@@ -2264,11 +3045,13 @@ class PlanExecutor:
         summary = ""
         candidates: List[Any] = []
         gaps: List[Any] = []
+        errors: List[Any] = []
         if isinstance(payload, dict):
             analysis = payload.get("analysis") if isinstance(payload.get("analysis"), dict) else {}
             summary = str(analysis.get("summary") or payload.get("summary") or "").strip()
             candidates = analysis.get("candidates") or payload.get("candidates") or []
             gaps = analysis.get("gaps") or payload.get("gaps") or []
+            errors = analysis.get("errors") or payload.get("errors") or []
         else:
             summary = str(payload).strip()
         lines: List[str] = []
@@ -2296,6 +3079,10 @@ class PlanExecutor:
             gap_text = "; ".join([str(g) for g in gaps[:3] if g])
             if gap_text:
                 lines.append(f"Gaps: {gap_text}")
+        if isinstance(errors, list) and errors:
+            error_text = "; ".join([str(e) for e in errors[:3] if e])
+            if error_text:
+                lines.append(f"Errors: {error_text}")
         return "\n".join(lines).strip()
 
     async def _draftbook(self, plan_id: str, step: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -2342,7 +3129,7 @@ class PlanExecutor:
                 "partition_notes": packed_text,
                 "instructions": (
                     "Summarize partition notes into a draft answer and key points. "
-                    "List candidate communities mentioned, even if criteria are not confirmed."
+                    "List candidate items mentioned, even if criteria are not confirmed."
                 ),
             }
             try:
@@ -2358,6 +3145,7 @@ class PlanExecutor:
                         "use_responses": True,
                     },
                     required_capabilities=["structured_output"],
+                    avoid_coder=self._should_avoid_coder(self._question),
                 )
                 content = response.get("choices", [{}])[0].get("message", {}).get("content") or ""
                 parsed = None
@@ -2414,23 +3202,30 @@ class PlanExecutor:
         if self.model_manager and draft_text:
             prompt = f"Question: {self._question}\n\nDraftbook:\n{draft_text}\n\n"
             if candidate_text:
-                prompt += f"Candidate communities:\n{candidate_text}\n\n"
+                prompt += f"Candidate items:\n{candidate_text}\n\n"
             prompt += (
-                "Write the final answer. Include a concise candidate list with caveats and "
-                "note which criteria are unverified if evidence is missing."
+                "Write the final answer that directly addresses the question. "
+                "If candidate items are relevant, include a concise list with caveats and "
+                "note which criteria are unverified if evidence is missing. "
+                "If no candidate is fully confirmed, still present the closest matches with "
+                "their verification gaps; do not respond with only 'none found'."
             )
+            coding_task = _looks_like_coding_task(self._question) or _looks_like_coding_task(draft_text)
             try:
                 response = await self.model_manager.call(
                     required_capabilities=[],
+                    objective="best_quality",
+                    avoid_coder=not coding_task,
                     request={
                         "messages": [
-                            {
-                                "role": "system",
-                                "content": (
-                                    "You finalize the response. Return plain text only and include "
-                                    "candidate communities with brief caveats."
-                                ),
-                            },
+                        {
+                            "role": "system",
+                            "content": (
+                                "You finalize the response. Return plain text only and include "
+                                "candidate items with brief caveats when relevant. If nothing is "
+                                "fully confirmed, list closest matches with what is unverified."
+                            ),
+                        },
                             {"role": "user", "content": prompt},
                         ],
                         "temperature": 0.2,
@@ -2461,7 +3256,7 @@ class PlanExecutor:
                 fields=["step_id", "tags", "output_refs", "title"],
             )
             for step in steps.get("steps") or []:
-                tags = set(step.get("tags") or [])
+                tags = self._normalize_phase_tags(step)
                 if "phase:finalize" in tags or str(step.get("title", "")).lower().startswith("final"):
                     refs = step.get("output_refs") or []
                     return refs[0] if refs else None

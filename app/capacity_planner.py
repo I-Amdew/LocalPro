@@ -50,6 +50,29 @@ def _gpu_totals(snapshot: Dict[str, Any]) -> Dict[int, float]:
     return totals
 
 
+def _sanitize_vram_peaks(profile: Dict[str, Any], totals: Dict[int, float]) -> Dict[str, float]:
+    vram_peak_by_gpu = profile.get("vram_instance_peak_mb_by_gpu") or {}
+    load_delta = profile.get("load_delta_vram_mb_by_gpu") or {}
+    sanitized: Dict[str, float] = {}
+    for gid_str, peak_val in vram_peak_by_gpu.items():
+        try:
+            gid = int(gid_str)
+        except Exception:
+            gid = 0
+        peak = _safe_float(peak_val, 0.0)
+        total = totals.get(gid, 0.0)
+        fallback = _safe_float(load_delta.get(str(gid)) or load_delta.get(gid), 0.0)
+        if fallback > 0.0 and peak > (fallback * 1.5):
+            peak = fallback
+        if total and peak > (total * 2.0):
+            peak = fallback if fallback > 0.0 else 0.0
+        if peak > 0.0:
+            sanitized[str(gid)] = peak
+    if not sanitized and profile.get("vram_estimate_only_mb") is not None:
+        sanitized = {"0": _safe_float(profile.get("vram_estimate_only_mb"), 0.0)}
+    return sanitized
+
+
 class CapacityPlanner:
     def __init__(
         self,
@@ -77,14 +100,21 @@ class CapacityPlanner:
 
     def compute_capacity(self, profile: Dict[str, Any], snapshot: Dict[str, Any]) -> Dict[str, Any]:
         ram_peak = _safe_float(profile.get("ram_instance_peak_bytes"))
-        vram_peak_by_gpu = profile.get("vram_instance_peak_mb_by_gpu") or {}
-        if not vram_peak_by_gpu and profile.get("vram_estimate_only_mb") is not None:
-            vram_peak_by_gpu = {"0": _safe_float(profile.get("vram_estimate_only_mb"))}
+        load_delta_ram = _safe_float(profile.get("load_delta_ram_bytes"))
+        totals = _gpu_totals(snapshot)
+        vram_peak_by_gpu = _sanitize_vram_peaks(profile, totals)
         baseline_ram_used = _baseline_ram_used(profile)
         baseline_vram_used = _baseline_vram_used(profile)
         total_ram = _total_ram_bytes(snapshot, profile)
         allowed_ram = total_ram * (1.0 - (self.ram_headroom_pct / 100.0)) if total_ram else 0.0
         usable_ram = allowed_ram - baseline_ram_used
+        if load_delta_ram > 0.0 and (ram_peak <= 0.0 or ram_peak > (load_delta_ram * 4.0)):
+            ram_peak = load_delta_ram
+        if usable_ram > 0.0 and ram_peak > usable_ram:
+            if load_delta_ram > 0.0 and load_delta_ram <= usable_ram:
+                ram_peak = load_delta_ram
+            else:
+                ram_peak = usable_ram
         max_by_ram: Optional[int] = None
         if ram_peak > 0:
             if usable_ram > 0:
@@ -92,7 +122,6 @@ class CapacityPlanner:
             else:
                 max_by_ram = 0
 
-        totals = _gpu_totals(snapshot)
         max_instances_by_gpu: Dict[str, int] = {}
         if totals and vram_peak_by_gpu:
             for gid_str, peak in vram_peak_by_gpu.items():

@@ -34,11 +34,12 @@ class SpawnGovernor:
         ram_headroom_pct: float = 10.0,
         vram_headroom_pct: float = 10.0,
         max_concurrent_loads: int = 1,
+        load_sem: Optional[asyncio.Semaphore] = None,
     ) -> None:
         self.telemetry = telemetry
         self.ram_headroom_pct = ram_headroom_pct
         self.vram_headroom_pct = vram_headroom_pct
-        self._load_sem = asyncio.Semaphore(max(1, max_concurrent_loads))
+        self._load_sem = load_sem or asyncio.Semaphore(max(1, max_concurrent_loads))
 
     def _headroom_allows(
         self,

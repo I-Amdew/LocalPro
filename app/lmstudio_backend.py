@@ -19,7 +19,11 @@ _CLI_LOAD_TIMEOUT_S = 120.0
 _CLI_UNLOAD_TIMEOUT_S = 30.0
 _CLI_SERVER_TIMEOUT_S = 30.0
 _VRAM_RE = re.compile(r"(\\d+(?:\\.\\d+)?)\\s*mb", re.IGNORECASE)
-_INSTANCE_SUFFIX_RE = re.compile(r"-[0-9a-f]{8}$", re.IGNORECASE)
+_ESTIMATE_RE = re.compile(
+    r"Estimated\\s+(GPU|Total)\\s+Memory:\\s*(\\d+(?:\\.\\d+)?)\\s*(GB|MB)",
+    re.IGNORECASE,
+)
+_INSTANCE_SUFFIX_RE = re.compile(r"(?:-[0-9a-f]{8}|:[0-9]+)$", re.IGNORECASE)
 
 
 def _to_float(val: Any) -> Optional[float]:
@@ -187,6 +191,7 @@ class LMStudioBackend(ModelBackend):
                         continue
                     identifier = item.get("identifier") or item.get("id") or item.get("model")
                     model_key = item.get("modelKey") or item.get("model_key") or item.get("model") or identifier
+                    ctx_len = item.get("contextLength") or item.get("context_length")
                     if not identifier:
                         continue
                     cli_instances.append(
@@ -198,6 +203,7 @@ class LMStudioBackend(ModelBackend):
                             endpoint=self.base_url,
                             status="ready",
                             ttl_seconds=item.get("ttl") or item.get("ttl_seconds"),
+                            context_length=int(ctx_len) if ctx_len is not None else None,
                         )
                     )
             except Exception:
@@ -205,31 +211,32 @@ class LMStudioBackend(ModelBackend):
         if cli_instances:
             instances.extend(cli_instances)
         seen_ids = {inst.api_identifier or inst.instance_id for inst in instances if inst}
-        try:
-            resp = await self.client.get(f"{self.base_url}/models", timeout=5.0)
-            if resp.status_code < 400:
-                data = resp.json()
-                for item in data.get("data", []):
-                    if not isinstance(item, dict):
-                        continue
-                    model_id = item.get("id")
-                    if not model_id:
-                        continue
-                    if model_id in seen_ids:
-                        continue
-                    instances.append(
-                        ModelInstanceInfo(
-                            backend_id=self.id,
-                            instance_id=str(model_id),
-                            model_key=str(model_id),
-                            api_identifier=str(model_id),
-                            endpoint=self.base_url,
-                            status="ready",
+        if not cli_instances:
+            try:
+                resp = await self.client.get(f"{self.base_url}/models", timeout=5.0)
+                if resp.status_code < 400:
+                    data = resp.json()
+                    for item in data.get("data", []):
+                        if not isinstance(item, dict):
+                            continue
+                        model_id = item.get("id")
+                        if not model_id:
+                            continue
+                        if model_id in seen_ids:
+                            continue
+                        instances.append(
+                            ModelInstanceInfo(
+                                backend_id=self.id,
+                                instance_id=str(model_id),
+                                model_key=str(model_id),
+                                api_identifier=str(model_id),
+                                endpoint=self.base_url,
+                                status="ready",
+                            )
                         )
-                    )
-                    seen_ids.add(model_id)
-        except Exception:
-            pass
+                        seen_ids.add(model_id)
+            except Exception:
+                pass
         return instances
 
     async def load_instance(self, model_key: str, opts: Dict[str, Any]) -> ModelInstanceInfo:
@@ -237,6 +244,7 @@ class LMStudioBackend(ModelBackend):
         if not identifier:
             identifier = f"{model_key}-{uuid.uuid4().hex[:8]}"
         ttl = int(opts.get("ttl_seconds") or self.default_ttl_s)
+        ctx_len = opts.get("context_length")
         args = ["load", model_key, "--identifier", str(identifier)]
         if ttl:
             args.extend(["--ttl", str(ttl)])
@@ -254,6 +262,7 @@ class LMStudioBackend(ModelBackend):
             endpoint=self.base_url,
             status="ready",
             ttl_seconds=ttl,
+            context_length=int(ctx_len) if ctx_len is not None else None,
         )
 
     async def unload_instance(self, instance_id_or_identifier: str) -> None:
@@ -280,6 +289,26 @@ class LMStudioBackend(ModelBackend):
                 ram_mb=_to_float(payload.get("ram_mb") or payload.get("ram")),
                 cpu_pct=_to_float(payload.get("cpu_pct") or payload.get("cpu")),
                 gpu_id=_to_float(payload.get("gpu_id")),
+            )
+        matches = _ESTIMATE_RE.findall(raw or "")
+        if matches:
+            vram_mb = None
+            ram_mb = None
+            for kind, value, unit in matches:
+                amount = _to_float(value)
+                if amount is None:
+                    continue
+                if unit and unit.lower().startswith("g"):
+                    amount *= 1024.0
+                if kind.lower().startswith("gpu"):
+                    vram_mb = amount
+                else:
+                    ram_mb = amount
+            if ram_mb is None and vram_mb is not None:
+                ram_mb = vram_mb
+            return ResourceEstimate(
+                vram_mb=vram_mb,
+                ram_mb=ram_mb,
             )
         match = _VRAM_RE.search(raw or "")
         if match:

@@ -33,6 +33,19 @@ def _safe_int(val: Any, default: int = 0) -> int:
         return default
 
 
+def _model_size_hint(model_key: str) -> Optional[float]:
+    if not model_key:
+        return None
+    lower = model_key.lower()
+    for token in lower.replace("-", " ").replace("_", " ").split():
+        if token.endswith("b"):
+            try:
+                return float(token[:-1])
+            except Exception:
+                return None
+    return None
+
+
 def _median(values: List[float]) -> float:
     if not values:
         return 0.0
@@ -153,7 +166,7 @@ def _compute_return_pct(baseline: float, peak: float, current: float) -> float:
 
 def build_config_signature(candidate: "ModelCandidate", opts: Dict[str, Any]) -> str:
     base = {
-        "context_length": opts.get("context_length") or candidate.metadata.get("context_length"),
+        "context_length": opts.get("context_length"),
         "quantization": candidate.metadata.get("quantization") or candidate.metadata.get("quant"),
         "gpu_id": opts.get("gpu"),
     }
@@ -265,6 +278,7 @@ class LoadProfiler:
         max_output_tokens: Optional[int] = None,
         settle_ram_tolerance_bytes: int = DEFAULT_SETTLE_RAM_TOLERANCE_BYTES,
         settle_vram_tolerance_mb: float = DEFAULT_SETTLE_VRAM_TOLERANCE_MB,
+        load_sem: Optional[asyncio.Semaphore] = None,
     ) -> None:
         self.telemetry = telemetry
         self.store = store
@@ -279,6 +293,7 @@ class LoadProfiler:
         self.settle_ram_tolerance_bytes = settle_ram_tolerance_bytes
         self.settle_vram_tolerance_mb = settle_vram_tolerance_mb
         self.tests = _build_test_suite()
+        self._load_sem = load_sem
 
     def _headroom_allows(
         self,
@@ -334,6 +349,10 @@ class LoadProfiler:
         estimate_vram = _safe_float(getattr(estimate, "vram_mb", None)) if estimate else None
         estimate_ram = _safe_float(getattr(estimate, "ram_mb", None)) if estimate else None
         estimate_ram_bytes = estimate_ram * 1024.0 * 1024.0 if estimate_ram else None
+        if estimate_vram is None:
+            size_hint = _model_size_hint(candidate.model_key)
+            if size_hint is not None:
+                estimate_vram = size_hint * 900.0
         base_snapshot = self.telemetry.snapshot()
         gpu_id = None
         if opts.get("gpu") is not None:
@@ -368,7 +387,11 @@ class LoadProfiler:
         opts.setdefault("identifier", instance_id)
         opts.setdefault("ttl_seconds", 240)
         try:
-            instance = await backend.load_instance(candidate.model_key, opts)
+            if self._load_sem:
+                async with self._load_sem:
+                    instance = await backend.load_instance(candidate.model_key, opts)
+            else:
+                instance = await backend.load_instance(candidate.model_key, opts)
         except Exception as exc:
             return {
                 "backend_id": candidate.backend_id,
@@ -411,6 +434,7 @@ class LoadProfiler:
             if not load_delta_vram and estimate_vram is not None:
                 load_delta_vram = {"0": estimate_vram}
                 vram_estimate_only = True
+            test_base_snapshot = post_load
             per_test_runs: Dict[str, List[Dict[str, Any]]] = {t["name"]: [] for t in self.tests}
             tool_supported = backend.supports_tools()
             structured_supported: Optional[bool] = candidate.capabilities.get("structured_output")
@@ -420,7 +444,7 @@ class LoadProfiler:
                         backend=backend,
                         instance=instance,
                         test=test,
-                        base_snapshot=base_snapshot,
+                        base_snapshot=test_base_snapshot,
                         tool_supported=tool_supported,
                         structured_supported=structured_supported,
                     )
@@ -445,12 +469,14 @@ class LoadProfiler:
                 tps_values = [r.get("tokens_per_sec", 0.0) for r in runs if r.get("tokens_per_sec")]
                 tokens_values = [r.get("tokens_out", 0) for r in runs if r.get("tokens_out")]
                 peak_ram = max((r.get("peak_delta_ram_bytes", 0.0) for r in runs), default=0.0)
-                peak_ram_values.append(peak_ram)
+                peak_ram_values.append(load_delta_ram + peak_ram)
                 peak_vram = {}
                 for r in runs:
                     for gid, val in (r.get("peak_delta_vram_mb_by_gpu") or {}).items():
-                        peak_vram[gid] = max(peak_vram.get(gid, 0.0), _safe_float(val))
-                        peak_vram_by_gpu[gid] = max(peak_vram_by_gpu.get(gid, 0.0), _safe_float(val))
+                        cleaned = _safe_float(val)
+                        peak_vram[gid] = max(peak_vram.get(gid, 0.0), cleaned)
+                        load_base = _safe_float(load_delta_vram.get(str(gid)) or load_delta_vram.get(gid), 0.0)
+                        peak_vram_by_gpu[gid] = max(peak_vram_by_gpu.get(gid, 0.0), load_base + cleaned)
                 success_rate = 1.0 if runs and errors == 0 else (1.0 - (errors / max(len(runs), 1)))
                 capability_values = [
                     1.0 if r.get("capability_supported") else 0.0
@@ -611,7 +637,12 @@ class LoadProfiler:
                         payload=fallback_payload,
                         base_snapshot=base_snapshot,
                     )
-                if structured_supported is None:
+                    parsed_fallback = _parse_structured_text(_extract_text(result.get("response") or {}))
+                    if parsed_fallback and parsed_fallback.get("ok") is True and parsed_fallback.get("label") == "alpha":
+                        capability_supported = True
+                    else:
+                        capability_supported = False
+                if structured_supported is None and capability_supported is None:
                     capability_supported = False
         return {
             "success": bool(result.get("success")),

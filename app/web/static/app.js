@@ -9,6 +9,9 @@ let timerInterval = null;
 let timerStartedAt = null;
 let timerRunId = null;
 let etaTargetAt = null;
+let etaLastTotalSteps = null;
+let etaLastCompletedSteps = null;
+let etaModel = createEtaModel();
 let lastAssistantRunId = null;
 let historyLog = [];
 let totalSteps = 0;
@@ -44,6 +47,14 @@ let lastEventSeq = 0;
 let thinkingPlaceholders = {};
 let latestLiveLine = "Thinking...";
 let activeAgentSteps = new Map();
+let planState = {
+  planId: null,
+  kind: "",
+  goal: "",
+  revision: 0,
+  steps: new Map(),
+  counts: null,
+};
 let uploadPanelVisible = false;
 let draggingUploads = false;
 let settingsDefaults = {
@@ -78,6 +89,10 @@ const NARRATION_PREFIX = "";
 const EXECUTOR_AGENT_KEY = "__executor__";
 const EXECUTOR_AGENT_LABEL = "Executor";
 const DEFAULT_STEP_MS = 15000;
+const ETA_MIN_STEP_MS = 1000;
+const ETA_PASS_BASELINE = -1.1;
+const ETA_MAX_EXTRA_PASSES = 1;
+const ETA_ONE_TIME_STEP_TYPES = new Set(["analysis", "plan", "planning"]);
 function getInitialApiBase() {
   const params = new URLSearchParams(window.location.search);
   const fromQuery = params.get("api") || params.get("api_base");
@@ -302,6 +317,302 @@ function formatTime(ms) {
   return `${m}:${s}`;
 }
 
+function clamp(value, min, max) {
+  return Math.min(Math.max(value, min), max);
+}
+
+function createEtaStat() {
+  return { count: 0, mean: 0, m2: 0, ema: null, last: null };
+}
+
+function updateEtaStat(stat, sampleMs) {
+  const val = Number(sampleMs);
+  if (!Number.isFinite(val) || val <= 0) return;
+  stat.count += 1;
+  const delta = val - stat.mean;
+  stat.mean += delta / stat.count;
+  stat.m2 += delta * (val - stat.mean);
+  const alpha = 0.25;
+  stat.ema = stat.ema === null ? val : stat.ema + alpha * (val - stat.ema);
+  stat.last = val;
+}
+
+function etaStatValue(stat, fallback) {
+  if (!stat || !stat.count) return fallback;
+  const mean = stat.mean || fallback;
+  const variance = stat.count > 1 ? stat.m2 / (stat.count - 1) : 0;
+  const std = Math.sqrt(Math.max(variance, 0));
+  const ema = stat.ema ?? mean;
+  const last = stat.last || 0;
+  const conservative = Math.max(ema, mean + std * 0.5, last);
+  return Number.isFinite(conservative) && conservative > 0 ? conservative : fallback;
+}
+
+function etaTypeKey(type) {
+  return String(type || "").trim().toLowerCase();
+}
+
+function getEtaTypeStat(type, create = false) {
+  if (!etaModel) etaModel = createEtaModel();
+  const key = etaTypeKey(type);
+  if (!key) return null;
+  if (!etaModel.stats.byType.has(key)) {
+    if (!create) return null;
+    etaModel.stats.byType.set(key, createEtaStat());
+  }
+  return etaModel.stats.byType.get(key);
+}
+
+function isOneTimeStepType(type) {
+  const key = etaTypeKey(type);
+  return key ? ETA_ONE_TIME_STEP_TYPES.has(key) : false;
+}
+
+function createEtaModel() {
+  return {
+    stepStarts: new Map(),
+    stats: { overall: createEtaStat(), byType: new Map() },
+    pass: { expected: 1, observed: 1, riskScore: 0 },
+    parallel: { target: null, lastObserved: 1 },
+    lastPredictedPasses: 1,
+    lastPredictedTotal: null,
+  };
+}
+
+function resetEtaModel() {
+  etaModel = createEtaModel();
+  etaTargetAt = null;
+  etaLastTotalSteps = null;
+  etaLastCompletedSteps = null;
+}
+
+function noteEtaStepStart(detail = {}) {
+  if (!etaModel) etaModel = createEtaModel();
+  const key = stepKeyFrom(detail);
+  if (!key) return;
+  const type = etaTypeKey(detail.type || detail.step_type || "");
+  etaModel.stepStarts.set(key, { startedAt: Date.now(), type });
+}
+
+function noteEtaStepEnd(detail = {}) {
+  if (!etaModel) etaModel = createEtaModel();
+  const key = stepKeyFrom(detail);
+  if (!key) return;
+  const entry = etaModel.stepStarts.get(key);
+  if (!entry) return;
+  etaModel.stepStarts.delete(key);
+  const durationMs = Date.now() - entry.startedAt;
+  if (!Number.isFinite(durationMs) || durationMs <= 0) return;
+  updateEtaStat(etaModel.stats.overall, durationMs);
+  const typeStat = getEtaTypeStat(entry.type || detail.type || detail.step_type, true);
+  if (typeStat) updateEtaStat(typeStat, durationMs);
+}
+
+function bumpEtaRisk(amount) {
+  if (!etaModel) etaModel = createEtaModel();
+  const next = (etaModel.pass.riskScore || 0) + amount;
+  etaModel.pass.riskScore = clamp(next, 0, 3);
+}
+
+function noteEtaExpectedPasses(value) {
+  if (!etaModel) etaModel = createEtaModel();
+  const num = Number(value);
+  if (!Number.isFinite(num) || num <= 0) return;
+  etaModel.pass.expected = Math.max(etaModel.pass.expected || 1, num);
+}
+
+function noteEtaSignal(type, detail = {}) {
+  switch (type) {
+    case "strict_mode":
+      bumpEtaRisk(0.5);
+      break;
+    case "planner_verifier":
+      bumpEtaRisk(0.35);
+      break;
+    case "step_error":
+    case "model_error":
+    case "model_unavailable":
+      bumpEtaRisk(0.4);
+      break;
+    case "control_action": {
+      const control = String(detail.control || detail.action_type || "").toUpperCase();
+      if (control && control !== "CONTINUE") bumpEtaRisk(0.3);
+      break;
+    }
+    case "loop_iteration": {
+      const iter = Number(detail.iteration ?? detail);
+      if (Number.isFinite(iter) && iter >= 1) {
+        etaModel.pass.observed = Math.max(etaModel.pass.observed || 1, iter + 1);
+      }
+      bumpEtaRisk(0.8);
+      break;
+    }
+    default:
+      break;
+  }
+}
+
+function etaPassProbability() {
+  if (!etaModel) etaModel = createEtaModel();
+  const expected = Math.max(etaModel.pass.expected || 1, 1);
+  const observed = Math.max(etaModel.pass.observed || 1, 1);
+  let score = ETA_PASS_BASELINE + (etaModel.pass.riskScore || 0);
+  score += Math.min(expected - 1, 2) * 0.6;
+  score += Math.min(observed - 1, 2) * 0.8;
+  if (multiAgentMode) score += 0.15;
+  const progress = totalSteps > 0 ? Math.min(completedSteps / totalSteps, 1) : 0;
+  score -= progress * 0.25;
+  const prob = 1 / (1 + Math.exp(-score));
+  return clamp(prob, 0.05, 0.85);
+}
+
+function predictEtaPasses() {
+  if (!etaModel) etaModel = createEtaModel();
+  const expected = Math.max(etaModel.pass.expected || 1, 1);
+  const observed = Math.max(etaModel.pass.observed || 1, 1);
+  const base = Math.max(expected, observed);
+  const extra = etaPassProbability();
+  return Math.min(base + ETA_MAX_EXTRA_PASSES, base + extra);
+}
+
+function noteEtaParallelBudget(budget = {}) {
+  if (!etaModel) etaModel = createEtaModel();
+  const maxParallel = Number(budget.max_parallel || budget.max || budget.slots || 0);
+  const desired = Number(budget.desired_parallel || 0);
+  const target = Math.max(maxParallel, desired, 0);
+  if (target > 0) etaModel.parallel.target = target;
+}
+
+function estimatePerPassRerun(baseTotal) {
+  if (!Number.isFinite(baseTotal) || baseTotal <= 0) return 0;
+  if (planState.steps && planState.steps.size) {
+    let oneTime = 0;
+    planState.steps.forEach((step) => {
+      if (isOneTimeStepType(step.step_type)) oneTime += 1;
+    });
+    const rerun = Math.max(baseTotal - oneTime, Math.round(baseTotal * 0.6));
+    return Math.max(1, rerun);
+  }
+  return Math.max(1, Math.round(baseTotal * 0.6));
+}
+
+function estimateWeightedStepMs(basePerStepMs) {
+  if (!planState.steps || !planState.steps.size) return basePerStepMs;
+  let sum = 0;
+  let count = 0;
+  planState.steps.forEach((step) => {
+    const status = String(step.status || "PENDING").toUpperCase();
+    if (status === "DONE" || status === "FAILED") return;
+    const stat = getEtaTypeStat(step.step_type, false);
+    const val = etaStatValue(stat, basePerStepMs);
+    sum += val;
+    count += 1;
+  });
+  return count ? sum / count : basePerStepMs;
+}
+
+function estimateParallelism(entries) {
+  if (!etaModel) etaModel = createEtaModel();
+  const observed = entries.length || etaModel.parallel.lastObserved || 1;
+  etaModel.parallel.lastObserved = observed;
+  const target = Number(etaModel.parallel.target || 0);
+  if (!Number.isFinite(target) || target <= 0) return Math.max(1, observed);
+  const capped = Math.min(target, observed + 0.5);
+  return Math.max(1, capped);
+}
+
+function computeEtaEstimate(now) {
+  if (!etaModel) etaModel = createEtaModel();
+  const hasPlan = planState.steps && planState.steps.size;
+  if (!timerStartedAt || (!totalSteps && !hasPlan)) return null;
+  const entries = activeAgentEntries();
+  const elapsed = Math.max(now - timerStartedAt, 0);
+  const perStepFromProgress = completedSteps > 0 ? elapsed / completedSteps : null;
+  const statStepMs = etaStatValue(etaModel.stats.overall, DEFAULT_STEP_MS);
+  let perStepMs = Math.max(DEFAULT_STEP_MS, perStepFromProgress || 0, statStepMs || 0);
+  if (entries.length) {
+    const runningDurations = entries
+      .map(([, entry]) => (Number.isFinite(entry.startedAt) ? now - entry.startedAt : null))
+      .filter((val) => Number.isFinite(val) && val > 0);
+    if (runningDurations.length) {
+      const sum = runningDurations.reduce((acc, val) => acc + val, 0);
+      const avg = sum / runningDurations.length;
+      if (Number.isFinite(avg) && avg > 0) perStepMs = Math.max(perStepMs, avg);
+    }
+  }
+  perStepMs = Math.max(perStepMs, ETA_MIN_STEP_MS);
+  const weightedMs = estimateWeightedStepMs(perStepMs);
+  perStepMs = Math.max(perStepMs, weightedMs);
+
+  let estimatedCompleted = completedSteps;
+  if (entries.length && totalSteps > 0) {
+    const remaining = Math.max(totalSteps - completedSteps, 0);
+    let inFlight = 0;
+    for (const [, entry] of entries) {
+      if (inFlight >= remaining) break;
+      const startedAt = Number.isFinite(entry.startedAt) ? entry.startedAt : timerStartedAt;
+      const since = Math.max(now - (startedAt || now), 0);
+      const fraction = perStepMs > 0 ? Math.min(0.9, since / perStepMs) : 0;
+      inFlight += fraction;
+    }
+    estimatedCompleted += Math.min(inFlight, remaining);
+  }
+
+  const baseTotal = planState.steps && planState.steps.size ? planState.steps.size : totalSteps;
+  const expectedPasses = Math.max(etaModel.pass.expected || 1, 1);
+  const predictedPasses = predictEtaPasses();
+  const perPassRerun = estimatePerPassRerun(baseTotal);
+  let expectedTotal = baseTotal;
+  if (expectedPasses > 1 && perPassRerun) {
+    expectedTotal = baseTotal + perPassRerun * (expectedPasses - 1);
+  }
+  if (totalSteps > 0) expectedTotal = Math.max(expectedTotal, totalSteps);
+  const extraPasses = Math.max(0, predictedPasses - expectedPasses);
+  const predictedTotal = expectedTotal + perPassRerun * extraPasses;
+  const parallelism = estimateParallelism(entries);
+  const remainingSteps = Math.max(predictedTotal - estimatedCompleted, 0);
+  const remainingMs = (perStepMs * remainingSteps) / parallelism;
+  return {
+    perStepMs,
+    estimatedCompleted,
+    predictedTotal,
+    predictedPasses,
+    remainingMs,
+  };
+}
+
+function applyEtaEstimate(now, estimate) {
+  if (!etaModel) etaModel = createEtaModel();
+  const etaEl = el("etaText");
+  if (!etaEl) return;
+  if (!estimate || !Number.isFinite(estimate.remainingMs)) {
+    etaTargetAt = null;
+    etaLastTotalSteps = totalSteps;
+    etaLastCompletedSteps = completedSteps;
+    etaEl.textContent = totalSteps > 0 ? "ETA: ..." : "ETA: --";
+    return;
+  }
+  const remainingMs = Math.max(estimate.remainingMs, 0);
+  const newTarget = now + remainingMs;
+  const totalIncreased = Number.isFinite(etaLastTotalSteps) && totalSteps > etaLastTotalSteps;
+  const predictedIncrease =
+    Number.isFinite(etaModel.lastPredictedTotal) && estimate.predictedTotal > etaModel.lastPredictedTotal + 0.5;
+  const passesIncrease =
+    Number.isFinite(etaModel.lastPredictedPasses) && estimate.predictedPasses > etaModel.lastPredictedPasses + 0.05;
+  const allowIncrease = etaTargetAt === null || totalIncreased || predictedIncrease || passesIncrease;
+  if (etaTargetAt === null || allowIncrease) {
+    etaTargetAt = newTarget;
+  } else if (newTarget < etaTargetAt - 500) {
+    etaTargetAt = newTarget;
+  }
+  etaLastTotalSteps = totalSteps;
+  etaLastCompletedSteps = completedSteps;
+  etaModel.lastPredictedPasses = estimate.predictedPasses;
+  etaModel.lastPredictedTotal = estimate.predictedTotal;
+  const displayRemaining = Math.max((etaTargetAt ?? newTarget) - now, 0);
+  etaEl.textContent = `ETA: ${formatTime(displayRemaining)}`;
+}
+
 function formatBytes(bytes) {
   if (!bytes && bytes !== 0) return "";
   const units = ["B", "KB", "MB", "GB"];
@@ -372,7 +683,7 @@ function updateEtaCountdown() {
   if (!etaEl) return;
   const remaining = Math.max(etaTargetAt - Date.now(), 0);
   etaEl.textContent = `ETA: ${formatTime(remaining)}`;
-  if (remaining === 0) {
+  if (remaining === 0 && totalSteps > 0 && completedSteps >= totalSteps) {
     etaTargetAt = null;
   }
 }
@@ -848,6 +1159,308 @@ function escapeHtml(text) {
   return div.innerHTML;
 }
 
+function sanitizeUrl(raw) {
+  const value = String(raw || "").trim();
+  if (!value) return null;
+  if (value.startsWith("#") || value.startsWith("/") || value.startsWith("./") || value.startsWith("../")) {
+    return value;
+  }
+  try {
+    const parsed = new URL(value, window.location.href);
+    const protocol = parsed.protocol.toLowerCase();
+    if (protocol === "http:" || protocol === "https:" || protocol === "mailto:") {
+      return parsed.href;
+    }
+  } catch (_) {}
+  return null;
+}
+
+function applyEmphasis(escaped) {
+  let html = escaped;
+  html = html.replace(/~~(.+?)~~/g, "<del>$1</del>");
+  html = html.replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>");
+  html = html.replace(/__(.+?)__/g, "<strong>$1</strong>");
+  html = html.replace(/\*(.+?)\*/g, "<em>$1</em>");
+  html = html.replace(/_(.+?)_/g, "<em>$1</em>");
+  return html;
+}
+
+function applyInlineFormatting(text) {
+  if (!text) return "";
+  const linkRegex = /\[([^\]]+)\]\(([^)]+)\)/g;
+  const segments = [];
+  let lastIndex = 0;
+  let match = null;
+  while ((match = linkRegex.exec(text)) !== null) {
+    if (match.index > lastIndex) {
+      segments.push({ type: "text", value: text.slice(lastIndex, match.index) });
+    }
+    segments.push({ type: "link", label: match[1], url: match[2], raw: match[0] });
+    lastIndex = linkRegex.lastIndex;
+  }
+  if (lastIndex < text.length) {
+    segments.push({ type: "text", value: text.slice(lastIndex) });
+  }
+  return segments
+    .map((segment) => {
+      if (segment.type === "text") {
+        return applyEmphasis(escapeHtml(segment.value));
+      }
+      const safe = sanitizeUrl(segment.url);
+      if (!safe) {
+        return escapeHtml(segment.raw);
+      }
+      const label = applyEmphasis(escapeHtml(segment.label));
+      return `<a href="${escapeHtml(safe)}" target="_blank" rel="noopener noreferrer">${label}</a>`;
+    })
+    .join("");
+}
+
+function formatInline(text) {
+  if (!text) return "";
+  const parts = [];
+  const regex = /`([^`]+)`/g;
+  let lastIndex = 0;
+  let match = null;
+  while ((match = regex.exec(text)) !== null) {
+    if (match.index > lastIndex) {
+      parts.push(applyInlineFormatting(text.slice(lastIndex, match.index)));
+    }
+    parts.push(`<code>${escapeHtml(match[1])}</code>`);
+    lastIndex = regex.lastIndex;
+  }
+  if (lastIndex < text.length) {
+    parts.push(applyInlineFormatting(text.slice(lastIndex)));
+  }
+  return parts.join("");
+}
+
+function splitTableCells(line) {
+  let text = String(line || "").trim();
+  if (text.startsWith("|")) text = text.slice(1);
+  if (text.endsWith("|")) text = text.slice(0, -1);
+  const cells = [];
+  let current = "";
+  let inCode = false;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (ch === "`") {
+      inCode = !inCode;
+      current += ch;
+      continue;
+    }
+    if (ch === "\\" && i + 1 < text.length) {
+      const next = text[i + 1];
+      if (next === "|" || next === "\\") {
+        current += next;
+        i += 1;
+        continue;
+      }
+    }
+    if (ch === "|" && !inCode) {
+      cells.push(current.trim());
+      current = "";
+      continue;
+    }
+    current += ch;
+  }
+  cells.push(current.trim());
+  return cells;
+}
+
+function isTableSeparatorLine(line) {
+  const raw = String(line || "");
+  if (!raw.includes("|")) return false;
+  const parts = splitTableCells(raw);
+  if (!parts.length) return false;
+  return parts.every((part) => /^:?-+:?$/.test(part.trim()));
+}
+
+function parseTableAlignments(line) {
+  return splitTableCells(line).map((part) => {
+    const trimmed = part.trim();
+    const left = trimmed.startsWith(":");
+    const right = trimmed.endsWith(":");
+    if (left && right) return "center";
+    if (right) return "right";
+    if (left) return "left";
+    return null;
+  });
+}
+
+function buildTableHtml(headerCells, rows, alignments) {
+  const rowLengths = rows.map((row) => row.length);
+  const colCount = Math.max(headerCells.length, alignments.length, ...rowLengths);
+  const normalizeCells = (cells) => {
+    const filled = [];
+    for (let i = 0; i < colCount; i++) {
+      filled.push(cells[i] || "");
+    }
+    return filled;
+  };
+  const alignAttr = (index) => {
+    const align = alignments[index];
+    return align ? ` style="text-align: ${align};"` : "";
+  };
+  const headerHtml = normalizeCells(headerCells)
+    .map((cell, idx) => `<th${alignAttr(idx)}>${formatInline(cell)}</th>`)
+    .join("");
+  const bodyHtml = rows
+    .map((row) => {
+      const cells = normalizeCells(row)
+        .map((cell, idx) => `<td${alignAttr(idx)}>${formatInline(cell)}</td>`)
+        .join("");
+      return `<tr>${cells}</tr>`;
+    })
+    .join("");
+  return `<table><thead><tr>${headerHtml}</tr></thead><tbody>${bodyHtml}</tbody></table>`;
+}
+
+function renderMarkdown(text) {
+  const input = String(text || "");
+  if (!input.trim()) return "";
+  const lines = input.replace(/\r\n/g, "\n").split("\n");
+  const blocks = [];
+  let inCode = false;
+  let codeLang = "";
+  let codeLines = [];
+  let listType = null;
+  let listItems = [];
+  let paragraphLines = [];
+  let blockquoteLines = [];
+
+  const flushParagraph = () => {
+    if (!paragraphLines.length) return;
+    const content = formatInline(paragraphLines.join("\n")).replace(/\n/g, "<br>");
+    blocks.push(`<p>${content}</p>`);
+    paragraphLines = [];
+  };
+  const flushList = () => {
+    if (!listType || !listItems.length) {
+      listType = null;
+      listItems = [];
+      return;
+    }
+    blocks.push(`<${listType}>${listItems.join("")}</${listType}>`);
+    listType = null;
+    listItems = [];
+  };
+  const flushBlockquote = () => {
+    if (!blockquoteLines.length) return;
+    const content = formatInline(blockquoteLines.join("\n")).replace(/\n/g, "<br>");
+    blocks.push(`<blockquote>${content}</blockquote>`);
+    blockquoteLines = [];
+  };
+  const closeTextBlocks = () => {
+    flushParagraph();
+    flushList();
+    flushBlockquote();
+  };
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const trimmed = line.trim();
+    if (inCode) {
+      if (trimmed.startsWith("```")) {
+        const safeLang = String(codeLang || "").replace(/[^a-z0-9_-]+/gi, "");
+        const classAttr = safeLang ? ` class="language-${safeLang}"` : "";
+        blocks.push(`<pre><code${classAttr}>${escapeHtml(codeLines.join("\n"))}</code></pre>`);
+        inCode = false;
+        codeLang = "";
+        codeLines = [];
+      } else {
+        codeLines.push(line);
+      }
+      continue;
+    }
+
+    const fenceMatch = line.match(/^```\s*([a-zA-Z0-9_-]+)?\s*$/);
+    if (fenceMatch) {
+      closeTextBlocks();
+      inCode = true;
+      codeLang = fenceMatch[1] || "";
+      continue;
+    }
+
+    const nextLine = i + 1 < lines.length ? lines[i + 1] : "";
+    if (line.includes("|") && isTableSeparatorLine(nextLine)) {
+      closeTextBlocks();
+      const headerCells = splitTableCells(line);
+      const alignments = parseTableAlignments(nextLine);
+      const rows = [];
+      let rowIndex = i + 2;
+      for (; rowIndex < lines.length; rowIndex++) {
+        const rowLine = lines[rowIndex];
+        if (!rowLine.trim()) break;
+        if (!rowLine.includes("|")) break;
+        if (rowLine.trim().startsWith("```")) break;
+        rows.push(splitTableCells(rowLine));
+      }
+      blocks.push(buildTableHtml(headerCells, rows, alignments));
+      i = rowIndex - 1;
+      continue;
+    }
+
+    if (!trimmed) {
+      closeTextBlocks();
+      continue;
+    }
+
+    const headingMatch = line.match(/^(#{1,6})\s+(.*)$/);
+    if (headingMatch) {
+      closeTextBlocks();
+      const level = headingMatch[1].length;
+      const content = formatInline(headingMatch[2].trim());
+      blocks.push(`<h${level}>${content}</h${level}>`);
+      continue;
+    }
+
+    if (/^(-{3,}|\*{3,}|_{3,})$/.test(trimmed)) {
+      closeTextBlocks();
+      blocks.push("<hr>");
+      continue;
+    }
+
+    const quoteMatch = line.match(/^\s*>\s?(.*)$/);
+    if (quoteMatch) {
+      flushParagraph();
+      flushList();
+      blockquoteLines.push(quoteMatch[1]);
+      continue;
+    }
+
+    const orderedMatch = line.match(/^\s*\d+[.)]\s+(.*)$/);
+    const unorderedMatch = line.match(/^\s*[-+*]\s+(.*)$/);
+    if (orderedMatch || unorderedMatch) {
+      flushParagraph();
+      flushBlockquote();
+      const nextType = orderedMatch ? "ol" : "ul";
+      if (listType && listType !== nextType) {
+        flushList();
+      }
+      listType = nextType;
+      const itemText = (orderedMatch || unorderedMatch)[1];
+      listItems.push(`<li>${formatInline(itemText)}</li>`);
+      continue;
+    }
+
+    if (listType) {
+      flushList();
+    }
+    paragraphLines.push(line);
+  }
+
+  if (inCode) {
+    const safeLang = String(codeLang || "").replace(/[^a-z0-9_-]+/gi, "");
+    const classAttr = safeLang ? ` class="language-${safeLang}"` : "";
+    blocks.push(`<pre><code${classAttr}>${escapeHtml(codeLines.join("\n"))}</code></pre>`);
+  } else {
+    closeTextBlocks();
+  }
+
+  return blocks.join("");
+}
+
 async function copyToClipboard(text) {
   const value = String(text || "");
   if (!value) return false;
@@ -902,6 +1515,7 @@ function appendChat(role, text, opts = {}) {
   const runId = opts.runId || null;
   const cleanText = text || "";
   const html = opts.html || null;
+  const useMarkdown = typeof opts.markdown === "boolean" ? opts.markdown : role !== "user";
   const skipPending = opts.skipPending === true;
   const state = opts.state || null;
   const idKey = messageId ? String(messageId) : null;
@@ -932,7 +1546,8 @@ function appendChat(role, text, opts = {}) {
   head.textContent = role === "user" ? "You" : "LocalPro";
   const body = document.createElement("div");
   body.className = "bubble-body";
-  body.innerHTML = html !== null ? html : escapeAndBreak(cleanText);
+  const content = html !== null ? html : useMarkdown ? renderMarkdown(cleanText) : escapeAndBreak(cleanText);
+  body.innerHTML = content;
   wrap.appendChild(head);
   wrap.appendChild(body);
   el("chatThread").appendChild(wrap);
@@ -1233,7 +1848,170 @@ function resetLiveStreamState(question = "") {
   pendingQuestion = question;
   questionShownInLive = false;
   multiAgentMode = false;
+  resetEtaModel();
   resetLiveAgentState();
+  resetPlanState();
+}
+
+const PLAN_STATUS_ORDER = {
+  RUNNING: 0,
+  READY: 1,
+  CLAIMED: 2,
+  PENDING: 3,
+  DONE: 4,
+  FAILED: 5,
+};
+
+function resetPlanState() {
+  planState = { planId: null, kind: "", goal: "", revision: 0, steps: new Map(), counts: null };
+  renderPlan();
+}
+
+function normalizePlanStep(step = {}) {
+  const status = String(step.status || "PENDING").toUpperCase();
+  return {
+    step_id: String(step.step_id || step.id || ""),
+    title: String(step.title || step.name || step.label || "").trim(),
+    display_title: String(
+      step.display_title || step.displayTitle || step.human_title || step.humanTitle || ""
+    ).trim(),
+    display_target: String(
+      step.display_target || step.displayTarget || step.human_target || step.humanTarget || ""
+    ).trim(),
+    status,
+    step_type: String(step.step_type || step.type || "").trim(),
+    tags: Array.isArray(step.tags) ? step.tags : [],
+    prereq_step_ids: Array.isArray(step.prereq_step_ids)
+      ? step.prereq_step_ids
+      : Array.isArray(step.depends_on)
+      ? step.depends_on
+      : [],
+    priority: Number.isFinite(Number(step.priority)) ? Number(step.priority) : 0,
+    partition_key: step.partition_key || "",
+  };
+}
+
+function setPlanSnapshot(payload = {}) {
+  const planId = payload.plan_id || payload.planId || null;
+  planState.planId = planId;
+  planState.kind = payload.kind || planState.kind || "";
+  planState.goal = payload.goal || planState.goal || "";
+  planState.revision = Number(payload.revision || planState.revision || 0);
+  planState.counts = payload.counts_by_status || payload.counts || null;
+  planState.steps = new Map();
+  const steps = Array.isArray(payload.steps) ? payload.steps : [];
+  steps.forEach((step) => {
+    const normalized = normalizePlanStep(step);
+    if (normalized.step_id) {
+      planState.steps.set(normalized.step_id, normalized);
+    }
+  });
+  renderPlan();
+}
+
+function addPlanSteps(payload = {}) {
+  const planId = payload.plan_id || payload.planId || null;
+  if (planId && planState.planId && planId !== planState.planId) {
+    resetPlanState();
+  }
+  if (planId) planState.planId = planId;
+  if (payload.kind) planState.kind = payload.kind;
+  if (payload.goal) planState.goal = payload.goal;
+  const steps = Array.isArray(payload.steps) ? payload.steps : [];
+  steps.forEach((step) => {
+    const normalized = normalizePlanStep(step);
+    if (normalized.step_id) {
+      planState.steps.set(normalized.step_id, normalized);
+    }
+  });
+  renderPlan();
+}
+
+function updatePlanStepStatus(stepId, status) {
+  if (!stepId || !planState.steps.size) return;
+  const key = String(stepId);
+  const step = planState.steps.get(key);
+  if (!step) return;
+  const nextStatus = String(status || "").toUpperCase();
+  if (nextStatus && step.status !== nextStatus) {
+    step.status = nextStatus;
+    planState.steps.set(key, step);
+    renderPlan();
+  }
+}
+
+function computePlanCounts() {
+  const counts = {};
+  planState.steps.forEach((step) => {
+    const status = String(step.status || "PENDING").toUpperCase();
+    counts[status] = (counts[status] || 0) + 1;
+  });
+  return counts;
+}
+
+function formatPlanSummary(counts) {
+  if (!counts) return "";
+  const total = Object.values(counts).reduce((acc, val) => acc + Number(val || 0), 0);
+  const done = Number(counts.DONE || 0);
+  const failed = Number(counts.FAILED || 0);
+  const running = Number(counts.RUNNING || 0);
+  const ready = Number(counts.READY || 0);
+  const pending = Number(counts.PENDING || 0) + Number(counts.CLAIMED || 0);
+  return `Steps: ${total} | Running ${running} | Ready ${ready} | Pending ${pending} | Done ${done} | Failed ${failed}`;
+}
+
+function renderPlan() {
+  const feed = el("planFeed");
+  const summaryEl = el("planSummary");
+  if (!feed) return;
+  const steps = Array.from(planState.steps.values());
+  if (!steps.length) {
+    feed.innerHTML = "";
+    if (summaryEl) summaryEl.textContent = "";
+    return;
+  }
+  const counts = planState.counts || computePlanCounts();
+  if (summaryEl) {
+    summaryEl.textContent = formatPlanSummary(counts);
+  }
+  steps.sort((a, b) => {
+    const orderA = PLAN_STATUS_ORDER[a.status] ?? 99;
+    const orderB = PLAN_STATUS_ORDER[b.status] ?? 99;
+    if (orderA !== orderB) return orderA - orderB;
+    if (a.priority !== b.priority) return b.priority - a.priority;
+    const titleA = a.display_title || a.title;
+    const titleB = b.display_title || b.title;
+    return titleA.localeCompare(titleB);
+  });
+  feed.innerHTML = "";
+  steps.forEach((step) => {
+    const row = document.createElement("div");
+    const status = String(step.status || "PENDING").toUpperCase();
+    const statusClass = status.toLowerCase();
+    row.className = `plan-step ${statusClass}`;
+    const badge = document.createElement("span");
+    badge.className = `plan-status ${statusClass}`;
+    badge.textContent = status;
+    const title = document.createElement("span");
+    title.className = "plan-title";
+    title.textContent = step.display_title || step.title || step.step_id || "Step";
+    const header = document.createElement("div");
+    header.className = "plan-header";
+    header.appendChild(badge);
+    header.appendChild(title);
+    row.appendChild(header);
+    const metaParts = [];
+    if (step.step_type) metaParts.push(step.step_type);
+    if (step.prereq_step_ids && step.prereq_step_ids.length) metaParts.push(`deps ${step.prereq_step_ids.length}`);
+    if (step.tags && step.tags.length) metaParts.push(step.tags.slice(0, 3).join(", "));
+    if (metaParts.length) {
+      const meta = document.createElement("div");
+      meta.className = "plan-meta";
+      meta.textContent = metaParts.join(" | ");
+      row.appendChild(meta);
+    }
+    feed.appendChild(row);
+  });
 }
 
 function stepKeyFrom(detail = {}) {
@@ -1242,7 +2020,49 @@ function stepKeyFrom(detail = {}) {
   return String(key);
 }
 
+function planStepFor(detail = {}) {
+  const key = stepKeyFrom(detail);
+  if (!key || !planState.steps) return null;
+  return planState.steps.get(String(key)) || null;
+}
+
+function resolveStepLabel(detail = {}, preferTarget = false) {
+  const planStep = planStepFor(detail);
+  const displayTarget = String(
+    detail?.display_target ||
+      detail?.displayTarget ||
+      planStep?.display_target ||
+      planStep?.displayTarget ||
+      ""
+  ).trim();
+  const displayTitle = String(
+    detail?.display_title ||
+      detail?.displayTitle ||
+      planStep?.display_title ||
+      planStep?.displayTitle ||
+      ""
+  ).trim();
+  if (preferTarget && displayTarget) return displayTarget;
+  if (displayTitle) return displayTitle;
+  if (displayTarget) return displayTarget;
+  const name = String(detail?.name || "").trim();
+  if (name) return name;
+  return planStep?.title || "";
+}
+
+function enrichStepDetail(detail = {}, preferTarget = false) {
+  const planStep = planStepFor(detail);
+  if (!planStep) return detail;
+  const name = resolveStepLabel(detail, preferTarget);
+  const enriched = { ...detail };
+  if (name) enriched.name = name;
+  if (!enriched.type && planStep.step_type) enriched.type = planStep.step_type;
+  return enriched;
+}
+
 function agentLabelFrom(detail = {}) {
+  const human = resolveStepLabel(detail, true);
+  if (human) return human;
   const name = String(detail?.name || "").trim();
   if (name) return name;
   const profile = String(detail?.agent_profile || "").trim();
@@ -1451,7 +2271,7 @@ function withLane(text, lane, multiLane) {
 }
 
 function inferStepType(detail) {
-  const raw = String(detail?.type || "").toLowerCase();
+  const raw = String(detail?.type || detail?.step_type || detail?.stepType || "").toLowerCase();
   if (raw) return raw;
   const name = String(detail?.name || "").toLowerCase();
   if (name.includes("research")) return "research";
@@ -1804,24 +2624,38 @@ function traceLineForEvent(type, detail = {}) {
       if (passes) text += `, ${passes} pass${passes === 1 ? "" : "es"}`;
       return { text, tone: "info", lane: "orch", urls: traceUrls(safe) };
     }
+    case "plan_snapshot": {
+      const steps = Array.isArray(safe.steps) ? safe.steps.length : 0;
+      const text = steps ? `Plan loaded: ${steps} steps` : "Plan loaded";
+      return { text, tone: "info", lane: "orch", urls: traceUrls(safe) };
+    }
+    case "plan_steps_added": {
+      const steps = Array.isArray(safe.steps) ? safe.steps.length : 0;
+      const text = steps ? `Plan expanded: +${steps} steps` : "Plan expanded";
+      return { text, tone: "info", lane: "orch", urls: traceUrls(safe) };
+    }
     case "step_started": {
-      const base = describeStep(safe, "start");
+      const enriched = enrichStepDetail(safe, true);
+      const base = describeStep(enriched, "start");
       const clean = base.replace(/\.$/, "");
       const suffix = safe.step_id ? ` (step ${safe.step_id})` : "";
-      const lane = laneFromProfile(safe.agent_profile || "") || laneFrom(safe.name || "", safe.step_id);
+      const lane =
+        laneFromProfile(enriched.agent_profile || "") || laneFrom(enriched.name || "", safe.step_id);
       return { text: `${clean}${suffix}.`, tone: "info", lane, urls: traceUrls(safe) };
     }
     case "step_completed": {
-      const base = describeStep(safe, "done");
+      const enriched = enrichStepDetail(safe, true);
+      const base = describeStep(enriched, "done");
       const clean = base.replace(/\.$/, "");
       const suffix = safe.step_id ? ` (step ${safe.step_id})` : "";
-      const lane = laneFromProfile(safe.agent_profile || "") || laneFrom(safe.name || "", safe.step_id);
+      const lane =
+        laneFromProfile(enriched.agent_profile || "") || laneFrom(enriched.name || "", safe.step_id);
       return { text: `${clean}${suffix}.`, tone: "info", lane, urls: traceUrls(safe) };
     }
     case "step_error": {
-      const label = safe.name || (safe.step ? `Step ${safe.step}` : "Step");
+      const label = resolveStepLabel(safe, false) || (safe.step ? `Step ${safe.step}` : "Step");
       const msg = safe.message || "error encountered";
-      const lane = laneFromProfile(safe.agent_profile || "") || laneFrom(safe.name || "", safe.step);
+      const lane = laneFromProfile(safe.agent_profile || "") || laneFrom(label || "", safe.step);
       const detail = String(safe.detail || "").trim();
       const suffix = detail ? ` (${shortenWords(detail, 16)})` : "";
       return { text: `${label} ran into an error: ${msg}${suffix}`, tone: "warn", lane, urls: traceUrls(safe) };
@@ -3380,37 +4214,8 @@ function updateReasoningBadge() {
 
 function updateProgressUI() {
   const now = Date.now();
-  let estimatedCompleted = completedSteps;
-  let perStepMs = null;
-  if (timerStartedAt && totalSteps > 0) {
-    const entries = activeAgentEntries();
-    const elapsed = Math.max(now - timerStartedAt, 0);
-    perStepMs = completedSteps > 0 ? elapsed / completedSteps : DEFAULT_STEP_MS;
-    if (entries.length) {
-      const runningDurations = entries
-        .map(([, entry]) => (Number.isFinite(entry.startedAt) ? now - entry.startedAt : null))
-        .filter((val) => Number.isFinite(val) && val > 0);
-      if (runningDurations.length) {
-        const sum = runningDurations.reduce((acc, val) => acc + val, 0);
-        const avg = sum / runningDurations.length;
-        if (Number.isFinite(avg) && avg > 0) {
-          perStepMs = Math.max(perStepMs, avg);
-        }
-      }
-      const remaining = Math.max(totalSteps - completedSteps, 0);
-      let inFlight = 0;
-      for (const [, entry] of entries) {
-        if (inFlight >= remaining) break;
-        const startedAt = Number.isFinite(entry.startedAt) ? entry.startedAt : timerStartedAt;
-        const since = Math.max(now - (startedAt || now), 0);
-        const fraction = perStepMs > 0 ? Math.min(0.9, since / perStepMs) : 0;
-        inFlight += fraction;
-      }
-      estimatedCompleted += Math.min(inFlight, remaining);
-    }
-    if (!Number.isFinite(perStepMs) || perStepMs <= 0) perStepMs = DEFAULT_STEP_MS;
-    perStepMs = Math.max(perStepMs, 1000);
-  }
+  const estimate = computeEtaEstimate(now);
+  const estimatedCompleted = estimate ? estimate.estimatedCompleted : completedSteps;
   const pct = totalSteps > 0 ? Math.min(100, Math.round((estimatedCompleted / totalSteps) * 100)) : 0;
   const progressText = el("progressText");
   const fill = el("runProgressFill");
@@ -3418,19 +4223,14 @@ function updateProgressUI() {
   if (fill) fill.style.width = `${pct}%`;
   const etaEl = el("etaText");
   if (etaEl) {
-    if (timerStartedAt && totalSteps > 0 && estimatedCompleted > 0) {
-      const remaining = Math.max(totalSteps - estimatedCompleted, 0);
-      const perStep = perStepMs || DEFAULT_STEP_MS;
-      const etaMs = perStep * remaining;
-      etaTargetAt = now + etaMs;
-      etaEl.textContent = `ETA: ${formatTime(etaMs)}`;
-    } else if (totalSteps > 0) {
-      etaTargetAt = null;
-      etaEl.textContent = "ETA: ...";
-    } else {
-      etaTargetAt = null;
-      etaEl.textContent = "ETA: --";
+    if (timerStartedAt && totalSteps > 0 && estimate && estimatedCompleted > 0) {
+      applyEtaEstimate(now, estimate);
+      return;
     }
+    etaTargetAt = null;
+    etaLastTotalSteps = totalSteps;
+    etaLastCompletedSteps = completedSteps;
+    etaEl.textContent = totalSteps > 0 ? "ETA: ..." : "ETA: --";
   }
 }
 
@@ -3558,6 +4358,7 @@ function handleEvent(type, p) {
     }
     case "run_started":
       resetLiveAgentState();
+      resetEtaModel();
       setExecutorActive(true);
       setStatus("Thinking", "live");
       totalSteps = 0;
@@ -3589,6 +4390,7 @@ function handleEvent(type, p) {
         const desired = Number(p.desired_parallel || budget?.desired_parallel || 0);
         const maxSlots = Number(budget?.max_parallel || budget?.max || budget?.slots || 0);
         multiAgentMode = Math.max(desired, maxSlots) > 1;
+        noteEtaParallelBudget(budget);
       }
       queueLiveEvent("resource_budget", p.budget || p, "orch");
       break;
@@ -3612,23 +4414,35 @@ function handleEvent(type, p) {
       break;
     }
     case "planner_verifier":
+      noteEtaSignal("planner_verifier", p);
       queueLiveEvent("planner_verifier", p, "verifier");
       break;
     case "model_selected":
     case "model_unavailable":
     case "model_error": {
       const lane = laneFromProfile(p.profile || "");
+      if (type === "model_error" || type === "model_unavailable") {
+        noteEtaSignal(type, p);
+      }
       queueLiveEvent(type, p, lane || "orch");
       break;
     }
     case "strict_mode":
+      noteEtaSignal("strict_mode", p);
       queueLiveEvent("strict_mode", p, "verifier");
       break;
     case "plan_created":
       totalSteps = Number(p.expected_total_steps || p.steps || 0);
       completedSteps = Number(p.completed_reset_to || 0);
+      noteEtaExpectedPasses(p.expected_passes);
       updateProgressUI();
       queueLiveEvent("plan_created", p, "orch");
+      break;
+    case "plan_snapshot":
+      setPlanSnapshot(p || {});
+      break;
+    case "plan_steps_added":
+      addPlanSteps(p || {});
       break;
     case "plan_updated":
       if (typeof p.expected_total_steps !== "undefined") {
@@ -3639,9 +4453,19 @@ function handleEvent(type, p) {
       if (typeof p.completed_reset_to === "number") {
         completedSteps = Number(p.completed_reset_to);
       }
+      noteEtaExpectedPasses(p.expected_passes);
       updateProgressUI();
       queueLiveEvent("plan_updated", p, "orch");
       break;
+    case "plan_overview": {
+      const counts = p.counts_by_status || {};
+      const total = Object.values(counts).reduce((acc, val) => acc + Number(val || 0), 0);
+      const done = Number(counts.DONE || 0) + Number(counts.FAILED || 0);
+      if (total > 0) totalSteps = total;
+      completedSteps = Math.max(0, done);
+      updateProgressUI();
+      break;
+    }
     case "upload_received":
       setUploadStatus(p.upload_id, "ready");
       queueLiveEvent("upload_received", p, "orch");
@@ -3657,10 +4481,19 @@ function handleEvent(type, p) {
     case "step_started":
       {
         noteAgentStepStarted(p);
+        noteEtaStepStart(p);
         const lane = laneFromProfile(p.agent_profile || "") || laneFrom(p.name, p.step_id);
+        updatePlanStepStatus(p.step_id, "RUNNING");
         queueLiveEvent(
           "step_started",
-          { step_id: p.step_id, name: p.name, type: p.type, agent_profile: p.agent_profile },
+          {
+            step_id: p.step_id,
+            name: p.name,
+            type: p.type,
+            agent_profile: p.agent_profile,
+            display_title: p.display_title,
+            display_target: p.display_target,
+          },
           lane
         );
       }
@@ -3703,8 +4536,10 @@ function handleEvent(type, p) {
     }
     case "step_completed":
       noteAgentStepFinished(p);
+      noteEtaStepEnd(p);
       completedSteps = Math.min(totalSteps || completedSteps + 1, completedSteps + 1);
       updateProgressUI();
+      updatePlanStepStatus(p.step_id, "DONE");
       if (currentRunId) {
         fetchArtifacts(currentRunId, { liveOnly: true, skipChat: true }).catch(() => {});
       }
@@ -3712,12 +4547,20 @@ function handleEvent(type, p) {
         const lane = laneFromProfile(p.agent_profile || "") || laneFrom(p.name, p.step_id);
         queueLiveEvent(
           "step_completed",
-          { step_id: p.step_id, name: p.name, type: p.type, agent_profile: p.agent_profile },
+          {
+            step_id: p.step_id,
+            name: p.name,
+            type: p.type,
+            agent_profile: p.agent_profile,
+            display_title: p.display_title,
+            display_target: p.display_target,
+          },
           lane
         );
       }
       break;
     case "control_action":
+      noteEtaSignal("control_action", p);
       queueLiveEvent(
         "control_action",
         { control: p.control || p.action_type || "", origin: p.origin || "" },
@@ -3725,6 +4568,7 @@ function handleEvent(type, p) {
       );
       break;
     case "loop_iteration":
+      noteEtaSignal("loop_iteration", p);
       if (typeof p.expected_total_steps === "number") {
         totalSteps = Number(p.expected_total_steps) || totalSteps;
       }
@@ -3764,9 +4608,12 @@ function handleEvent(type, p) {
     case "step_error": {
       const safe = p || {};
       noteAgentStepFinished(safe);
+      noteEtaStepEnd(safe);
+      noteEtaSignal("step_error", safe);
       const lane = laneFromProfile(safe.agent_profile || "") || laneFrom(safe.name || "", safe.step);
       const label = safe.name || (safe.step ? `Step ${safe.step}` : "Step");
       const msg = safe.message || "error encountered";
+      updatePlanStepStatus(safe.step, "FAILED");
       queueLiveEvent(
         "step_error",
         { step_id: safe.step, name: safe.name, type: safe.type, agent_profile: safe.agent_profile, message: msg },
@@ -4117,7 +4964,7 @@ function renderAssistantAnswer(runId, envelope) {
   runDetails[runId] = envelope;
   const displayText = envelope.final_text || "...";
   let bubble = getAssistantBubble(runId);
-  const bodyHtml = escapeAndBreak(displayText);
+  const bodyHtml = renderMarkdown(displayText);
   if (!bubble) {
     bubble = appendChat("assistant", "", { runId, html: bodyHtml, skipPending: true });
   } else {
@@ -4243,6 +5090,8 @@ async function fetchArtifacts(runId, opts = {}) {
     startNewConversation({ keepQuestion: true, silent: true, keepUploads: true, preserveChat: !clearChat });
   } else {
     resetLiveAgentState();
+    resetPlanState();
+    resetEtaModel();
   }
     {
       const activity = el("activityFeed");

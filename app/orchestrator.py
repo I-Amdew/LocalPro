@@ -38,6 +38,7 @@ from .schemas import (
     VerifierReport,
 )
 from .plan_runner import run_plan_pipeline
+from .plan_executor import humanize_plan_steps
 from .tavily import TavilyClient
 
 logger = logging.getLogger("uvicorn.error")
@@ -682,6 +683,27 @@ def _summarize_plan_event(event_type: str, payload: dict) -> Optional[str]:
         steps = payload.get("expected_total_steps") or payload.get("steps")
         passes = payload.get("expected_passes")
         return f"{event_type}: steps={steps} passes={passes}" if steps else f"{event_type}"
+    if event_type in ("plan_snapshot", "plan_steps_added"):
+        steps = payload.get("steps") or []
+        plan_id = payload.get("plan_id")
+        suffix = f" plan={plan_id}" if plan_id else ""
+        return f"{event_type}: steps={len(steps)}{suffix}"
+    if event_type == "model_selected":
+        profile = payload.get("profile")
+        model = payload.get("model") or payload.get("model_key")
+        instance = payload.get("instance") or payload.get("model_instance")
+        step_id = payload.get("step_id")
+        parts = []
+        if profile:
+            parts.append(f"profile={profile}")
+        if model:
+            parts.append(f"model={model}")
+        if instance:
+            parts.append(f"inst={instance}")
+        if step_id is not None:
+            parts.append(f"step={step_id}")
+        if parts:
+            return "model_selected: " + " ".join(parts)
     return None
 
 
@@ -733,12 +755,10 @@ async def tail_lmstudio_log(
     if not path:
         logger.warning("LM Studio log path not found; set LM_STUDIO_LOG_PATH to enable tailing.")
         return
+    logger.info("LMStudio[%s] tailing %s", run_id, path)
     stop_events = stop_events or []
     last_pos: Optional[int] = None
     try:
-        initial_lines = _read_tail_lines(path)
-        for line in initial_lines:
-            logger.info("LMStudio[%s] %s", run_id, line)
         last_pos = path.stat().st_size
     except OSError:
         last_pos = 0
@@ -2633,6 +2653,28 @@ def guess_needs_web(question: str) -> bool:
     citation_tokens = ("source", "sources", "citation", "cite", "reference", "references", "link", "links")
     if any(token in q for token in citation_tokens):
         return True
+    real_estate_signals = (
+        "real estate",
+        "homes for sale",
+        "home for sale",
+        "for sale",
+        "listing",
+        "listings",
+        "mls",
+        "neighborhood",
+        "neighbourhood",
+        "subdivision",
+        "golf community",
+        "golf communities",
+        "master planned",
+        "single family",
+        "villa",
+        "condo",
+        "new construction",
+        "year built",
+    )
+    if any(token in q for token in real_estate_signals):
+        return True
     data_signals = (
         "percent",
         "percentage",
@@ -3296,7 +3338,8 @@ def compute_pool_budget(
     ]
     if gpu_list:
         free_gpu = max((g.get("free_gb") or 0.0 for g in gpu_list), default=0.0)
-        vram_slots = max(1, int(float(free_gpu) // vram_headroom))
+        adjusted_free = float(free_gpu) + (vram_headroom * 0.25)
+        vram_slots = max(1, int(adjusted_free // vram_headroom))
         if float(free_gpu) < vram_headroom:
             vram_pressure = True
     base_slots = max(1, ready_count)
@@ -3653,6 +3696,7 @@ _PROFILE_TIMEOUTS = {
 }
 
 _LATENCY_OBJECTIVE_PROFILES = {"Router", "Planner", "Summarizer", "JSONRepair"}
+_QUALITY_OBJECTIVE_PROFILES = {"Writer", "Finalizer", "Verifier", "Critic", "EvidenceSynth"}
 
 
 def profile_requirements(profile: str, tool_required_default: bool = True) -> List[str]:
@@ -4328,6 +4372,7 @@ async def build_step_plan(
     memory_context: str = "",
     planner_endpoint: Optional[Dict[str, str]] = None,
     desired_parallel: int = 1,
+    plan_reasoning_mode: str = "normal",
     run_state: Optional[RunState] = None,
 ) -> StepPlan:
     plan_prompt = (
@@ -4337,8 +4382,14 @@ async def build_step_plan(
         "Add global_constraints.expected_passes (1-3) if a verifier rerun is likely, and response_guidance describing how long the final answer should be based on task complexity. "
         "Use available worker slots for parallel research lanes when useful; rotate ResearchPrimary/ResearchRecency/ResearchAdversarial and add multiple lanes per profile if slots exceed profiles."
     )
+    if str(plan_reasoning_mode).lower() == "extensive":
+        plan_prompt += (
+            " For exhaustive requests, include a discovery step to enumerate all candidate items and then "
+            "add per-item (or batched) research steps that validate each item against the constraints before drafting."
+        )
     user_content = (
         f"Question: {question}\nNeeds web: {decision.needs_web}\nReasoning level: {decision.reasoning_level}\nExpected passes: {decision.expected_passes}\n"
+        f"Plan reasoning mode: {plan_reasoning_mode}\n"
         f"Available worker slots: {max(desired_parallel, 1)} (aim to keep them busy in parallel)\n"
         f"Chat facts (this conversation): {memory_context}\n"
         "Return JSON only as {\"plan_id\": \"...\", \"goal\": \"...\", \"global_constraints\": {...}, \"steps\": [...]}"
@@ -4440,11 +4491,43 @@ async def run_worker(
     if run_state and not run_state.can_chat:
         raise RuntimeError("Local model unavailable.")
     system_prompt = system_prompt_override or profile_system(profile)
-    avoid_coder = False
+    coding_profiles = {
+        "Writer",
+        "Executor",
+        "Finalizer",
+        "ResearchPrimary",
+        "ResearchRecency",
+        "ResearchAdversarial",
+        "EvidenceSynth",
+        "Critic",
+        "Verifier",
+    }
+    coding_task = False
     if run_state and run_state.question:
-        avoid_coder = not looks_like_coding_task(run_state.question)
+        coding_task = looks_like_coding_task(run_state.question)
+    if looks_like_coding_task(prompt):
+        coding_task = True
+    use_coder = coding_task and profile in coding_profiles
+    avoid_coder = not use_coder
+    prefer_families = None
+    if use_coder:
+        prefer_families = ["coder"]
+    elif profile in {
+        "Orchestrator",
+        "Planner",
+        "Finalizer",
+        "Critic",
+        "Verifier",
+        "EvidenceSynth",
+    }:
+        prefer_families = ["oss"]
+    elif profile in {"Router", "Summarizer", "Executor", "JSONRepair", "Writer"}:
+        prefer_families = ["vision"]
+    model_manager_error: Optional[Exception] = None
     if model_manager is not None:
         required = profile_requirements(profile, model_manager.tool_required_by_default)
+        if use_coder and "coding" not in required:
+            required.append("coding")
         request = {
             "messages": [
                 {"role": "system", "content": system_prompt},
@@ -4457,47 +4540,79 @@ async def run_worker(
         effective_objective = model_manager.routing_objective
         if profile in _LATENCY_OBJECTIVE_PROFILES:
             effective_objective = "best_latency"
+        elif profile in _QUALITY_OBJECTIVE_PROFILES:
+            effective_objective = "best_quality"
         call_timeout = timeout_s if timeout_s is not None else _PROFILE_TIMEOUTS.get(profile)
-        try:
-            if call_timeout:
-                resp, instance = await asyncio.wait_for(
-                    model_manager.call_with_instance(
+        for attempt in range(2):
+            try:
+                if call_timeout:
+                    resp, instance = await asyncio.wait_for(
+                        model_manager.call_with_instance(
+                            required_capabilities=required,
+                            objective=effective_objective,
+                            request=request,
+                            avoid_coder=avoid_coder,
+                            prefer_families=prefer_families,
+                        ),
+                        timeout=call_timeout,
+                    )
+                else:
+                    resp, instance = await model_manager.call_with_instance(
                         required_capabilities=required,
                         objective=effective_objective,
                         request=request,
                         avoid_coder=avoid_coder,
-                    ),
-                    timeout=call_timeout,
-                )
-            else:
-                resp, instance = await model_manager.call_with_instance(
-                    required_capabilities=required,
-                    objective=effective_objective,
-                    request=request,
-                    avoid_coder=avoid_coder,
-                )
-        except asyncio.TimeoutError as exc:
+                        prefer_families=prefer_families,
+                    )
+                if run_id and bus:
+                    await bus.emit(
+                        run_id,
+                        "model_selected",
+                        {
+                            "profile": profile,
+                            "model": instance.model_key,
+                            "instance": instance.api_identifier,
+                            "backend_id": instance.backend_id,
+                            "step_id": step_id,
+                            "context": context,
+                        },
+                    )
+                return resp["choices"][0]["message"]["content"]
+            except asyncio.TimeoutError as exc:
+                if run_state:
+                    run_state.add_dev_trace(
+                        "Model call timed out.",
+                        {"profile": profile, "timeout_s": call_timeout or 0},
+                    )
+                raise RuntimeError("Model call timed out.") from exc
+            except RuntimeError as exc:
+                if "No suitable model instance available." in str(exc) and attempt == 0:
+                    await asyncio.sleep(0.5)
+                    continue
+                model_manager_error = exc
+                break
+            except Exception as exc:
+                model_manager_error = exc
+                break
+        if model_manager_error:
             if run_state:
                 run_state.add_dev_trace(
-                    "Model call timed out.",
-                    {"profile": profile, "timeout_s": call_timeout or 0},
+                    "Model manager call failed; falling back to direct endpoint.",
+                    {"profile": profile, "error": str(model_manager_error)},
                 )
-            raise RuntimeError("Model call timed out.") from exc
-        if run_id and bus:
-            await bus.emit(
-                run_id,
-                "model_selected",
-                {
-                    "profile": profile,
-                    "model": instance.model_key,
-                    "instance": instance.api_identifier,
-                    "backend_id": instance.backend_id,
-                    "step_id": step_id,
-                    "context": context,
-                },
-            )
-        return resp["choices"][0]["message"]["content"]
-    last_error: Optional[Exception] = None
+            if run_id and bus:
+                await bus.emit(
+                    run_id,
+                    "model_error",
+                    {
+                        "profile": profile,
+                        "step_id": step_id,
+                        "context": context,
+                        "error": str(model_manager_error),
+                        "source": "model_manager",
+                    },
+                )
+    last_error: Optional[Exception] = model_manager_error
     last_base_url: Optional[str] = None
     last_detail: str = ""
     saw_unavailable = False
@@ -4578,6 +4693,12 @@ async def run_worker(
                     or "insufficient memory" in detail_lower
                     or "model is unloaded" in detail_lower
                     or "model unloaded" in detail_lower
+                    or "model has crashed" in detail_lower
+                    or "context length" in detail_lower
+                    or "context window" in detail_lower
+                    or "context overflow" in detail_lower
+                    or "context the overflows" in detail_lower
+                    or "prediction-error" in detail_lower
                     or "model not found" in detail_lower
                     or "invalid model identifier" in detail_lower
                     or "valid downloaded model" in detail_lower
@@ -4856,7 +4977,13 @@ async def warm_worker_pool(
     if max_workers <= 0:
         return
     if model_manager:
-        instance = await model_manager.acquire_instance(required_capabilities=["tool_use"], backlog=1)
+        ready_now = 0
+        try:
+            ready_now = len(await model_manager.worker_pool.list_ready())
+        except Exception:
+            ready_now = 0
+        backlog = max(1, max_workers - ready_now)
+        instance = await model_manager.acquire_instance(required_capabilities=["tool_use"], backlog=backlog)
         if instance:
             await model_manager.release_instance(instance.instance_id)
         return
@@ -4977,6 +5104,11 @@ async def generate_step_prompt(
         prompt += f"\nExecutor guidance: {prompt_hint}"
     if toolbox_hint:
         prompt += f"\nTooling you can request (tool_requests[]): {toolbox_hint}"
+    if step.type == "analysis":
+        prompt += (
+            "\nReturn concise notes as bullet points. If you need tools, return JSON with activity_lines "
+            "and tool_requests so the notes are still visible."
+        )
     # For most steps this generic prompt suffices; for research we include instruction.
     if step.type == "research":
         prompt += (
@@ -7251,6 +7383,14 @@ async def execute_step(
         summary_text = summary_raw
         tool_requests = []
         tool_results = []
+        hint = ""
+        if isinstance(step.inputs, dict):
+            hint = str(
+                step.inputs.get("prompt_hint")
+                or step.inputs.get("prompt")
+                or step.inputs.get("focus")
+                or ""
+            ).strip()
         fixer_model = (
             (model_map.get("summarizer") or {}).get("model")
             or (model_map.get("orch") or {}).get("model")
@@ -7264,14 +7404,32 @@ async def execute_step(
             model_manager=run_state.model_manager if run_state else None,
         )
         if isinstance(parsed, dict):
-            lines = parsed.get("activity_lines") or parsed.get("memory_notes") or parsed.get("criteria")
+            summary_text = ""
+            lines = (
+                parsed.get("activity_lines")
+                or parsed.get("memory_notes")
+                or parsed.get("notes")
+                or parsed.get("summary")
+                or parsed.get("criteria")
+                or parsed.get("text")
+            )
             if isinstance(lines, list):
-                summary_text = " ".join(str(x) for x in lines if str(x).strip()).strip() or summary_raw
+                summary_text = " ".join(str(x) for x in lines if str(x).strip()).strip()
             elif isinstance(lines, str) and lines.strip():
                 summary_text = lines.strip()
             tool_requests = parsed.get("tool_requests") or []
             if not isinstance(tool_requests, list):
                 tool_requests = []
+            if not summary_text.strip():
+                if hint:
+                    summary_text = f"Notes: {hint}"
+                else:
+                    summary_text = "Notes: No additional notes."
+        if not summary_text.strip():
+            if hint:
+                summary_text = f"Notes: {hint}"
+            else:
+                summary_text = "Notes: No additional notes."
         if not tool_requests:
             math_request = build_math_tool_request(question)
             if math_request:
@@ -7668,6 +7826,21 @@ async def run_question(
                 "Discovering available local models.",
             )
             await model_manager.refresh()
+            candidates = await model_manager.get_candidates()
+            if candidates:
+                for cand in candidates:
+                    caps = sorted([k for k, v in (cand.capabilities or {}).items() if v])
+                    meta = cand.metadata or {}
+                    family = meta.get("family") or meta.get("publisher") or ""
+                    context_len = meta.get("context_length") or meta.get("maxContextLength") or ""
+                    logger.info(
+                        "Run %s model_catalog: %s family=%s caps=%s ctx=%s",
+                        run_id,
+                        cand.model_key,
+                        family,
+                        ",".join(caps),
+                        context_len,
+                    )
             if model_manager.profiling_config.get("pause_execution") and model_manager.profiling_active():
                 await maybe_emit_work_log(
                     run_state,
@@ -7678,6 +7851,10 @@ async def run_question(
                 )
                 await model_manager.wait_for_profiles()
             bootstrap_instance = await model_manager.bootstrap()
+            if bootstrap_instance:
+                logger.info("Run %s model_bootstrap: %s", run_id, bootstrap_instance.model_key)
+            else:
+                logger.warning("Run %s model_bootstrap: none", run_id)
             candidates = await model_manager.get_candidates()
             if not candidates:
                 server_down = False
@@ -7905,8 +8082,7 @@ async def run_question(
         ready_worker_count = 0
         candidate_count = 0
         if model_manager:
-            instances = await model_manager.worker_pool.list_instances()
-            ready_instances = [inst for inst in instances if inst.status != "busy"]
+            ready_instances = await model_manager.worker_pool.list_ready()
             ready_worker_count = len(ready_instances)
             ready_worker_models = {(inst.endpoint, inst.model_key) for inst in ready_instances}
             candidate_count = len(await model_manager.get_candidates())
@@ -8010,11 +8186,10 @@ async def run_question(
             int(reasoning_level) if reasoning_level is not None else granularity_level_from_router(router_decision.reasoning_level)
         )
         if plan_granularity_level >= 4:
-            plan_reasoning_mode = "extensive"
-            planning_mode = "extensive"
-        else:
-            plan_reasoning_mode = "auto"
-            planning_mode = "auto"
+            if plan_reasoning_mode == "auto":
+                plan_reasoning_mode = "extensive"
+            if planning_mode == "auto":
+                planning_mode = "extensive"
         depth_profile = REASONING_DEPTHS.get(router_decision.reasoning_level, REASONING_DEPTHS["MED"])
         if model_tier == "fast":
             depth_profile = REASONING_DEPTHS["LOW"]
@@ -8166,6 +8341,11 @@ async def run_question(
             target_parallel_slots = max(1, desired_slots)
         if force_parallel:
             target_parallel_slots = max(min_parallel_slots, target_parallel_slots)
+        if model_manager and ready_worker_count > target_parallel_slots:
+            try:
+                await model_manager.trim_idle_instances(target_parallel_slots)
+            except Exception:
+                pass
         loop = asyncio.get_running_loop()
         last_resource_refresh = loop.time()
         if target_parallel_slots > 1:
@@ -8392,6 +8572,7 @@ async def run_question(
                 memory_context,
                 planner_endpoint=planner_endpoint,
                 desired_parallel=target_parallel_slots,
+                plan_reasoning_mode=plan_reasoning_mode,
                 run_state=run_state,
             )
         if run_state.can_web and router_decision.needs_web:
@@ -8459,6 +8640,55 @@ async def run_question(
             run_state=run_state,
         )
         await db.add_step_plan(run_id, step_plan.model_dump())
+        plan_humanized_cache: Dict[str, Dict[str, str]] = {}
+        humanize_steps_payload: List[Dict[str, Any]] = []
+        for step in step_plan.steps:
+            inputs = step.inputs if isinstance(step.inputs, dict) else {}
+            humanize_steps_payload.append(
+                {
+                    "step_id": str(step.step_id),
+                    "title": step.name,
+                    "description": inputs.get("description") or inputs.get("prompt") or "",
+                    "step_type": step.type,
+                    "tags": [f"profile:{step.agent_profile}", f"type:{step.type}"],
+                    "focus": inputs.get("focus") or "",
+                    "partition_label": inputs.get("partition_label") or "",
+                    "queries": inputs.get("queries") or [],
+                }
+            )
+        humanized = await humanize_plan_steps(
+            model_manager,
+            question,
+            humanize_steps_payload,
+            cache=plan_humanized_cache,
+        )
+        plan_steps_payload = []
+        for step in step_plan.steps:
+            step_payload = {
+                "step_id": str(step.step_id),
+                "title": step.name,
+                "status": "PENDING",
+                "step_type": step.type,
+                "tags": [f"profile:{step.agent_profile}", f"type:{step.type}"],
+                "prereq_step_ids": list(step.depends_on or []),
+            }
+            human = humanized.get(str(step.step_id)) if humanized else None
+            if human:
+                step_payload["display_title"] = human.get("display_title")
+                step_payload["display_target"] = human.get("display_target")
+            plan_steps_payload.append(step_payload)
+        if plan_steps_payload:
+            await bus.emit(
+                run_id,
+                "plan_snapshot",
+                {
+                    "plan_id": step_plan.plan_id,
+                    "kind": "step_plan",
+                    "goal": step_plan.goal,
+                    "steps": plan_steps_payload,
+                    "counts_by_status": {"PENDING": len(plan_steps_payload)},
+                },
+            )
         plan_payload = {
             "steps": len(step_plan.steps),
             "expected_total_steps": progress_meta["total_steps"],
@@ -8651,6 +8881,55 @@ async def run_question(
                 await cancel_running_tasks()
             if plan_changed:
                 await db.add_step_plan(run_id, step_plan.model_dump())
+                humanize_steps_payload = []
+                for step in step_plan.steps:
+                    inputs = step.inputs if isinstance(step.inputs, dict) else {}
+                    humanize_steps_payload.append(
+                        {
+                            "step_id": str(step.step_id),
+                            "title": step.name,
+                            "description": inputs.get("description") or inputs.get("prompt") or "",
+                            "step_type": step.type,
+                            "tags": [f"profile:{step.agent_profile}", f"type:{step.type}"],
+                            "focus": inputs.get("focus") or "",
+                            "partition_label": inputs.get("partition_label") or "",
+                            "queries": inputs.get("queries") or [],
+                        }
+                    )
+                humanized = await humanize_plan_steps(
+                    model_manager,
+                    question,
+                    humanize_steps_payload,
+                    cache=plan_humanized_cache,
+                )
+                plan_steps_payload = []
+                for step in step_plan.steps:
+                    step_payload = {
+                        "step_id": str(step.step_id),
+                        "title": step.name,
+                        "status": "PENDING",
+                        "step_type": step.type,
+                        "tags": [f"profile:{step.agent_profile}", f"type:{step.type}"],
+                        "prereq_step_ids": list(step.depends_on or []),
+                    }
+                    human = humanized.get(str(step.step_id)) if humanized else None
+                    if human:
+                        step_payload["display_title"] = human.get("display_title")
+                        step_payload["display_target"] = human.get("display_target")
+                    plan_steps_payload.append(step_payload)
+                if plan_steps_payload:
+                    await bus.emit(
+                        run_id,
+                        "plan_snapshot",
+                        {
+                            "plan_id": step_plan.plan_id,
+                            "kind": "step_plan",
+                            "goal": step_plan.goal,
+                            "steps": plan_steps_payload,
+                            "counts_by_status": {"PENDING": len(plan_steps_payload)},
+                            "note": "plan_updated",
+                        },
+                    )
                 progress_meta = compute_progress_meta(step_plan, progress_meta.get("counted_passes", 1))
                 plan_payload = {
                     "steps": len(step_plan.steps),
@@ -8864,8 +9143,7 @@ async def run_question(
                 except Exception:
                     resource_snapshot = {}
                 if model_manager:
-                    instances = await model_manager.worker_pool.list_instances()
-                    ready_instances = [inst for inst in instances if inst.status != "busy"]
+                    ready_instances = await model_manager.worker_pool.list_ready()
                     ready_worker_count = len(ready_instances)
                     ready_worker_models = {(inst.endpoint, inst.model_key) for inst in ready_instances}
                     candidate_count = len(await model_manager.get_candidates())

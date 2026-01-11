@@ -1,0 +1,64 @@
+{
+  "runs": [
+    {
+      "run_id": "1e4c28ed-0a83-408b-a1ba-d49e788b223d",
+      "created_at": "2026-01-01T09:55:47.891385Z",
+      "status": "completed",
+      "question": "What golf club neighborhoods in the Naples and Bonita Springs area have homes built between 2010 and now, single family homes or detached villas that can be purchased for less than .0M, and aren't more than 15 miles from the nearest beach?",
+      "model_tier": "pro",
+      "planning_mode": "extensive",
+      "plan_reasoning_mode": "extensive",
+      "reasoning_level": "ULTRA",
+      "needs_web": true,
+      "final_answer_preview": "No fully confirmed candidate items meet all criteria due to system limitations preventing data retrieval. However, based on known Naples and Bonita Springs golf club communities with recent builds and proximity to beaches, the closest matches include:\n\n- **Naples Golf Club (Naples, FL)** - Some single-family homes built 2010-2023, some under $1M, within 10 miles of the Gulf Coast. *Verification gap: Exact lot sizes and prices vary; not all homes meet all criteria.*\n- **Bonita Springs Country Club (Bonita Springs, FL)** - Detached villas built 2012-2024, some under $1M, located near the Gulf, within 12 miles. *Verification gap: Pricing and build dates vary by lot; not all are verified under $1M.*\n- **The Villas at Naples Beach (Naples, FL)** - A gated community with newer detached homes (2010-2023), some under $1M, within 12 miles of the beach. *Verification gap: Not all homes are golf club-affiliated; some are condo-style.*\n\n*Note: All listings are subject to price fluctuations, and \"golf club\" designation may vary by community rules or marketing. No verified list of homes meeting all criteria is available due to system constraints.*"
+    },
+    {
+      "run_id": "7feccfb7-b683-49a1-801d-ccca7c42dfd4",
+      "created_at": "2026-01-01T10:39:19.538974Z",
+      "status": "completed",
+      "question": "List 5 quick tips for securing a home Wi-Fi network.",
+      "model_tier": "fast",
+      "planning_mode": "normal",
+      "plan_reasoning_mode": "normal",
+      "reasoning_level": "LOW",
+      "needs_web": false,
+      "final_answer_preview": "1. Change the default admin password.  \n2. Enable WPA3 or WPA2 encryption.  \n3. Hide your SSID to prevent easy access.  \n4. Update router firmware regularly.  \n5. Disable remote management and use a strong, unique password."
+    },
+    {
+      "run_id": "868b988f-fa2e-4b3a-bfd7-8651bc189a28",
+      "created_at": "2026-01-01T10:14:27.283685Z",
+      "status": "completed",
+      "question": "Write a Python script to parse NGINX access logs and output the top 10 IPs by request count, plus the top 5 status codes. Include brief usage instructions.",
+      "model_tier": "fast",
+      "planning_mode": "normal",
+      "plan_reasoning_mode": "normal",
+      "reasoning_level": "LOW",
+      "needs_web": false,
+      "final_answer_preview": "```python\nimport re\nfrom collections import defaultdict\n\ndef parse_nginx_log(log_file_path):\n    ip_counts = defaultdict(int)\n    status_counts = defaultdict(int)\n\n    with open(log_file_path, 'r') as f:\n        for line in f:\n            # NGINX access log format: [ip] [status] [size] [time] [request]\n            match = re.match(r'(\\S+) (\\d+) (\\S+) \"\\S+\"', line.strip())\n            if match:\n                ip, status = match.group(1), match.group(2)\n                ip_counts[ip] += 1\n                status_counts[status] += 1\n\n    # Top 10 IPs by request count\n    top_ips = sorted(ip_counts.items(), key=lambda x: x[1], reverse=True)[:10]\n    # Top 5 status codes\n    top_statuses = sorted(status_counts.items(), key=lambda x: x[1], reverse=True)[:5]\n\n    return top_ips, top_statuses\n\n# Usage:\n# 1. Save your NGINX access log to a file (e.g., 'access.log').\n# 2. Run: python script.py --log_file 'access.log'\n# 3. Output: Top 10 IPs and Top 5 status codes.\n\n# Example script:\n# if __name__ == '__main__':\n#     top_ips, top_statuses = parse_nginx_log('access.log')\n#     print(\"Top 10 IPs:\")\n#     for ip, count in top_ips:\n#         print(f\"{ip}: {count}\")\n#     print(\"\\nTop 5 Status Cod..."
+    },
+    {
+      "run_id": "3e83aa57-f829-4b56-9855-bbe92858fb4e",
+      "created_at": "2026-01-01T10:00:02.259187Z",
+      "status": "completed",
+      "question": "Create a step-by-step checklist to migrate a 10-user office from Windows to Linux for email, files, and backups. Include risks, downtime estimates, and a rollback plan.",
+      "model_tier": "deep",
+      "planning_mode": "extensive",
+      "plan_reasoning_mode": "extensive",
+      "reasoning_level": "HIGH",
+      "needs_web": true,
+      "final_answer_preview": "**10User Office Migration Checklist - Windows  Linux (Email, Files & Backups)**  \n*(All items are based on common industry practice; none were directly extracted from the supplied notes and should be verified against your specific environment.)*\n\n---\n\n### 1 PreMigration Planning  \n\n| # | Task | Caveat / Verification Needed |\n|---|------|------------------------------|\n| 1 | **Inventory current infrastructure** - Windows OS versions, domain controllers, file shares, email server (Exchange/SMTP), backup software. | Must confirm exact versions and configurations in your environment. |\n| 2 | **Select Linux distribution** - Ubuntu Server LTS, CentOS Stream, Debian Stable, or RHEL (if licensing available). | Verify compatibility with existing hardware & support contracts. |\n| 3 | **Choose email solution** - Postfix + Dovecot, Zimbra, or Microsoftcompatible ExchangeonLinux (e.g., Kopano). | Confirm that chosen stack supports your current mailbox format and authentication method. |\n| 4 | **Plan filesharing protocol** - Samba (SMB) for Windows clients, NFS for Linux clients, or a hybrid. | Validate SMB/CIFS compatibility with all client OS versions. |\n| 5 | **Design backup strategy** - Incr..."
+    },
+    {
+      "run_id": "a2398a56-9f1b-430e-a78b-eb5f6a32b08c",
+      "created_at": "2026-01-01T08:57:11.193465Z",
+      "status": "completed",
+      "question": "Summarize the main pros and cons of using RAG for an internal knowledge base in 6-8 bullets.",
+      "model_tier": "fast",
+      "planning_mode": "normal",
+      "plan_reasoning_mode": "normal",
+      "reasoning_level": "LOW",
+      "needs_web": false,
+      "final_answer_preview": "**Pros**  \n\u2022 Rapid answers by pulling relevant docs instead of generating from scratch.  \n\u2022 Higher factual accuracy than pure generative models.  \n\u2022 Keeps the core model lightweight; updates handled via the knowledge base.  \n\n**Cons**  \n\u2022 Retrieval adds latency and complexity to the pipeline.  \n\u2022 Requires well\u2011indexed, up\u2011to\u2011date data; poor indexing hurts performance.  \n\u2022 Risk of hallucination if retrieved passages are noisy or incomplete.  \n\u2022 Sensitive internal content may be exposed during retrieval if not properly secured."
+    }
+  ]
+}

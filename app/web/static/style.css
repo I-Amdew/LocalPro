@@ -855,9 +855,129 @@ input[type="search"] {
 }
 
 .chat-bubble .bubble-body {
-  white-space: pre-wrap;
+  white-space: normal;
   line-height: 1.7;
   font-size: 15px;
+}
+
+.chat-bubble .bubble-body > * {
+  margin: 0 0 10px;
+}
+
+.chat-bubble .bubble-body > *:last-child {
+  margin-bottom: 0;
+}
+
+.chat-bubble .bubble-body h1,
+.chat-bubble .bubble-body h2,
+.chat-bubble .bubble-body h3,
+.chat-bubble .bubble-body h4,
+.chat-bubble .bubble-body h5,
+.chat-bubble .bubble-body h6 {
+  font-family: var(--font-display);
+  letter-spacing: -0.01em;
+  line-height: 1.25;
+}
+
+.chat-bubble .bubble-body h1 { font-size: 1.4em; }
+.chat-bubble .bubble-body h2 { font-size: 1.25em; }
+.chat-bubble .bubble-body h3 { font-size: 1.15em; }
+.chat-bubble .bubble-body h4 { font-size: 1.05em; }
+
+.chat-bubble .bubble-body p {
+  margin: 0 0 10px;
+}
+
+.chat-bubble .bubble-body ul,
+.chat-bubble .bubble-body ol {
+  margin: 8px 0 10px;
+  padding-left: 20px;
+}
+
+.chat-bubble .bubble-body li {
+  margin: 4px 0;
+}
+
+.chat-bubble .bubble-body a {
+  color: var(--accent-strong);
+  font-weight: 600;
+}
+
+.chat-bubble .bubble-body blockquote {
+  margin: 8px 0;
+  padding: 8px 12px;
+  border-left: 3px solid rgba(11, 114, 133, 0.55);
+  background: rgba(11, 114, 133, 0.08);
+  border-radius: 10px;
+  color: var(--text-secondary);
+}
+
+.chat-bubble .bubble-body code {
+  font-family: var(--font-mono);
+  font-size: 0.92em;
+  background: rgba(15, 23, 42, 0.08);
+  border: 1px solid rgba(15, 23, 42, 0.12);
+  padding: 1px 5px;
+  border-radius: 6px;
+}
+
+.chat-bubble .bubble-body pre {
+  margin: 10px 0;
+  padding: 12px 14px;
+  background: #0f172a;
+  color: #e2e8f0;
+  border-radius: 12px;
+  overflow-x: auto;
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.08);
+}
+
+.chat-bubble .bubble-body pre code {
+  background: transparent;
+  border: none;
+  padding: 0;
+  color: inherit;
+  font-size: 0.9em;
+  white-space: pre;
+}
+
+.chat-bubble .bubble-body hr {
+  border: none;
+  border-top: 1px solid var(--border-subtle);
+  margin: 12px 0;
+}
+
+.chat-bubble .bubble-body table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.95em;
+}
+
+.chat-bubble .bubble-body th,
+.chat-bubble .bubble-body td {
+  border: 1px solid var(--border-subtle);
+  padding: 6px 8px;
+  text-align: left;
+  vertical-align: top;
+}
+
+.chat-bubble .bubble-body th {
+  background: var(--surface-2);
+  font-weight: 600;
+}
+
+.bubble-user .bubble-body a {
+  color: #ffffff;
+  text-decoration: underline;
+}
+
+.bubble-user .bubble-body code {
+  background: rgba(255, 255, 255, 0.2);
+  border-color: rgba(255, 255, 255, 0.35);
+  color: #ffffff;
+}
+
+.bubble-user .bubble-body pre {
+  background: rgba(15, 23, 42, 0.92);
 }
 
 .bubble-user {
@@ -1287,7 +1407,8 @@ textarea.prompt-locked {
   display: grid;
   grid-template-rows: minmax(0, 1fr) minmax(0, 1fr);
   gap: 12px;
-  height: 100%;
+  flex: 1;
+  min-height: 0;
 }
 
 .panel-section {
@@ -1359,6 +1480,86 @@ textarea.prompt-locked {
 .feed .event:last-child,
 .thinking-feed .thought:last-child {
   border-bottom: none;
+}
+
+.plan-section {
+  min-height: 0;
+}
+
+.plan-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.plan-feed {
+  max-height: 280px;
+}
+
+.plan-step {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 8px 10px;
+  border-bottom: 1px solid rgba(15, 23, 32, 0.08);
+}
+
+.plan-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.plan-step:last-child {
+  border-bottom: none;
+}
+
+.plan-title {
+  font-size: 12px;
+}
+
+.plan-step > .plan-meta {
+  font-size: 11px;
+  color: var(--text-tertiary);
+}
+
+.plan-status {
+  display: inline-flex;
+  align-items: center;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  padding: 2px 6px;
+  border-radius: 999px;
+  background: rgba(15, 23, 32, 0.08);
+  color: var(--text-secondary);
+  margin-right: 8px;
+}
+
+.plan-header .plan-status {
+  flex-shrink: 0;
+}
+
+.plan-status.running {
+  background: rgba(15, 118, 110, 0.15);
+  color: var(--text-primary);
+}
+
+.plan-status.ready,
+.plan-status.claimed {
+  background: rgba(37, 99, 235, 0.12);
+  color: var(--text-primary);
+}
+
+.plan-status.done {
+  background: rgba(22, 163, 74, 0.12);
+  color: var(--text-primary);
+}
+
+.plan-status.failed {
+  background: rgba(220, 38, 38, 0.12);
+  color: var(--text-primary);
 }
 
 .thinking-header {
