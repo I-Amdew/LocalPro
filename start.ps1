@@ -106,7 +106,7 @@ if (-not $depsOk) {
 }
 
 if (-not (Test-Path .env)) {
-    Copy-Item .env.example .env
+    Write-Host "No .env found; using defaults. Create .env to override settings."
 }
 
 function Get-EnvValueFromFile {

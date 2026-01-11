@@ -14,7 +14,7 @@ Executor Scheduling Policy
 - Uses overview + diff + paginated step lists; never loads full plan into context.
 - Schedules by priority plus a "unblocks many dependents" heuristic.
 - Uses ResourceManager reserve/release with headroom thresholds to avoid overcommit.
-- Supports multiple concurrent model instances chosen by capability requirements.
+- Supports multiple concurrent backend instances chosen by capability requirements.
 
 Prereq Resolution Pass
 - Scaffold and expansion steps can emit notes in the form:

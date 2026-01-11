@@ -14,8 +14,12 @@ venv/
 logs/
 *.log
 
-# Local environment
-.env
-
 # Local database
 app_data.db*
+app_data*_test.db
+
+# Local settings
+config.json
+
+# Uploads
+uploads/
